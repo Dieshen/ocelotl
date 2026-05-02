@@ -1,0 +1,12 @@
+[package]
+name = "ocelotl-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Tokenizer and chat-template boundary for Ocelotl."
+readme = "../../README.md"
+
+[dependencies]
+ocelotl-core.workspace = true
