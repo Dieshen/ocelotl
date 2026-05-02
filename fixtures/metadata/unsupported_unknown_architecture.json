@@ -1,0 +1,16 @@
+{
+  "fixture_version": 1,
+  "name": "unsupported_unknown_architecture",
+  "purpose": "Negative fixture: loader/runtime should reject unknown architectures before compute.",
+  "source": "hand-authored synthetic fixture",
+  "model": {
+    "architecture": "unknown-transformer",
+    "context_length": 128,
+    "vocab_size": 32,
+    "dtype": "f32"
+  },
+  "expected_error": {
+    "category": "Unsupported",
+    "feature": "architecture"
+  }
+}

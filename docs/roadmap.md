@@ -3,21 +3,28 @@
 This roadmap is ordered to reduce correctness risk. Each milestone should land
 with tests, acceptance criteria, and validation commands before broadening scope.
 Ocelotl is developed test-first; see `docs/validation/tdd.md` and
-`docs/validation/test-matrix.md` for the project-wide testing policy.
+`docs/validation/test-matrix.md` for the project-wide testing policy. The
+provisional first model target is documented in `docs/model-target.md`.
+Executable task backlogs for each milestone live in `docs/tasks/README.md`.
 
 ## Milestones
 
-| Milestone | Spec | Summary |
-| --- | --- | --- |
-| M0 | `docs/milestones/m0-skeleton.md` | Workspace, crate boundaries, publishing metadata, and control docs. |
-| M1 | `docs/milestones/m1-cpu-reference.md` | Deterministic CPU reference path for one narrow model shape. |
-| M2 | `docs/milestones/m2-loader-tokenizer.md` | Local metadata loading, tokenizer fixtures, and chat-template contracts. |
-| M3 | `docs/milestones/m3-single-model-forward.md` | Prefill and one-token decode for one model family through runtime APIs. |
-| M4 | `docs/milestones/m4-gpu-kernel-path.md` | First GPU-backed kernel path with CPU/GPU parity. |
-| M5 | `docs/milestones/m5-contiguous-kv-cache.md` | Request-scoped contiguous KV cache used by decode. |
-| M6 | `docs/milestones/m6-paged-kv-cache.md` | Paged KV with multi-page tests and contiguous/paged parity. |
-| M7 | `docs/milestones/m7-continuous-batching.md` | Scheduler and continuous batching without changing deterministic outputs. |
-| M8 | `docs/milestones/m8-server-api.md` | Server layer around runtime APIs with intentional error and streaming semantics. |
+| Milestone | Spec | Tasks | Summary |
+| --- | --- | --- | --- |
+| M0 | `docs/milestones/m0-skeleton.md` | `docs/tasks/m0-skeleton.md` | Workspace, crate boundaries, publishing metadata, and control docs. |
+| M1 | `docs/milestones/m1-cpu-reference.md` | `docs/tasks/m1-cpu-reference.md` | Deterministic CPU reference path for a tiny Qwen2.5-shaped model. |
+| M2 | `docs/milestones/m2-loader-tokenizer.md` | `docs/tasks/m2-loader-tokenizer.md` | Local metadata loading, tokenizer fixtures, and chat-template contracts. |
+| M3 | `docs/milestones/m3-single-model-forward.md` | `docs/tasks/m3-single-model-forward.md` | Qwen2.5-style prefill and one-token decode through runtime APIs. |
+| M4 | `docs/milestones/m4-gpu-kernel-path.md` | `docs/tasks/m4-gpu-kernel-path.md` | First GPU-backed kernel path with CPU/GPU parity. |
+| M5 | `docs/milestones/m5-contiguous-kv-cache.md` | `docs/tasks/m5-contiguous-kv-cache.md` | Request-scoped contiguous KV cache used by decode. |
+| M6 | `docs/milestones/m6-paged-kv-cache.md` | `docs/tasks/m6-paged-kv-cache.md` | Paged KV with multi-page tests and contiguous/paged parity. |
+| M7 | `docs/milestones/m7-continuous-batching.md` | `docs/tasks/m7-continuous-batching.md` | Scheduler and continuous batching without changing deterministic outputs. |
+| M8 | `docs/milestones/m8-server-api.md` | `docs/tasks/m8-server-api.md` | Server layer around runtime APIs with intentional error and streaming semantics. |
+
+## CI Baseline
+
+The baseline CI policy is documented in `docs/ci.md`. Default CI must stay
+offline and run formatting, workspace check, and workspace tests.
 
 ## Development Rule
 

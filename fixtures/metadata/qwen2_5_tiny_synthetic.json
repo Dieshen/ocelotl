@@ -1,0 +1,21 @@
+{
+  "fixture_version": 1,
+  "name": "qwen2_5_tiny_synthetic",
+  "purpose": "M1 synthetic metadata fixture for a tiny Qwen2.5-shaped decoder-only model.",
+  "source": "hand-authored synthetic fixture; not a real model artifact",
+  "model": {
+    "architecture": "qwen2",
+    "context_length": 128,
+    "vocab_size": 32,
+    "dtype": "f32",
+    "num_hidden_layers": 2,
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 4,
+    "rope_theta": 1000000.0,
+    "rms_norm_eps": 0.000001
+  },
+  "unsupported_features": []
+}

@@ -5,6 +5,12 @@
 Run prefill and one-token decode for a single supported model family through the
 runtime API and compare outputs against reference fixtures.
 
+## Target Family
+
+M3 targets the Qwen2.5-style dense decoder-only forward path. Any generalization
+beyond that family should wait until the Qwen2.5 path has reference fixtures and
+parity tests.
+
 ## Non-Goals
 
 - GPU execution.
@@ -34,7 +40,7 @@ there is a stable parity baseline.
 
 ## Acceptance Criteria
 
-- One model family has explicit support.
+- Qwen2.5-style dense decoder-only inference has explicit support.
 - Prefill and decode are separate operations in the runtime path.
 - Reference fixtures cover at least one short prompt.
 - Greedy output is deterministic.

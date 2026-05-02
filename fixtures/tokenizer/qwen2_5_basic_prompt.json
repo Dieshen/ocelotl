@@ -1,0 +1,9 @@
+{
+  "fixture_version": 1,
+  "name": "qwen2_5_basic_prompt",
+  "purpose": "Placeholder tokenizer fixture shape for M2 exact token ID tests.",
+  "source": "to be regenerated from a pinned Qwen/Qwen2.5-0.5B-Instruct tokenizer revision before M2 implementation",
+  "input": "Hello",
+  "expected_token_ids": [],
+  "notes": "This file defines the fixture contract. M2 must replace expected_token_ids with exact IDs from a pinned tokenizer revision."
+}

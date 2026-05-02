@@ -43,3 +43,15 @@ fixtures/logits/m1-single-token-prefill.json
 
 If a fixture is generated from a tool, document the exact command and tool
 version. Regenerating fixtures should be deliberate and reviewed.
+
+## Existing Scaffold
+
+The repository starts with fixture directories and synthetic placeholders:
+
+- `fixtures/metadata/qwen2_5_tiny_synthetic.json`
+- `fixtures/metadata/unsupported_unknown_architecture.json`
+- `fixtures/tokenizer/qwen2_5_basic_prompt.json`
+- `fixtures/logits/README.md`
+
+M2 must replace tokenizer placeholder IDs with exact IDs from a pinned tokenizer
+revision before treating that fixture as passing behavior.

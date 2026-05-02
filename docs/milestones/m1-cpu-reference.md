@@ -5,6 +5,12 @@
 Build the first deterministic CPU reference path for one narrow decoder-only
 model shape. The purpose is correctness, not speed.
 
+## Target Model Shape
+
+M1 targets a tiny synthetic Qwen2.5-shaped dense decoder-only model. It does not
+load the full real model, but it should use metadata categories compatible with
+the first real artifact candidate in `docs/model-target.md`.
+
 ## Non-Goals
 
 - GPU execution.
@@ -19,8 +25,8 @@ model shape. The purpose is correctness, not speed.
 M1 should establish a minimal path through the same high-level runtime API that
 future GPU execution will use:
 
-1. Load or construct model metadata.
-2. Tokenize a fixed prompt.
+1. Load or construct Qwen2.5-shaped synthetic metadata.
+2. Tokenize or inject a fixed prompt fixture.
 3. Run prefill.
 4. Run one decode step.
 5. Produce logits or next-token output that can be compared against a reference.
@@ -30,7 +36,7 @@ explicit shape checks, and deterministic tests over kernel-level performance.
 
 ## Acceptance Criteria
 
-- One supported model shape is declared explicitly.
+- One supported model shape is declared explicitly: tiny synthetic Qwen2.5-shaped decoder-only metadata.
 - Unsupported features fail before execution begins.
 - Prefill and one-token decode run through `ocelotl-runtime`.
 - A fixture test validates deterministic output without network access.

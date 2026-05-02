@@ -32,3 +32,9 @@ a small set of offline validation fixtures.
 
 Paged KV, continuous batching, OpenAI-compatible serving, quantized weights,
 GGUF compatibility, and multi-GPU execution are follow-on milestones.
+
+## First Model Family
+
+The provisional first target is Qwen2.5-style dense decoder-only inference, with
+`Qwen/Qwen2.5-0.5B-Instruct` as the first real artifact candidate. See
+`docs/model-target.md`.

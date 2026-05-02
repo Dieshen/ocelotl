@@ -5,6 +5,12 @@
 Load model metadata and tokenizer behavior from local fixtures or artifacts, then
 normalize both into Ocelotl-owned contracts.
 
+## Target Artifact
+
+M2 should use fixtures derived from a pinned `Qwen/Qwen2.5-0.5B-Instruct`
+revision when real tokenizer or metadata behavior is needed. Large model weights
+must not be committed.
+
 ## Non-Goals
 
 - Full model execution.
@@ -18,7 +24,7 @@ normalize both into Ocelotl-owned contracts.
 
 Write tests before implementation for:
 
-- Known-good metadata fixture parses into exact normalized fields.
+- Known-good Qwen2.5-shaped metadata fixture parses into exact normalized fields.
 - Missing required metadata fails with an explicit error.
 - Unsupported architecture fails with an explicit error.
 - Exact token IDs for a short prompt.
@@ -34,8 +40,7 @@ are introduced, default tests should still run offline without downloading them.
 
 ## Acceptance Criteria
 
-- `ocelotl-loader` exposes normalized metadata for at least one supported model
-  fixture.
+- `ocelotl-loader` exposes normalized metadata for at least one supported Qwen2.5-shaped model fixture.
 - `ocelotl-loader` rejects malformed metadata fixtures.
 - `ocelotl-tokenizer` encodes and decodes known fixtures exactly.
 - Chat-template behavior is covered by a deterministic test.
