@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use ocelotl_core::{InvalidModelError, OcelotlError, Result, UnsupportedError};
+use ocelotl_core::{InvalidModelError, IoError, OcelotlError, Result, UnsupportedError};
 
 /// Dtypes the loader currently accepts for inspected tensors. Anything else in
 /// a header is rejected with `OcelotlError::Unsupported` so the caller can
@@ -48,11 +48,16 @@ pub struct SafetensorsManifest {
 /// Inspect a safetensors file and return its tensor manifest. Does **not**
 /// load or interpret tensor weights — only the header is parsed.
 pub fn inspect_safetensors(path: &Path) -> Result<SafetensorsManifest> {
+    // Per docs/design/errors.md and .local/workflow/crossing-crate-boundaries.md,
+    // file-read failures map to `Io`, not `InvalidModel`. The artifact only
+    // becomes "invalid" once we can read it and find malformed contents — a
+    // missing or unreadable file is a storage problem, not a malformed
+    // artifact. Decided in M2.6 (paired); previous M2.5 mapping to
+    // InvalidModel was wrong.
     let bytes = std::fs::read(path).map_err(|source| {
-        OcelotlError::from(InvalidModelError {
+        OcelotlError::from(IoError {
             path: Some(path.to_path_buf()),
-            field: None,
-            message: format!("failed to read safetensors file: {source}"),
+            source,
         })
     })?;
 
@@ -217,6 +222,36 @@ mod tests {
             name
         ));
         p
+    }
+
+    #[test]
+    fn inspect_safetensors_returns_io_error_when_file_does_not_exist() {
+        // Per docs/design/errors.md and crossing-crate-boundaries.md, a
+        // missing artifact file is a storage/IO problem, not a malformed
+        // model. The error must be `Io`, carry the requested path, and
+        // preserve the underlying io::Error as a source so callers can
+        // distinguish NotFound from PermissionDenied.
+        let path = tmp_path("definitely_does_not_exist");
+        // No build_fixture call — the file is intentionally absent.
+        let err = inspect_safetensors(&path).expect_err("missing file must fail");
+
+        match err {
+            OcelotlError::Io(io) => {
+                assert_eq!(
+                    io.path.as_deref(),
+                    Some(path.as_path()),
+                    "expected the missing path on the Io error, got {:?}",
+                    io.path,
+                );
+                assert_eq!(
+                    io.source.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "expected the underlying io::Error kind to be NotFound, got {:?}",
+                    io.source.kind(),
+                );
+            }
+            other => panic!("expected OcelotlError::Io for missing file, got {other:?}"),
+        }
     }
 
     #[test]
