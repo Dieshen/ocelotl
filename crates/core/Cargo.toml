@@ -8,6 +8,11 @@ rust-version.workspace = true
 description = "Core types and contracts for Ocelotl."
 readme = "../../README.md"
 
+[features]
+# Exposes test-only helpers (fixture path resolution, etc.) to other crates'
+# `[dev-dependencies]`. Should never be enabled in a production dependency.
+test-fixtures = []
+
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true

@@ -12,3 +12,6 @@ readme = "../../README.md"
 ocelotl-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+ocelotl-core = { workspace = true, features = ["test-fixtures"] }

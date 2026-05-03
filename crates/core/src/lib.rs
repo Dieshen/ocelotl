@@ -350,8 +350,8 @@ mod tests {
             model: ModelMetadata,
         }
 
-        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/metadata/qwen2_5_tiny_synthetic.json");
+        let fixture_path =
+            crate::test_fixtures::metadata_fixture_path("qwen2_5_tiny_synthetic.json");
 
         let json = std::fs::read_to_string(&fixture_path)
             .expect("fixture file must be readable from workspace root");
@@ -450,5 +450,30 @@ impl Default for GenerationOptions {
 }
 
 // ---------------------------------------------------------------------------
-// M1.2 and M1.3 tests (appended to the existing tests module below)
+// Test-fixture helpers (M1.5)
 // ---------------------------------------------------------------------------
+
+/// Test-only helpers shared across crates. Gated behind the `test-fixtures`
+/// feature so the helpers stay out of the production API surface.
+///
+/// Enable from another crate's `[dev-dependencies]`:
+/// ```toml
+/// ocelotl-core = { workspace = true, features = ["test-fixtures"] }
+/// ```
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_fixtures {
+    use std::path::PathBuf;
+
+    /// Resolve a fixture under `<repo>/fixtures/metadata/` by name.
+    ///
+    /// Both `ocelotl-core` and `ocelotl-loader` live at `crates/<name>/` and
+    /// therefore share the same `../../fixtures/metadata/` relative path from
+    /// their `CARGO_MANIFEST_DIR`. `CARGO_MANIFEST_DIR` here resolves to the
+    /// `ocelotl-core` crate, but the absolute target path is identical for
+    /// any sibling crate at the same depth.
+    pub fn metadata_fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/metadata")
+            .join(name)
+    }
+}

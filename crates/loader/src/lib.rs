@@ -1,10 +1,8 @@
 //! Model artifact loading and validation.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use ocelotl_core::{
-    DType, InvalidModelError, ModelMetadata, OcelotlError, Result, UnsupportedError,
-};
+use ocelotl_core::{InvalidModelError, ModelMetadata, OcelotlError, Result, UnsupportedError};
 use serde::Deserialize;
 
 /// Architectures the loader currently accepts. Anything outside this list is
@@ -108,16 +106,11 @@ fn extract_missing_field(message: &str) -> Option<String> {
 mod tests {
     use super::*;
     use ocelotl_core::OcelotlError;
-
-    fn fixture_path(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/metadata")
-            .join(name)
-    }
+    use ocelotl_core::test_fixtures::metadata_fixture_path;
 
     #[test]
     fn load_metadata_rejects_unknown_architecture_with_typed_unsupported_error() {
-        let path = fixture_path("unsupported_unknown_architecture.json");
+        let path = metadata_fixture_path("unsupported_unknown_architecture.json");
 
         let err = load_metadata(&path)
             .expect_err("loading an unknown architecture must fail with a typed error");
@@ -149,7 +142,7 @@ mod tests {
 
     #[test]
     fn load_metadata_rejects_unknown_dtype_with_typed_unsupported_error() {
-        let path = fixture_path("unsupported_dtype.json");
+        let path = metadata_fixture_path("unsupported_dtype.json");
 
         let err = load_metadata(&path)
             .expect_err("loading an unknown dtype must fail with a typed error");
@@ -181,7 +174,7 @@ mod tests {
 
     #[test]
     fn load_metadata_rejects_missing_required_field_with_invalid_model_error() {
-        let path = fixture_path("invalid_missing_vocab_size.json");
+        let path = metadata_fixture_path("invalid_missing_vocab_size.json");
 
         let err =
             load_metadata(&path).expect_err("loading metadata missing a required field must fail");
@@ -226,40 +219,4 @@ mod tests {
             Some("vocab_size")
         );
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelArtifact {
-    pub path: PathBuf,
-    pub metadata: ModelMetadata,
-}
-
-pub fn inspect_model(path: impl AsRef<Path>) -> Result<ModelArtifact> {
-    let path = path.as_ref();
-    if !path.exists() {
-        return Err(OcelotlError::from(InvalidModelError {
-            path: Some(path.to_path_buf()),
-            field: None,
-            message: "path does not exist".to_string(),
-        }));
-    }
-
-    Ok(ModelArtifact {
-        path: path.to_path_buf(),
-        metadata: ModelMetadata {
-            architecture: "unknown".to_string(),
-            vocab_size: 0,
-            num_hidden_layers: 0,
-            hidden_size: 0,
-            intermediate_size: 0,
-            num_attention_heads: 0,
-            num_key_value_heads: 0,
-            head_dim: 0,
-            context_length: 0,
-            rope_theta: 0.0,
-            rms_norm_eps: 0.0,
-            dtype: DType::F32,
-            tokenizer_model_hint: None,
-        },
-    })
 }
