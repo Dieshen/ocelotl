@@ -18,12 +18,21 @@ pub trait CausalLanguageModel: Send + Sync {
     fn generate(&self, prompt: &[u32], options: &GenerationOptions) -> Result<Vec<u32>>;
 }
 
-/// A small constant scale factor for the deterministic synthetic forward.
-/// Chosen to keep `sin`/`cos` arguments well within a few cycles for the
-/// fixture sizes used in M1 (vocab ≤ 64, hidden ≤ 64). The exact value is
-/// not load-bearing as long as it is not changed without regenerating the
-/// committed expected-token fixture; see `fixtures/logits/`.
-const SYNTHETIC_SCALE: f32 = 0.0125;
+/// A scale factor for the deterministic synthetic forward.
+///
+/// Chosen so that `cos(v * h * SCALE)` traverses several oscillations
+/// across the (vocab × hidden) grid — without that, the cos terms stay
+/// near 1 for low indices and the argmax is trivially `0` for every
+/// prompt, which would make the M1 smoke test pass even if the runtime
+/// were short-circuited. With this value, the argmax depends
+/// non-trivially on the prompt token (e.g. prompt `[7]` argmaxes at `5`,
+/// prompt `[8]` at `7`).
+///
+/// The exact value is not load-bearing for correctness, but **changing it
+/// requires regenerating** the committed expected-token fixture at
+/// `fixtures/logits/m1_smoke_expected.json` and updating the integration
+/// test's pinned next-token value in lockstep.
+const SYNTHETIC_SCALE: f32 = 0.1;
 
 /// Deterministic synthetic forward pass over the last prompt token.
 ///
