@@ -219,6 +219,51 @@ mod tests {
         p
     }
 
+    /// Build a deliberately malformed safetensors file where one tensor's
+    /// `data_offsets` byte length does not match `shape_product * dtype_size`.
+    ///
+    /// `tensors` is `(name, dtype_str, shape, declared_byte_len)`. The
+    /// `declared_byte_len` is what gets written into `data_offsets[1] -
+    /// data_offsets[0]` regardless of what the shape × dtype implies. The
+    /// data section is sized to `declared_byte_len` so the file itself is
+    /// internally consistent at the byte level — the *header* is the bug.
+    ///
+    /// M2.5's `build_fixture` deliberately keeps shape and offsets
+    /// consistent; this peer helper exists specifically to construct the
+    /// shape-vs-offsets disagreement that M2.7 covers.
+    fn build_shape_mismatch_fixture(path: &Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        use std::collections::BTreeMap;
+        use std::io::Write;
+
+        let mut header_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut cursor: usize = 0;
+        for (name, dtype, shape, declared_byte_len) in tensors {
+            let begin = cursor;
+            let end = cursor + *declared_byte_len;
+            cursor = end;
+            header_map.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [begin, end],
+                }),
+            );
+        }
+        let total_data_bytes = cursor;
+
+        let header_json = serde_json::to_string(&header_map).expect("serialize header");
+        let header_bytes = header_json.as_bytes();
+        let header_len = header_bytes.len() as u64;
+
+        let mut file = std::fs::File::create(path).expect("create fixture file");
+        file.write_all(&header_len.to_le_bytes())
+            .expect("write header length");
+        file.write_all(header_bytes).expect("write header");
+        let zeros = vec![0u8; total_data_bytes];
+        file.write_all(&zeros).expect("write data section");
+    }
+
     #[test]
     fn inspect_safetensors_returns_tensor_metadata_for_known_good_fixture() {
         let path = tmp_path("happy");
@@ -398,6 +443,53 @@ mod tests {
         let manifest = inspect_safetensors(&path).expect("fixture inspects");
         require_tensors(&manifest, &["embed", "lm_head"], Some(&path))
             .expect("all required tensors are present");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inspect_safetensors_rejects_shape_offsets_mismatch_with_invalid_model_error() {
+        // Header declares shape [4, 8] and dtype F32 (32 elems × 4 bytes =
+        // 128 bytes), but `data_offsets: [0, 64]` claims only 64 bytes for
+        // the tensor's payload. The header is internally inconsistent. The
+        // M2.7 contract: this surfaces as OcelotlError::InvalidModel
+        // carrying the fixture path so callers can report which artifact
+        // failed and which tensor was inconsistent.
+        //
+        // Note: this is a header-vs-header inconsistency (declared shape
+        // disagrees with declared byte_range), not a header-vs-file-size
+        // truncation — the file's data section is sized to match
+        // data_offsets, so the bug is purely in the metadata.
+        let path = tmp_path("shape_offsets_mismatch");
+        build_shape_mismatch_fixture(
+            &path,
+            // shape [4, 8] × F32 implies 128 bytes; we declare 64.
+            &[("attention_weight", "F32", &[4, 8], 64)],
+        );
+
+        let err = inspect_safetensors(&path)
+            .expect_err("safetensors header with shape vs data_offsets mismatch must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.path.as_deref(),
+                    Some(path.as_path()),
+                    "expected fixture path on InvalidModel, got {:?}",
+                    invalid.path,
+                );
+                assert!(
+                    invalid.message.contains("safetensors header"),
+                    "expected message to mention safetensors header parsing, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => {
+                panic!(
+                    "expected OcelotlError::InvalidModel for shape/offsets mismatch, got {other:?}"
+                )
+            }
+        }
 
         let _ = std::fs::remove_file(&path);
     }
