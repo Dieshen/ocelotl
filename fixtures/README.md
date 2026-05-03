@@ -5,6 +5,8 @@ Default tests must run offline. Large model weights should not be committed.
 
 ## Layout
 
+- `manifest/`: machine-readable artifact pins (repository + commit SHA +
+  license) for external models referenced by other fixtures.
 - `metadata/`: normalized model metadata and malformed metadata cases.
 - `tokenizer/`: exact token ID and chat-template fixtures.
 - `logits/`: reference logits or token outputs for small deterministic cases.
