@@ -227,4 +227,45 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn inspect_safetensors_rejects_truncated_header_with_invalid_model_error() {
+        // Write a file that claims a 1024-byte header but contains only 4
+        // bytes after the length prefix. The safetensors crate must reject
+        // this; we expect that rejection to surface as a typed
+        // OcelotlError::InvalidModel carrying the fixture path so callers
+        // can report which artifact failed.
+        use std::io::Write;
+        let path = tmp_path("truncated_header");
+        let mut file = std::fs::File::create(&path).expect("create truncated fixture");
+        let claimed_header_len: u64 = 1024;
+        file.write_all(&claimed_header_len.to_le_bytes())
+            .expect("write claimed header length");
+        file.write_all(b"oops").expect("write truncated body");
+        drop(file);
+
+        let err =
+            inspect_safetensors(&path).expect_err("truncated safetensors header must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.path.as_deref(),
+                    Some(path.as_path()),
+                    "expected fixture path on InvalidModel, got {:?}",
+                    invalid.path,
+                );
+                assert!(
+                    invalid.message.contains("safetensors header"),
+                    "expected message to mention safetensors header parsing, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => {
+                panic!("expected OcelotlError::InvalidModel for truncated header, got {other:?}")
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
