@@ -11,3 +11,4 @@ readme = "../../README.md"
 [dependencies]
 ocelotl-core.workspace = true
 serde.workspace = true
+serde_json.workspace = true
