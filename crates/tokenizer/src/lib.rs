@@ -5,6 +5,9 @@ use std::path::Path;
 pub use ocelotl_core::TokenId;
 use ocelotl_core::{OcelotlError, Result, TokenizerError, UnsupportedError};
 
+mod chat_template;
+pub use chat_template::{ChatMessage, ChatTemplate};
+
 pub trait Tokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<Vec<TokenId>>;
     fn decode(&self, tokens: &[TokenId]) -> Result<String>;
