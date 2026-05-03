@@ -10,3 +10,4 @@ readme = "../../README.md"
 
 [dependencies]
 ocelotl-core.workspace = true
+ocelotl-kernels.workspace = true
