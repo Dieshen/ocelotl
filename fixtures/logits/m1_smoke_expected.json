@@ -1,0 +1,6 @@
+{
+  "model_shape": "qwen2_5_tiny_synthetic",
+  "prompt_tokens": [7],
+  "expected_next_token": 5,
+  "rationale": "Pinned by deterministic synthetic forward (ocelotl_models::tiny_synthetic_forward) and greedy_sample. Updates require regeneration whenever the synthetic forward changes (SYNTHETIC_SCALE, embedding/projection formulae). The integration test at crates/runtime/tests/m1_smoke.rs holds the same value; both must change together."
+}
