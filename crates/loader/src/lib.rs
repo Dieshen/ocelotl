@@ -5,6 +5,11 @@ use std::path::Path;
 use ocelotl_core::{InvalidModelError, ModelMetadata, OcelotlError, Result, UnsupportedError};
 use serde::Deserialize;
 
+pub mod safetensors_inspect;
+pub use safetensors_inspect::{
+    SafetensorsManifest, SupportedDtype, TensorEntry, inspect_safetensors, require_tensors,
+};
+
 /// Architectures the loader currently accepts. Anything outside this list is
 /// rejected with `OcelotlError::Unsupported` before any further validation.
 const SUPPORTED_ARCHITECTURES: &[&str] = &["qwen2"];
