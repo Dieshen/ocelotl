@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use ocelotl_core::{InvalidModelError, ModelMetadata, OcelotlError, Result, UnsupportedError};
+use ocelotl_core::{
+    InvalidModelError, IoError, ModelMetadata, OcelotlError, Result, UnsupportedError,
+};
 use serde::Deserialize;
 
 pub mod safetensors_inspect;
@@ -43,11 +45,13 @@ struct ModelInspect {
 /// Returns `OcelotlError::Unsupported` when the architecture is recognized
 /// but not yet implemented (e.g. anything outside `SUPPORTED_ARCHITECTURES`).
 pub fn load_metadata(path: &Path) -> Result<ModelMetadata> {
+    // File-read failures map to `Io`, not `InvalidModel` — see the matching
+    // comment in `safetensors_inspect::inspect_safetensors` and
+    // docs/design/loader.md "Error Mapping" for the rationale.
     let json = std::fs::read_to_string(path).map_err(|source| {
-        OcelotlError::from(InvalidModelError {
+        OcelotlError::from(IoError {
             path: Some(path.to_path_buf()),
-            field: None,
-            message: format!("failed to read metadata file: {source}"),
+            source,
         })
     })?;
 
@@ -207,6 +211,35 @@ mod tests {
             other => {
                 panic!("expected OcelotlError::InvalidModel for missing field, got {other:?}")
             }
+        }
+    }
+
+    #[test]
+    fn load_metadata_returns_io_error_when_file_does_not_exist() {
+        // Per docs/design/errors.md, missing-file failures are `Io`, not
+        // `InvalidModel`. This test pins that contract for `load_metadata`
+        // alongside the matching test on `inspect_safetensors`.
+        let mut path = std::env::temp_dir();
+        path.push(format!("ocelotl_m2_6_missing_{}.json", std::process::id()));
+        // Intentionally never create the file.
+
+        let err = load_metadata(&path).expect_err("missing metadata file must fail");
+        match err {
+            OcelotlError::Io(io) => {
+                assert_eq!(
+                    io.path.as_deref(),
+                    Some(path.as_path()),
+                    "expected the missing path on the Io error, got {:?}",
+                    io.path,
+                );
+                assert_eq!(
+                    io.source.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "expected NotFound, got {:?}",
+                    io.source.kind(),
+                );
+            }
+            other => panic!("expected OcelotlError::Io for missing file, got {other:?}"),
         }
     }
 
