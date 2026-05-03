@@ -23,7 +23,13 @@ external model artifacts (Qwen2.5 fixture work is M2.3).
 
 - `encode("hello world")` → `[TokenId(1), TokenId(2)]`
 - `encode("hello unknown world")` → `[TokenId(1), TokenId(0), TokenId(2)]`
-- `decode([TokenId(1), TokenId(2)])` → `"hello world"`
+- `decode([TokenId(1), TokenId(2)])` → `"helloworld"` (no separator)
+
+The decode result has no space between tokens because the configured
+`WordPiece` decoder concatenates tokens without re-inserting whitespace.
+That is the actual deterministic output of this fixture; restoring
+whitespace is a function of the model-specific decoder, which the M2.3
+Qwen2.5 fixture will exercise with a real BPE-style decoder.
 
 ### Regeneration
 

@@ -150,6 +150,25 @@ mod tests {
     }
 
     #[test]
+    fn json_tokenizer_decode_returns_known_text_for_known_ids() {
+        let path = tokenizer_fixture_path("tiny_wordlevel.json");
+        let tok = JsonTokenizer::from_json_path(&path).expect("fixture should load");
+
+        let text = tok
+            .decode(&[TokenId(1), TokenId(2)])
+            .expect("decoding known IDs against the tiny wordlevel fixture should succeed");
+
+        // Pinned by fixtures/tokenizer/README.md: the WordPiece decoder
+        // concatenates tokens without re-inserting separators, so
+        // [hello, world] decodes to "helloworld". This proves the boundary
+        // (IDs in, String out via the Ocelotl trait) without claiming
+        // whitespace round-trip — restoring whitespace is a function of the
+        // model's decoder configuration, which the M2.3 Qwen2.5 fixture will
+        // exercise with a real decoder.
+        assert_eq!(text, "helloworld");
+    }
+
+    #[test]
     fn json_tokenizer_malformed_json_returns_typed_tokenizer_error_with_path() {
         // Write malformed JSON to a unique temp file (no committed fixture so
         // we don't step on M2.7's malformed-fixture work).
