@@ -1,6 +1,6 @@
 //! Portable kernel dispatch boundary.
 
-use ocelotl_core::{Device, OcelotlError, Result};
+use ocelotl_core::{Device, OcelotlError, Result, UnsupportedError};
 
 #[derive(Debug, Clone)]
 pub struct KernelContext {
@@ -40,8 +40,10 @@ impl KernelBackend for CpuKernelBackend {
 pub fn require_gpu(backend: &dyn KernelBackend) -> Result<()> {
     match backend.context().device {
         Device::Gpu { .. } => Ok(()),
-        Device::Cpu => Err(OcelotlError::Unsupported(
-            "GPU kernels are not configured in this build".to_string(),
-        )),
+        Device::Cpu => Err(OcelotlError::Unsupported(UnsupportedError {
+            feature: "gpu_backend".to_string(),
+            requested: Some("gpu".to_string()),
+            supported: vec!["cpu".to_string()],
+        })),
     }
 }

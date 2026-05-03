@@ -1,6 +1,6 @@
 //! Request lifecycle and generation runtime.
 
-use ocelotl_core::{GenerationOptions, OcelotlError, Result};
+use ocelotl_core::{GenerationOptions, OcelotlError, Result, UnsupportedError};
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
 use serde::{Deserialize, Serialize};
 
@@ -37,8 +37,10 @@ impl<B: KernelBackend> Runtime<B> {
     }
 
     pub fn generate(&self, _request: GenerateRequest) -> Result<GenerateResponse> {
-        Err(OcelotlError::Unsupported(
-            "generation is not implemented yet".to_string(),
-        ))
+        Err(OcelotlError::Unsupported(UnsupportedError {
+            feature: "generate".to_string(),
+            requested: None,
+            supported: vec![],
+        }))
     }
 }
