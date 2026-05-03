@@ -124,6 +124,39 @@ pub fn vec_add(a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// Inner product: `sum(a[i] * b[i])`.
+///
+/// Both slices must have the same length. M1 is contiguous-only — there is no
+/// stride argument.
+///
+/// # Errors
+///
+/// Returns `KernelError` (backend = `"cpu"`) when the two input slices have
+/// different lengths.
+///
+/// # Example
+///
+/// ```
+/// use ocelotl_kernels::dot;
+/// let a = [1.0_f32, 2.0, 3.0];
+/// let b = [4.0_f32, 5.0, 6.0];
+/// assert_eq!(dot(&a, &b).unwrap(), 32.0);
+/// ```
+pub fn dot(a: &[f32], b: &[f32]) -> Result<f32> {
+    if a.len() != b.len() {
+        return Err(kernel_err(format!(
+            "dot length mismatch: a.len={}, b.len={}",
+            a.len(),
+            b.len()
+        )));
+    }
+    let mut acc = 0.0_f32;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    Ok(acc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +202,45 @@ mod tests {
 
         let err = vec_add(&a, &b, &mut out).expect_err("must reject mismatched output length");
         assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    // --- dot ---
+
+    #[test]
+    fn dot_computes_inner_product_of_four_element_vectors() {
+        let a = [1.0_f32, 2.0, 3.0, 4.0];
+        let b = [10.0_f32, 20.0, 30.0, 40.0];
+
+        // 1*10 + 2*20 + 3*30 + 4*40 = 10 + 40 + 90 + 160 = 300
+        let result = dot(&a, &b).expect("equal-length dot must succeed");
+
+        assert_eq!(result, 300.0);
+    }
+
+    #[test]
+    fn dot_of_empty_slices_is_zero() {
+        let a: [f32; 0] = [];
+        let b: [f32; 0] = [];
+
+        assert_eq!(dot(&a, &b).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn dot_rejects_mismatched_lengths() {
+        let a = [1.0_f32, 2.0, 3.0];
+        let b = [1.0_f32, 2.0];
+
+        let err = dot(&a, &b).expect_err("must reject mismatched lengths");
+
+        match err {
+            OcelotlError::Kernel(KernelError { backend, message }) => {
+                assert_eq!(backend, "cpu");
+                assert!(
+                    message.contains("dot"),
+                    "expected error to mention kernel name, got {message:?}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
     }
 }
