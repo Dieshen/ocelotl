@@ -67,3 +67,33 @@ All six rows are green. M1 acceptance is provable from `cargo test --workspace` 
 M1 default tests are offline by construction; the offline-by-default principle
 and its forward-looking implications for milestones that introduce network
 access live in `docs/ci.md`.
+
+## M2 Acceptance Traceability
+
+The table below maps each acceptance criterion in
+`docs/milestones/m2-loader-tokenizer.md` to the test (or test set) that proves
+it. Same shape as the M1 table; reviewers should be able to confirm every M2
+acceptance bullet has a green test in `cargo test --workspace`.
+
+| # | Acceptance criterion | Test(s) proving it | Status |
+| - | -------------------- | ------------------ | ------ |
+| 1 | `ocelotl-loader` exposes normalized metadata for at least one supported Qwen2.5-shaped model fixture. | `ocelotl_loader::tests::parse_hf_config_maps_real_qwen2_5_config_into_model_metadata` (in `crates/loader/src/lib.rs`) — parses `fixtures/metadata/qwen2_5_0_5b_instruct_config.json` (real Qwen config at pinned SHA `7ae5576...`) and asserts the resulting `core::ModelMetadata` matches the M1 typed shape. | green |
+| 2 | `ocelotl-loader` rejects malformed metadata fixtures. | Architecture: `load_metadata_rejects_unknown_architecture_with_typed_unsupported_error`. Dtype: `load_metadata_rejects_unknown_dtype_with_typed_unsupported_error`. Missing required field: `load_metadata_rejects_missing_required_field_with_invalid_model_error`. HF config gates: `parse_hf_config_rejects_unknown_model_type_with_unsupported`, `parse_hf_config_rejects_unknown_torch_dtype_with_unsupported`, `parse_hf_config_rejects_non_divisible_head_dim_with_invalid_model`. Missing file → `Io`: `load_metadata_returns_io_error_when_file_does_not_exist`. Safetensors header malformed/truncated/shape-mismatch/unsupported-dtype/missing-tensor: `inspect_safetensors_rejects_truncated_header_with_invalid_model_error`, `inspect_safetensors_rejects_unsupported_dtype_with_typed_unsupported_error`, `inspect_safetensors_rejects_shape_offsets_mismatch_with_invalid_model_error`, `require_tensors_returns_invalid_model_error_when_a_required_tensor_is_missing`, `inspect_safetensors_returns_io_error_when_file_does_not_exist`. The full inventory lives at `docs/validation/correctness.md` § Malformed Artifact Coverage (M2.7). | green |
+| 3 | `ocelotl-tokenizer` encodes and decodes known fixtures exactly. | Tiny WordLevel boundary tests: `ocelotl_tokenizer::tests::{json_tokenizer_loads_tiny_wordlevel_fixture_and_encodes_known_input, json_tokenizer_decode_returns_known_text_for_known_ids, json_tokenizer_missing_file_returns_typed_tokenizer_error_with_path, json_tokenizer_malformed_json_returns_typed_tokenizer_error_with_path}`. Qwen2.5 fixture shape (default-on): `crates/tokenizer/tests/qwen2_5_basic_prompt.rs::fixture_is_well_formed_and_populated` asserts `expected_token_ids = [9707]` for `"Hello"`. Real-tokenizer round trip (`#[ignore]`'d, opt-in via `local-artifacts/`): `json_tokenizer_round_trips_qwen2_5_basic_prompt`. | green |
+| 4 | Chat-template behavior is covered by a deterministic test. | Inline-fixture exact-bytes pin: `crates/tokenizer/tests/qwen2_5_chat_template.rs::chat_template_renders_inline_fixture_to_expected_bytes` (176-byte rendered output for system+user+assistant+user with `add_generation_prompt=true`). Determinism across calls: `chat_template_render_is_byte_for_byte_deterministic_across_repeated_calls`. Lenient-undefined contract pinned: `apply_treats_undefined_as_lenient_to_match_upstream_jinja2_semantics`. Unsupported-template-feature failures: `from_jinja_rejects_unsupported_statement_with_typed_unsupported_error`, `apply_surfaces_unknown_filter_via_typed_unsupported_error`, `from_jinja_distinguishes_genuine_syntax_error_from_unsupported_feature`. Upstream cross-check (`#[ignore]`'d): `inline_chat_template_matches_upstream_pinned_tokenizer_config`. | green |
+| 5 | Runtime-facing metadata types contain enough fields for M3 model construction. | Provable now via `parse_hf_config_maps_real_qwen2_5_config_into_model_metadata`: the test asserts the produced `core::ModelMetadata` carries every field M3 will need (architecture, vocab_size, hidden_size, num_hidden_layers, num_attention_heads, num_key_value_heads, intermediate_size, max_position_embeddings, rope_theta, head_dim, dtype). Final proof lands when M3 constructs a real model from this metadata; M2 closes this criterion at "shape is sufficient", M3 will close it at "shape is correct". | green (shape) |
+| 6 | Default tests do not require network access. | Static enforcement: `ci/check-offline.ps1` (added M2.8) scans all non-`#[ignore]` test code for forbidden patterns (`reqwest::`, `ureq::`, `hf_hub::`, `huggingface_hub`, literal `huggingface.co` URLs) and fails CI if any appear. Wired into `.github/workflows/ci.yml` between `cargo check` and `cargo test`. Behavioral: zero default tests fetch artifacts (verified by gate exit-0 on `0a63350`); the only network-dependent tests are the `#[ignore]`'d opt-in pair `json_tokenizer_round_trips_qwen2_5_basic_prompt` and `inline_chat_template_matches_upstream_pinned_tokenizer_config`, both gated on `local-artifacts/qwen2_5_0_5b_instruct/...` per `docs/artifact-preparation.md`. | green |
+
+### Closure note (2026-05-03)
+
+All six rows are green. M2 acceptance is provable from `cargo test --workspace`
+against main through `0a63350 merge: M2.4 — chat-template behavior for
+Qwen2.5 (dev-03)`. Total at M2 close: **85 default + 2 `#[ignore]`'d** tests
+passing. Per-crate breakdown: 17 core + 15 kernels + 18 loader (5 baseline +
+6 from M2.5 + 7 from M2.6 sweep+mapping) + 4 models + 12 runtime + 1 runtime
+smoke + 10 tokenizer (4 from M2.2 + 6 from M2.4 unit) + 1 doctest in
+tokenizer + 3 chat-template integration + 4 kernel doctests = 85 default;
+plus 1 `#[ignore]`'d in `qwen2_5_basic_prompt` and 1 in `qwen2_5_chat_template`.
+
+The M2.8 offline gate (`ci/check-offline.ps1`) extends acceptance enforcement
+beyond `cargo test`: criterion 6 is now CI-blocking, not advisory.
