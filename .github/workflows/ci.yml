@@ -15,5 +15,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Check
         run: cargo check --workspace
+      - name: Offline gate (M2.8)
+        shell: pwsh
+        run: ./ci/check-offline.ps1
       - name: Test
         run: cargo test --workspace
