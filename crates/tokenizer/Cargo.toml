@@ -16,10 +16,20 @@ ocelotl-core.workspace = true
 # `onig` C dependency and `progressbar`; `fancy-regex` (pure Rust) covers the
 # regex needs of pre-tokenizers like `Whitespace`.
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+# MiniJinja — Rust port of the Jinja2 template language used by Hugging Face
+# `tokenizer_config.json` chat templates. Kept behind the Ocelotl
+# `ChatTemplate` wrapper; this crate is the only one in the workspace that
+# imports `minijinja`. Sandbox is enabled by default (no filesystem access,
+# no arbitrary code), and `add_template_owned` keeps the source string-owned
+# so we do not surface minijinja lifetimes across the boundary.
+minijinja = { version = "2.19", default-features = false, features = ["builtins", "serde"] }
+# `serde` is needed by minijinja's `serde` feature and by `ChatMessage`'s
+# derive in the chat-template module. Production code depends on it; not
+# limited to dev-dependencies.
+serde.workspace = true
 
 [dev-dependencies]
-# Test-only: parse the small JSON fixtures under `fixtures/tokenizer/` (e.g.
-# qwen2_5_basic_prompt.json) into typed records for exact-ID assertions. Not
-# needed by production code; the `Tokenizer` trait does not deal in JSON.
-serde.workspace = true
+# Test-only: parse the small JSON fixtures under `fixtures/tokenizer/` and
+# `fixtures/chat/` into typed records for exact assertions. Not needed by
+# production code; the trait surface does not deal in JSON.
 serde_json.workspace = true
