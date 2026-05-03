@@ -10,3 +10,9 @@ readme = "../../README.md"
 
 [dependencies]
 ocelotl-core.workspace = true
+# Hugging Face tokenizers — used as the backend for JsonTokenizer. Kept behind
+# the Ocelotl `Tokenizer` trait; this crate is the only one in the workspace
+# that imports `tokenizers`. `default-features = false` drops the optional
+# `onig` C dependency and `progressbar`; `fancy-regex` (pure Rust) covers the
+# regex needs of pre-tokenizers like `Whitespace`.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
