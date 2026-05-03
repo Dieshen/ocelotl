@@ -62,3 +62,42 @@ multi-page/cache-boundary behavior when KV paging exists.
 A release that adds a model family, kernel path, quantization format, or cache
 layout should include a validation note listing the exact tests and fixtures that
 prove the path is safe to expose.
+
+## Malformed Artifact Coverage (M2.7)
+
+This inventory maps each malformed-artifact failure mode named in the M2.7 task
+spec to the test that pins the typed-error contract for it. Use this as the
+discovery surface when adding a new failure mode (extend the table) or when an
+error category changes (find every test that asserts the old shape).
+
+All listed tests are unit tests that build their fixture programmatically — no
+binary fixtures are committed under `fixtures/safetensors/`. The header-only
+inspection contract lets these stay byte-exact and deterministic without a
+real model artifact.
+
+| Failure mode                          | Test                                                                                                          | Crate     | Typed error                  | Commit    |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------- | --------- | ---------------------------- | --------- |
+| Missing tokenizer file                | `tokenizer::tests::json_tokenizer_missing_file_returns_typed_tokenizer_error_with_path`                       | tokenizer | `OcelotlError::Tokenizer`    | `2761ed9` |
+| Malformed tokenizer JSON              | `tokenizer::tests::json_tokenizer_malformed_json_returns_typed_tokenizer_error_with_path`                     | tokenizer | `OcelotlError::Tokenizer`    | `8180173` |
+| Missing required tensor               | `safetensors_inspect::tests::require_tensors_returns_invalid_model_error_when_a_required_tensor_is_missing`   | loader    | `OcelotlError::InvalidModel` | `06a9c3e` |
+| Unsupported safetensors dtype         | `safetensors_inspect::tests::inspect_safetensors_rejects_unsupported_dtype_with_typed_unsupported_error`      | loader    | `OcelotlError::Unsupported`  | `79481c0` |
+| Truncated safetensors header          | `safetensors_inspect::tests::inspect_safetensors_rejects_truncated_header_with_invalid_model_error`           | loader    | `OcelotlError::InvalidModel` | `e9c02ca` |
+| Safetensors shape vs offsets mismatch | `safetensors_inspect::tests::inspect_safetensors_rejects_shape_offsets_mismatch_with_invalid_model_error`     | loader    | `OcelotlError::InvalidModel` | `19897f7` |
+
+### Notes
+
+- **Truncated header** is *not* the same case as **shape vs offsets mismatch**:
+  the truncated case is a header-vs-file-size disagreement (file ends before
+  the claimed header does), while the shape-mismatch case is a
+  header-vs-header inconsistency (declared shape times dtype size disagrees
+  with declared `data_offsets` byte length, but the file itself matches what
+  the header claims).
+- Both safetensors header-level inconsistencies are detected inside the
+  third-party `safetensors` crate's `read_metadata` and surface through the
+  loader wrapper as `OcelotlError::InvalidModel`. The shape-mismatch test is
+  a *behavioral pin*, not a feature add — it ensures a future safetensors
+  upgrade or wrapper refactor cannot silently regress the contract.
+- The dtype case maps to `Unsupported` (not `InvalidModel`) because the
+  artifact is well-formed but uses a dtype outside Ocelotl's declared
+  supported subset (`F32`, `F16`, `BF16`); see
+  `crates/loader/src/safetensors_inspect.rs::SupportedDtype`.
