@@ -14,6 +14,7 @@ Read these first:
 6. `docs/model-target.md`
 7. `docs/validation/tdd.md`
 8. `docs/ci.md`
+9. `docs/artifact-preparation.md` (only when a task needs real local model files; default tests are offline)
 
 The short version: Ocelotl is a Rust-first LLM inference runtime. The project is
 correctness-first and test-driven. CPU/reference behavior comes before GPU;
