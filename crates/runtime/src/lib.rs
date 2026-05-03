@@ -4,7 +4,7 @@ use ocelotl_core::{GenerationOptions, OcelotlError, Result, UnsupportedError};
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerateRequest {
     pub prompt: String,
     pub options: GenerationOptions,

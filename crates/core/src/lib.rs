@@ -434,10 +434,10 @@ pub struct ModelMetadata {
     pub tokenizer_model_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationOptions {
     pub max_new_tokens: usize,
-    pub temperature: Option<u32>,
+    pub temperature: Option<f32>,
 }
 
 impl Default for GenerationOptions {
