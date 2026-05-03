@@ -157,6 +157,51 @@ pub fn dot(a: &[f32], b: &[f32]) -> Result<f32> {
     Ok(acc)
 }
 
+/// Numerically stable softmax, in place over a single slice.
+///
+/// Computes `x[i] = exp(x[i] - max(x)) / sum_j exp(x[j] - max(x))`.
+/// Subtracting the max before exponentiating is the standard stability
+/// technique: it leaves the result mathematically unchanged but bounds the
+/// largest argument to `exp` at zero, preventing overflow for inputs whose
+/// magnitude exceeds `~88` in `f32`. M1 is contiguous-only.
+///
+/// An empty slice is a no-op (softmax of nothing is nothing). A slice that is
+/// all `-∞` or all `NaN` will produce `NaN` outputs — that is upstream's
+/// responsibility, not the kernel's.
+///
+/// # Example
+///
+/// ```
+/// use ocelotl_kernels::softmax;
+/// let mut x = [1.0_f32, 2.0, 3.0];
+/// softmax(&mut x);
+/// let sum: f32 = x.iter().sum();
+/// assert!((sum - 1.0).abs() < 4.0 * f32::EPSILON);
+/// ```
+pub fn softmax(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+
+    let mut max = x[0];
+    for &v in x.iter().skip(1) {
+        if v > max {
+            max = v;
+        }
+    }
+
+    let mut sum = 0.0_f32;
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+
+    let inv_sum = 1.0_f32 / sum;
+    for v in x.iter_mut() {
+        *v *= inv_sum;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +286,70 @@ mod tests {
                 );
             }
             other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    // --- softmax ---
+
+    #[test]
+    fn softmax_produces_known_distribution_for_three_element_input() {
+        // Hand-checked: softmax([1, 2, 3]) with max-subtraction stability:
+        //   shifted = [-2, -1, 0]
+        //   e^shifted ≈ [0.13533528, 0.36787944, 1.0]
+        //   sum ≈ 1.50321472
+        //   result ≈ [0.09003057, 0.24472847, 0.66524096]
+        let mut x = [1.0_f32, 2.0, 3.0];
+        softmax(&mut x);
+
+        let expected = [0.09003057_f32, 0.24472847, 0.66524096];
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 4.0 * f32::EPSILON,
+                "softmax mismatch: got {got}, want {want}"
+            );
+        }
+
+        let sum: f32 = x.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 4.0 * f32::EPSILON,
+            "softmax must sum to 1.0, got {sum}"
+        );
+    }
+
+    #[test]
+    fn softmax_is_stable_for_large_inputs() {
+        // Without max-subtraction, exp(1000) overflows to +inf and the result
+        // is NaN. With max-subtraction, the largest exponent is 0 and the
+        // result is well-defined.
+        let mut x = [1000.0_f32, 1001.0, 1002.0];
+        softmax(&mut x);
+
+        let sum: f32 = x.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 4.0 * f32::EPSILON,
+            "stable softmax must sum to 1.0 even for large inputs, got {sum}"
+        );
+        for v in x.iter() {
+            assert!(v.is_finite(), "softmax output must be finite, got {v}");
+        }
+    }
+
+    #[test]
+    fn softmax_of_empty_slice_is_a_noop() {
+        let mut x: [f32; 0] = [];
+        softmax(&mut x);
+        // No assertion needed — must not panic.
+    }
+
+    #[test]
+    fn softmax_of_uniform_input_is_uniform_distribution() {
+        let mut x = [5.0_f32; 4];
+        softmax(&mut x);
+        for v in x.iter() {
+            assert!(
+                (v - 0.25).abs() < 4.0 * f32::EPSILON,
+                "uniform softmax must be 1/n, got {v}"
+            );
         }
     }
 }
