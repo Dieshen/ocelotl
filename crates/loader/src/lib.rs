@@ -11,6 +11,12 @@ use serde::Deserialize;
 /// rejected with `OcelotlError::Unsupported` before any further validation.
 const SUPPORTED_ARCHITECTURES: &[&str] = &["qwen2"];
 
+/// Dtypes the loader currently accepts. Anything outside this list is rejected
+/// with `OcelotlError::Unsupported` before the full metadata parse, so the
+/// rejection happens with a typed error rather than a generic serde
+/// "unknown variant" InvalidModel.
+const SUPPORTED_DTYPES: &[&str] = &["f32"];
+
 /// Top-level fixture envelope: `{ "model": { ... }, ... }`. Only the `model`
 /// field is meaningful for loading; the rest is fixture metadata.
 #[derive(Debug, Deserialize)]
@@ -18,12 +24,15 @@ struct MetadataEnvelope {
     model: ModelInspect,
 }
 
-/// Minimal projection of the model object used to gate on architecture before
-/// committing to a full `ModelMetadata` deserialize. Keeps the architecture
-/// rejection path independent of unrelated field-shape errors.
+/// Minimal projection of the model object used to gate on architecture and
+/// dtype before committing to a full `ModelMetadata` deserialize. Keeping
+/// these as `String` (not the typed `DType` enum) is intentional: serde would
+/// reject unknown enum variants at parse time and surface them as
+/// `InvalidModel`, when we want a typed `Unsupported` instead.
 #[derive(Debug, Deserialize)]
 struct ModelInspect {
     architecture: String,
+    dtype: String,
 }
 
 /// Load and validate a model metadata document from disk.
@@ -58,7 +67,15 @@ pub fn load_metadata(path: &Path) -> Result<ModelMetadata> {
         }));
     }
 
-    // Architecture is supported; deserialize the full metadata struct.
+    if !SUPPORTED_DTYPES.contains(&envelope.model.dtype.as_str()) {
+        return Err(OcelotlError::from(UnsupportedError {
+            feature: "dtype".to_string(),
+            requested: Some(envelope.model.dtype),
+            supported: SUPPORTED_DTYPES.iter().map(|s| s.to_string()).collect(),
+        }));
+    }
+
+    // Architecture and dtype are supported; deserialize the full metadata struct.
     #[derive(Debug, Deserialize)]
     struct FullEnvelope {
         model: ModelMetadata,
@@ -112,6 +129,38 @@ mod tests {
             }
             other => {
                 panic!("expected OcelotlError::Unsupported for unknown architecture, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn load_metadata_rejects_unknown_dtype_with_typed_unsupported_error() {
+        let path = fixture_path("unsupported_dtype.json");
+
+        let err = load_metadata(&path)
+            .expect_err("loading an unknown dtype must fail with a typed error");
+
+        match err {
+            OcelotlError::Unsupported(unsupported) => {
+                assert_eq!(
+                    unsupported.feature, "dtype",
+                    "expected feature == \"dtype\", got {:?}",
+                    unsupported.feature
+                );
+                assert_eq!(
+                    unsupported.requested.as_deref(),
+                    Some("f8"),
+                    "expected requested dtype from fixture, got {:?}",
+                    unsupported.requested
+                );
+                assert!(
+                    unsupported.supported.iter().any(|s| s == "f32"),
+                    "expected `f32` in supported list, got {:?}",
+                    unsupported.supported
+                );
+            }
+            other => {
+                panic!("expected OcelotlError::Unsupported for unknown dtype, got {other:?}")
             }
         }
     }

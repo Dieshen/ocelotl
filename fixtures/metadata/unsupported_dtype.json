@@ -1,0 +1,24 @@
+{
+  "fixture_version": 1,
+  "name": "unsupported_dtype",
+  "purpose": "Negative fixture: loader/runtime should reject unknown dtypes before compute.",
+  "source": "hand-authored synthetic fixture",
+  "model": {
+    "architecture": "qwen2",
+    "context_length": 128,
+    "vocab_size": 32,
+    "dtype": "f8",
+    "num_hidden_layers": 2,
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 4,
+    "rope_theta": 1000000.0,
+    "rms_norm_eps": 0.000001
+  },
+  "expected_error": {
+    "category": "Unsupported",
+    "feature": "dtype"
+  }
+}
