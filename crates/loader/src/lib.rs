@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 pub mod safetensors_inspect;
 pub use safetensors_inspect::{
-    SafetensorsManifest, SupportedDtype, TensorEntry, inspect_safetensors,
+    SafetensorsManifest, SupportedDtype, TensorEntry, inspect_safetensors, require_tensors,
 };
 
 /// Architectures the loader currently accepts. Anything outside this list is

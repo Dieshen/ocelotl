@@ -97,6 +97,35 @@ pub fn inspect_safetensors(path: &Path) -> Result<SafetensorsManifest> {
     })
 }
 
+/// Verify that every tensor name in `required` appears in the manifest.
+/// Returns an `OcelotlError::InvalidModel` for the *first* missing tensor,
+/// with `field` set to the missing name so callers can surface
+/// "this artifact is missing tensor X" without parsing the message.
+///
+/// `path` is optional so callers that built a manifest from memory can still
+/// use this helper; tests against on-disk fixtures should pass `Some(path)`
+/// so the InvalidModel error carries the artifact location.
+///
+/// Kept deliberately small for M2.5: M2.6 will own the model-family-specific
+/// list of required tensor names (e.g. the full Qwen2.5 weight set). This
+/// helper just answers "are all these names present?" against any manifest.
+pub fn require_tensors(
+    manifest: &SafetensorsManifest,
+    required: &[&str],
+    path: Option<&Path>,
+) -> Result<()> {
+    for name in required {
+        if !manifest.tensors.iter().any(|t| t.name == *name) {
+            return Err(OcelotlError::from(InvalidModelError {
+                path: path.map(|p| p.to_path_buf()),
+                field: Some((*name).to_string()),
+                message: format!("required tensor `{name}` not found in safetensors header"),
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Map a safetensors dtype to the supported subset, returning a typed
 /// `Unsupported` error otherwise. The error reports the *requested* dtype as
 /// the safetensors crate's `Display` form (e.g. `"F32"`, `"Q4_0"`-style names
@@ -311,6 +340,64 @@ mod tests {
                 panic!("expected OcelotlError::Unsupported for F64 dtype, got {other:?}")
             }
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn require_tensors_returns_invalid_model_error_when_a_required_tensor_is_missing() {
+        // The manifest declares only `embed`. We require both `embed` and
+        // `lm_head`. The contract: missing tensors are an InvalidModel
+        // error (the artifact is internally incomplete relative to a
+        // model-family expectation), with `field` carrying the missing
+        // tensor name so callers can surface "this artifact is missing
+        // tensor X".
+        let path = tmp_path("missing_tensor");
+        build_fixture(&path, &[("embed", "F32", &[2, 4])]);
+
+        let manifest = inspect_safetensors(&path).expect("fixture inspects");
+        let err = require_tensors(&manifest, &["embed", "lm_head"], Some(&path))
+            .expect_err("require_tensors must reject when a required tensor is absent");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.path.as_deref(),
+                    Some(path.as_path()),
+                    "expected fixture path on InvalidModel, got {:?}",
+                    invalid.path,
+                );
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("lm_head"),
+                    "expected the missing tensor name in field, got {:?}",
+                    invalid.field,
+                );
+                assert!(
+                    invalid.message.contains("lm_head"),
+                    "expected message to mention the missing tensor, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => {
+                panic!("expected OcelotlError::InvalidModel for missing tensor, got {other:?}")
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn require_tensors_returns_ok_when_all_required_tensors_are_present() {
+        let path = tmp_path("all_present");
+        build_fixture(
+            &path,
+            &[("embed", "F32", &[2, 4]), ("lm_head", "F32", &[4, 2])],
+        );
+
+        let manifest = inspect_safetensors(&path).expect("fixture inspects");
+        require_tensors(&manifest, &["embed", "lm_head"], Some(&path))
+            .expect("all required tensors are present");
 
         let _ = std::fs::remove_file(&path);
     }
