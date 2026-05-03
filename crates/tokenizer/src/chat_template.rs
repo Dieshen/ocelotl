@@ -55,13 +55,11 @@ pub struct ChatMessage {
 /// from minijinja are translated to typed `OcelotlError` at every public
 /// boundary so callers never see `minijinja::Error`.
 pub struct ChatTemplate {
-    // Owns the template source string so the Environment can borrow from
-    // a stable address; minijinja's `add_template` requires a borrowed
-    // `&str` so we pin the source on the heap.
+    // The Environment owns the template source via `add_template_owned`
+    // (minijinja 2.19's `Cow`-based API), so we don't carry a separate
+    // source field. Lifetime parameter is `'static` because no borrowed
+    // strings cross the boundary — only owned `String`s go in.
     env: Environment<'static>,
-    // Kept around so callers can re-inspect the template they compiled
-    // (useful for fixture round-trip tests). Not exposed publicly.
-    _source: Box<str>,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -83,24 +81,6 @@ impl ChatTemplate {
     /// Returns `OcelotlError::Tokenizer` with the parse error preserved
     /// as the source if the template is syntactically invalid.
     pub fn from_jinja(source: &str) -> Result<Self> {
-        // Heap-pin the source so the Environment can hold a `'static`
-        // borrow into it.
-        let source: Box<str> = Box::from(source);
-        // SAFETY-ish: we leak the Box to obtain a `'static` reference
-        // that the Environment can hold. The Box is then reconstituted
-        // and stored alongside the Environment so the lifetime balance
-        // works out — the leaked reference and the reconstituted Box
-        // refer to the same allocation, which lives as long as `Self`.
-        // We never expose the leaked reference.
-        let source_ptr: *const str = Box::into_raw(source);
-        // SAFETY: source_ptr is non-null and points at a live allocation
-        // we just heap-allocated. We immediately reconstruct the Box
-        // below to keep ownership; the &'static borrow we hand to the
-        // Environment is valid for as long as the Box is alive (the
-        // Box is stored on the same struct).
-        let source_ref: &'static str = unsafe { &*source_ptr };
-        let owned: Box<str> = unsafe { Box::from_raw(source_ptr as *mut str) };
-
         let mut env = Environment::new();
         // Lenient undefined matches Jinja2's default and is what
         // upstream Hugging Face chat templates are authored against.
@@ -114,13 +94,17 @@ impl ChatTemplate {
         // fixture-pinned expected output catches accidental drift in
         // semantics.
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
-        env.add_template(TEMPLATE_NAME, source_ref)
+        // `add_template_owned` (minijinja 2.19) accepts `Into<Cow<'source,
+        // str>>` for both name and source. Passing owned `String`s lets
+        // the Environment hold the source for its own lifetime without
+        // any borrow from us — no `unsafe`, no leaked Box, no manual
+        // lifetime extension. This is the safe alternative to the
+        // borrowed `add_template`, which would require us to feed the
+        // Environment a `&'static str` we don't actually have.
+        env.add_template_owned(TEMPLATE_NAME.to_string(), source.to_string())
             .map_err(translate_compile_error)?;
 
-        Ok(Self {
-            env,
-            _source: owned,
-        })
+        Ok(Self { env })
     }
 
     /// Render the template against `messages` plus the standard Hugging
