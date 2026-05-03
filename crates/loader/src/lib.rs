@@ -81,13 +81,27 @@ pub fn load_metadata(path: &Path) -> Result<ModelMetadata> {
         model: ModelMetadata,
     }
     let full: FullEnvelope = serde_json::from_str(&json).map_err(|source| {
+        let message = format!("failed to parse metadata JSON: {source}");
+        let field = extract_missing_field(&message);
         OcelotlError::from(InvalidModelError {
             path: Some(path.to_path_buf()),
-            field: None,
-            message: format!("failed to parse metadata JSON: {source}"),
+            field,
+            message,
         })
     })?;
     Ok(full.model)
+}
+
+/// Best-effort extraction of the field name from serde's standard
+/// "missing field `<name>`" error message. Returns `None` when the message
+/// does not match that pattern; callers should still surface the full message
+/// in the error so nothing is lost when extraction fails.
+fn extract_missing_field(message: &str) -> Option<String> {
+    let needle = "missing field `";
+    let start = message.find(needle)? + needle.len();
+    let rest = &message[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
 }
 
 #[cfg(test)]
@@ -163,6 +177,54 @@ mod tests {
                 panic!("expected OcelotlError::Unsupported for unknown dtype, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn load_metadata_rejects_missing_required_field_with_invalid_model_error() {
+        let path = fixture_path("invalid_missing_vocab_size.json");
+
+        let err =
+            load_metadata(&path).expect_err("loading metadata missing a required field must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.path.as_deref(),
+                    Some(path.as_path()),
+                    "expected fixture path on the InvalidModel error, got {:?}",
+                    invalid.path
+                );
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("vocab_size"),
+                    "expected extracted field name == vocab_size, got {:?}",
+                    invalid.field
+                );
+                assert!(
+                    invalid.message.contains("vocab_size"),
+                    "expected message to mention the missing field, got {:?}",
+                    invalid.message
+                );
+            }
+            other => {
+                panic!("expected OcelotlError::InvalidModel for missing field, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn extract_missing_field_returns_none_for_unrelated_message() {
+        assert_eq!(extract_missing_field("some other error text"), None);
+    }
+
+    #[test]
+    fn extract_missing_field_extracts_name_from_serde_message() {
+        let message =
+            "failed to parse metadata JSON: missing field `vocab_size` at line 1 column 50";
+        assert_eq!(
+            extract_missing_field(message).as_deref(),
+            Some("vocab_size")
+        );
     }
 }
 
