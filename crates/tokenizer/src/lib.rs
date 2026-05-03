@@ -1,9 +1,7 @@
 //! Tokenizer and chat-template boundary.
 
+pub use ocelotl_core::TokenId;
 use ocelotl_core::{OcelotlError, Result, UnsupportedError};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TokenId(pub u32);
 
 pub trait Tokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<Vec<TokenId>>;
