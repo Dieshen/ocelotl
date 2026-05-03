@@ -338,6 +338,29 @@ mod tests {
         assert_eq!(c.0, 4096);
     }
 
+    // --- GenerateResponse (M1.9) ---
+
+    #[test]
+    fn generate_response_round_trips_through_serde_json() {
+        // The server crate will eventually serialize this to JSON, so we pin
+        // the wire shape here: a `tokens` array of u32-shaped TokenIds. If
+        // someone changes the field name or token representation, this test
+        // fails before the server contract silently drifts.
+        let resp = GenerateResponse {
+            tokens: vec![TokenId(7), TokenId(42), TokenId(0)],
+        };
+
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            json.contains("\"tokens\""),
+            "expected tokens field in JSON, got {json:?}"
+        );
+        assert!(json.contains("7") && json.contains("42"));
+
+        let round_tripped: GenerateResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, resp);
+    }
+
     // Type safety is enforced at compile time — TokenId and SeqLen are distinct
     // types; passing one where the other is expected is a type error.
 
@@ -438,6 +461,17 @@ pub struct ModelMetadata {
 pub struct GenerationOptions {
     pub max_new_tokens: usize,
     pub temperature: Option<f32>,
+}
+
+/// The result of a generation call: the tokens the runtime produced, in
+/// emission order. Token-level (not text-level) because detokenization is the
+/// caller's job — the runtime owns no tokenizer. The server crate maps this
+/// to JSON; the loader and kernel crates don't import it. Lives in
+/// `ocelotl-core` so every consumer agrees on the shape without depending on
+/// the runtime crate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerateResponse {
+    pub tokens: Vec<TokenId>,
 }
 
 impl Default for GenerationOptions {
