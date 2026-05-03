@@ -16,3 +16,10 @@ ocelotl-core.workspace = true
 # `onig` C dependency and `progressbar`; `fancy-regex` (pure Rust) covers the
 # regex needs of pre-tokenizers like `Whitespace`.
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]
+# Test-only: parse the small JSON fixtures under `fixtures/tokenizer/` (e.g.
+# qwen2_5_basic_prompt.json) into typed records for exact-ID assertions. Not
+# needed by production code; the `Tokenizer` trait does not deal in JSON.
+serde.workspace = true
+serde_json.workspace = true
