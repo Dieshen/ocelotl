@@ -1,5 +1,9 @@
 //! Request lifecycle and generation runtime.
 
+mod sampling;
+
+pub use sampling::greedy_sample;
+
 use ocelotl_core::{
     GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId,
     UnsupportedError,
