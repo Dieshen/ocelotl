@@ -202,6 +202,81 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
+/// Matrix multiplication: `out = a @ b`, all row-major contiguous.
+///
+/// Shapes:
+/// - `a` is `m × k`, total length `m * k`.
+/// - `b` is `k × n`, total length `k * n`.
+/// - `out` is `m × n`, total length `m * n`.
+///
+/// This is a triple-loop reference implementation: `O(m * n * k)`. It is the
+/// parity oracle for future GPU matmul kernels, not a fast kernel.
+///
+/// # Errors
+///
+/// Returns `KernelError` (backend = `"cpu"`) when:
+/// - the inner dimensions of `a` and `b` disagree (`a_shape.1 != b_shape.0`),
+/// - any input slice length does not match its declared shape,
+/// - the output buffer length does not match `m * n`.
+///
+/// # Example
+///
+/// ```
+/// use ocelotl_kernels::matmul;
+/// // [[1, 2], [3, 4]] @ [[5, 6], [7, 8]] = [[19, 22], [43, 50]]
+/// let a = [1.0_f32, 2.0, 3.0, 4.0];
+/// let b = [5.0_f32, 6.0, 7.0, 8.0];
+/// let mut out = [0.0_f32; 4];
+/// matmul(&a, (2, 2), &b, (2, 2), &mut out).unwrap();
+/// assert_eq!(out, [19.0, 22.0, 43.0, 50.0]);
+/// ```
+pub fn matmul(
+    a: &[f32],
+    a_shape: (usize, usize),
+    b: &[f32],
+    b_shape: (usize, usize),
+    out: &mut [f32],
+) -> Result<()> {
+    let (m, k_a) = a_shape;
+    let (k_b, n) = b_shape;
+
+    if k_a != k_b {
+        return Err(kernel_err(format!(
+            "matmul inner-dimension mismatch: a is {m}x{k_a}, b is {k_b}x{n}"
+        )));
+    }
+    if a.len() != m * k_a {
+        return Err(kernel_err(format!(
+            "matmul a slice length {} does not match shape {m}x{k_a}",
+            a.len()
+        )));
+    }
+    if b.len() != k_b * n {
+        return Err(kernel_err(format!(
+            "matmul b slice length {} does not match shape {k_b}x{n}",
+            b.len()
+        )));
+    }
+    if out.len() != m * n {
+        return Err(kernel_err(format!(
+            "matmul out slice length {} does not match shape {m}x{n}",
+            out.len()
+        )));
+    }
+
+    let k = k_a;
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0_f32;
+            for p in 0..k {
+                acc += a[i * k + p] * b[p * n + j];
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +426,78 @@ mod tests {
                 "uniform softmax must be 1/n, got {v}"
             );
         }
+    }
+
+    // --- matmul ---
+
+    #[test]
+    fn matmul_handles_two_by_two_times_two_by_two() {
+        // [[1, 2], [3, 4]] @ [[5, 6], [7, 8]] = [[19, 22], [43, 50]]
+        // Hand check: row 0 of out = [1*5+2*7, 1*6+2*8] = [19, 22]
+        //             row 1 of out = [3*5+4*7, 3*6+4*8] = [43, 50]
+        let a = [1.0_f32, 2.0, 3.0, 4.0];
+        let b = [5.0_f32, 6.0, 7.0, 8.0];
+        let mut out = [0.0_f32; 4];
+
+        matmul(&a, (2, 2), &b, (2, 2), &mut out).expect("well-formed matmul must succeed");
+
+        assert_eq!(out, [19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn matmul_handles_non_square_two_by_three_times_three_by_two() {
+        // A = [[1, 2, 3], [4, 5, 6]]   (2x3)
+        // B = [[7, 8], [9, 10], [11, 12]]   (3x2)
+        // A@B row 0 = [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
+        // A@B row 1 = [4*7+5*9+6*11, 4*8+5*10+6*12] = [139, 154]
+        let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [7.0_f32, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let mut out = [0.0_f32; 4];
+
+        matmul(&a, (2, 3), &b, (3, 2), &mut out).expect("well-formed matmul must succeed");
+
+        assert_eq!(out, [58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn matmul_rejects_inner_dimension_mismatch() {
+        let a = [1.0_f32; 6]; // 2x3
+        let b = [1.0_f32; 8]; // 4x2 — inner dims disagree
+        let mut out = [0.0_f32; 4];
+
+        let err =
+            matmul(&a, (2, 3), &b, (4, 2), &mut out).expect_err("must reject inner-dim mismatch");
+
+        match err {
+            OcelotlError::Kernel(KernelError { backend, message }) => {
+                assert_eq!(backend, "cpu");
+                assert!(
+                    message.contains("inner-dimension"),
+                    "expected inner-dim message, got {message:?}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matmul_rejects_wrong_a_slice_length() {
+        let a = [1.0_f32; 5]; // claimed 2x3, actually 5
+        let b = [1.0_f32; 6]; // 3x2
+        let mut out = [0.0_f32; 4];
+
+        let err = matmul(&a, (2, 3), &b, (3, 2), &mut out).expect_err("must reject wrong a length");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn matmul_rejects_wrong_output_length() {
+        let a = [1.0_f32; 6]; // 2x3
+        let b = [1.0_f32; 6]; // 3x2
+        let mut out = [0.0_f32; 3]; // claimed 2x2 = 4
+
+        let err =
+            matmul(&a, (2, 3), &b, (3, 2), &mut out).expect_err("must reject wrong out length");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
     }
 }
