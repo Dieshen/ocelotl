@@ -1,0 +1,36 @@
+{
+  "fixture_version": 1,
+  "name": "qwen2_5_0_5b_instruct_pinned_artifact",
+  "purpose": "Machine-readable pin of the external model artifact identity used by M2 fixtures (tokenizer, chat template, safetensors metadata). Mirrors the Pinned Revision section of docs/model-target.md so tests can assert against an exact SHA without parsing prose.",
+  "model_family": "qwen2",
+  "artifact": {
+    "host": "huggingface",
+    "repository": "Qwen/Qwen2.5-0.5B-Instruct",
+    "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "revision_branch_at_pin_time": "main",
+    "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/tree/7ae557604adf67be50417f59c2c2f167def9a775",
+    "license": "apache-2.0",
+    "license_source": "Hugging Face repo metadata at pinned revision",
+    "date_pinned": "2026-05-03",
+    "pinned_by_task": "M2.1"
+  },
+  "tokenizer": {
+    "source_repository": "Qwen/Qwen2.5-0.5B-Instruct",
+    "source_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "expected_files": [
+      "tokenizer.json",
+      "tokenizer_config.json"
+    ],
+    "notes": "Same revision as the artifact pin. Token-ID and chat-template fixtures derived from this revision must reference the SHA above."
+  },
+  "scope": {
+    "covers_tasks": ["M2.2", "M2.3", "M2.4", "M2.5"],
+    "weight_files_committed": false,
+    "weight_files_note": "Per docs/validation/fixtures.md storage policy, large model weights (safetensors) must not be committed. M2.5 will commit only tiny synthetic safetensors fixtures plus, optionally, captured metadata (tensor names/shapes/dtypes/byte ranges) extracted from the pinned revision."
+  },
+  "prompt": null,
+  "expected_output": null,
+  "tolerance": null,
+  "applicability_notes": "This fixture is a manifest, not a behavioral fixture. The prompt/expected_output/tolerance fields required by docs/validation/fixtures.md for behavioral fixtures are explicitly null here. Behavioral fixtures (e.g. fixtures/tokenizer/qwen2_5_basic_prompt.json) reference this manifest's artifact.revision for their source-of-truth.",
+  "license_considerations": "Apache-2.0 permits redistribution and modification with attribution. No model weights are redistributed by this manifest; only the upstream identity is recorded. Derived fixtures that capture tokenizer JSON content or safetensors metadata must preserve upstream license attribution and remain small enough to fall under fair-use/quotation norms regardless."
+}
