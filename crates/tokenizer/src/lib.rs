@@ -148,4 +148,42 @@ mod tests {
             other => panic!("expected OcelotlError::Tokenizer, got {other:?}"),
         }
     }
+
+    #[test]
+    fn json_tokenizer_malformed_json_returns_typed_tokenizer_error_with_path() {
+        // Write malformed JSON to a unique temp file (no committed fixture so
+        // we don't step on M2.7's malformed-fixture work).
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ocelotl_tokenizer_malformed_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"{not valid json")
+            .expect("temp dir must be writable for malformed-JSON test");
+
+        let err =
+            JsonTokenizer::from_json_path(&path).expect_err("malformed tokenizer.json must fail");
+
+        // Best-effort cleanup; failure does not invalidate the assertion below.
+        let _ = std::fs::remove_file(&path);
+
+        match err {
+            OcelotlError::Tokenizer(t) => {
+                let rendered = format!("{t}");
+                assert!(
+                    rendered.contains("ocelotl_tokenizer_malformed_"),
+                    "expected offending path in tokenizer error display, got {rendered:?}"
+                );
+                assert!(
+                    std::error::Error::source(&t).is_some(),
+                    "expected underlying parse error to be preserved as source"
+                );
+            }
+            other => panic!("expected OcelotlError::Tokenizer, got {other:?}"),
+        }
+    }
 }
