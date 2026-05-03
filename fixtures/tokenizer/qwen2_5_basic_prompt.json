@@ -1,9 +1,19 @@
 {
   "fixture_version": 1,
   "name": "qwen2_5_basic_prompt",
-  "purpose": "Placeholder tokenizer fixture shape for M2 exact token ID tests.",
+  "purpose": "Exact encode/decode round trip for the M2.3 Qwen2.5 tokenizer fixture: prove the Ocelotl JsonTokenizer wrapper reproduces upstream Qwen2.5 BPE behavior bit-for-bit at the pinned revision.",
   "source": "Qwen/Qwen2.5-0.5B-Instruct tokenizer at revision 7ae557604adf67be50417f59c2c2f167def9a775; see fixtures/manifest/qwen2_5_0_5b_instruct.json (M2.1) for the canonical pin and docs/model-target.md for rationale.",
   "input": "Hello",
-  "expected_token_ids": [],
-  "notes": "This file defines the fixture contract. M2.3 must replace expected_token_ids with exact IDs produced by the pinned tokenizer revision referenced in source."
+  "expected_token_ids": [9707],
+  "decoded": "Hello",
+  "encode_options": {
+    "add_special_tokens": false,
+    "notes": "JsonTokenizer::encode currently passes add_special_tokens=false. The Qwen2.5 tokenizer does not auto-prepend BOS at the encode step (BOS/EOS are added by chat-template rendering, which is M2.4 territory). A bare ASCII word maps to a single BPE token under the Qwen2.5 vocab."
+  },
+  "decode_options": {
+    "skip_special_tokens": true,
+    "notes": "JsonTokenizer::decode currently passes skip_special_tokens=true. For this fixture there are no special tokens in the encoded sequence, so the flag has no effect — but the round-trip semantics are still pinned: encode(input) -> [9707] -> decode -> \"Hello\"."
+  },
+  "regeneration": "If the upstream tokenizer.json changes under the pinned SHA (treated as a breaking-change event per docs/model-target.md), re-run: `cargo test -p ocelotl-tokenizer --test qwen2_5_basic_prompt -- --ignored`. The failure message reports the new IDs; update expected_token_ids and decoded here, and bump fixtures/manifest/qwen2_5_0_5b_instruct.json + docs/model-target.md in the same dedicated commit.",
+  "notes": "M2.3 closes the placeholder shape M2.1 left behind. The decoded field is the source of truth for round-trip semantics — assertions compare against decoded, not input, so future Qwen2.5 fixtures (e.g. multi-token prompts where whitespace handling matters) can pin a non-trivial decoded form without changing the test. The accompanying integration test lives at crates/tokenizer/tests/qwen2_5_basic_prompt.rs and is #[ignore]'d by default per docs/artifact-preparation.md."
 }
