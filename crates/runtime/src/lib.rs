@@ -9,7 +9,15 @@ use ocelotl_core::{
     UnsupportedError,
 };
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
+use ocelotl_models::tiny_synthetic_forward;
 use serde::{Deserialize, Serialize};
+
+// Re-export the response vocabulary type so callers can
+// `use ocelotl_runtime::GenerateResponse;` without also pulling in
+// `ocelotl_core` directly. The canonical definition still lives in core
+// because the server crate will JSON-serialize it without depending on the
+// runtime.
+pub use ocelotl_core::GenerateResponse;
 
 /// A generation request after tokenization. The runtime accepts token ids,
 /// not raw strings; tokenization is the caller's responsibility (the
@@ -18,11 +26,6 @@ use serde::{Deserialize, Serialize};
 pub struct GenerateRequest {
     pub prompt_tokens: Vec<TokenId>,
     pub options: GenerationOptions,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GenerateResponse {
-    pub text: String,
 }
 
 /// Validate a generation request against the loaded model's metadata before
@@ -76,6 +79,39 @@ pub fn validate_request(req: &GenerateRequest, model: &ModelMetadata) -> Result<
     Ok(())
 }
 
+/// Run the M1 CPU reference path end to end and return a single sampled
+/// token.
+///
+/// This is the public entry point that wires together every component the
+/// previous M1 milestones built:
+///
+/// 1. `validate_request` (M1.6) rejects empty prompts, zero
+///    `max_new_tokens`, sampling-mode requests, and context overflow.
+/// 2. `ocelotl_models::tiny_synthetic_forward` (M1.9) produces a
+///    deterministic logits vector via `kernels::matmul` (M1.7).
+/// 3. `greedy_sample` (M1.8) picks the argmax with lowest-token-id
+///    tie-break.
+///
+/// # Why one token, not `max_new_tokens` tokens
+///
+/// M1 proves the *pipeline*. A loop that re-runs the synthetic forward
+/// `max_new_tokens` times would just be a `for` loop wrapped around this
+/// function and would not exercise any new component. Multi-step
+/// generation needs a KV cache and a real decoder loop, which is M3 work.
+/// Returning one token here keeps the contract honest: M1 is "the wires
+/// are connected", not "the runtime can decode".
+pub fn generate_one_token(
+    req: &GenerateRequest,
+    model: &ModelMetadata,
+) -> Result<GenerateResponse> {
+    validate_request(req, model)?;
+    let logits = tiny_synthetic_forward(model, &req.prompt_tokens)?;
+    let next_token = greedy_sample(&logits)?;
+    Ok(GenerateResponse {
+        tokens: vec![next_token],
+    })
+}
+
 pub struct Runtime<B: KernelBackend = CpuKernelBackend> {
     backend: B,
 }
@@ -97,12 +133,15 @@ impl<B: KernelBackend> Runtime<B> {
         &self.backend
     }
 
-    pub fn generate(&self, _request: GenerateRequest) -> Result<GenerateResponse> {
-        Err(OcelotlError::Unsupported(UnsupportedError {
-            feature: "generate".to_string(),
-            requested: None,
-            supported: vec![],
-        }))
+    /// Run a generation request through the M1 CPU reference path. For now
+    /// this is a thin shim around `generate_one_token`; multi-token
+    /// generation arrives with the KV cache in M3.
+    pub fn generate(
+        &self,
+        request: GenerateRequest,
+        model: &ModelMetadata,
+    ) -> Result<GenerateResponse> {
+        generate_one_token(&request, model)
     }
 }
 
@@ -262,6 +301,41 @@ mod tests {
         match err {
             OcelotlError::Unsupported(u) => assert_eq!(u.feature, "sampling_mode"),
             other => panic!("expected sampling_mode rejection to win, got {other:?}"),
+        }
+    }
+
+    // --- generate_one_token (M1.9 wiring) ---
+
+    #[test]
+    fn generate_one_token_returns_one_token_for_valid_request() {
+        let model = make_model(128);
+        let req = make_request(1, 8);
+
+        let resp = generate_one_token(&req, &model).expect("valid request must produce a token");
+
+        assert_eq!(resp.tokens.len(), 1);
+        assert!(
+            (resp.tokens[0].0 as usize) < model.vocab_size,
+            "sampled token must be within vocabulary, got {:?}",
+            resp.tokens[0]
+        );
+    }
+
+    #[test]
+    fn generate_one_token_propagates_validation_errors() {
+        // The wired path must surface validation failures verbatim — no
+        // swallowing, no remapping. A temperature request must produce the
+        // same Unsupported error validate_request would.
+        let model = make_model(128);
+        let mut req = make_request(1, 8);
+        req.options.temperature = Some(0.7);
+
+        let err = generate_one_token(&req, &model)
+            .expect_err("validation failure must propagate through generate_one_token");
+
+        match err {
+            OcelotlError::Unsupported(u) => assert_eq!(u.feature, "sampling_mode"),
+            other => panic!("expected sampling_mode rejection, got {other:?}"),
         }
     }
 }
