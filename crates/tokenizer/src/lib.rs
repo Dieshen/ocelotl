@@ -125,4 +125,27 @@ mod tests {
         // Pinned by fixtures/tokenizer/README.md: hello -> 1, world -> 2.
         assert_eq!(ids, vec![TokenId(1), TokenId(2)]);
     }
+
+    #[test]
+    fn json_tokenizer_missing_file_returns_typed_tokenizer_error_with_path() {
+        let bogus = tokenizer_fixture_path("does_not_exist_M2_2.json");
+
+        let err = JsonTokenizer::from_json_path(&bogus)
+            .expect_err("loading a missing tokenizer.json must fail");
+
+        match err {
+            OcelotlError::Tokenizer(t) => {
+                let rendered = format!("{t}");
+                assert!(
+                    rendered.contains("does_not_exist_M2_2.json"),
+                    "expected missing path in tokenizer error display, got {rendered:?}"
+                );
+                assert!(
+                    std::error::Error::source(&t).is_some(),
+                    "expected underlying tokenizers error to be preserved as source"
+                );
+            }
+            other => panic!("expected OcelotlError::Tokenizer, got {other:?}"),
+        }
+    }
 }
