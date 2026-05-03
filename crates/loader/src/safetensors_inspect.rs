@@ -268,4 +268,50 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn inspect_safetensors_rejects_unsupported_dtype_with_typed_unsupported_error() {
+        // F64 is a valid safetensors dtype (so the header parses cleanly) but
+        // outside Ocelotl's supported subset for M2.5. The contract: this is
+        // an Unsupported error (not InvalidModel) carrying the requested
+        // dtype name and the supported list, so callers can render
+        // "we support [F32, F16, BF16]; got F64".
+        let path = tmp_path("unsupported_dtype");
+        build_fixture(&path, &[("attention_bias", "F64", &[2, 4])]);
+
+        let err =
+            inspect_safetensors(&path).expect_err("F64 dtype must be rejected with Unsupported");
+
+        match err {
+            OcelotlError::Unsupported(unsupported) => {
+                assert_eq!(
+                    unsupported.feature, "safetensors_dtype",
+                    "expected feature == \"safetensors_dtype\", got {:?}",
+                    unsupported.feature,
+                );
+                let requested = unsupported
+                    .requested
+                    .as_deref()
+                    .expect("Unsupported error must carry the requested dtype");
+                assert!(
+                    requested.contains("F64"),
+                    "expected requested to mention F64, got {requested:?}",
+                );
+                assert!(
+                    requested.contains("attention_bias"),
+                    "expected requested to mention the offending tensor name, got {requested:?}",
+                );
+                assert!(
+                    unsupported.supported.iter().any(|s| s == "F32"),
+                    "expected F32 in supported list, got {:?}",
+                    unsupported.supported,
+                );
+            }
+            other => {
+                panic!("expected OcelotlError::Unsupported for F64 dtype, got {other:?}")
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
