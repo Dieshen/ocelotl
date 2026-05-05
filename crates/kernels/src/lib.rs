@@ -28,6 +28,8 @@
 
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
+pub mod rmsnorm;
+
 #[derive(Debug, Clone)]
 pub struct KernelContext {
     pub device: Device,
