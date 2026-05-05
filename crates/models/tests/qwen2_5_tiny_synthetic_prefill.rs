@@ -200,7 +200,11 @@ fn prefill_matches_pinned_fixture_within_tolerance() {
         cfg.vocab_size,
     );
 
-    for (i, (got, want)) in logits.iter().zip(fixture.expected_logits.iter()).enumerate() {
+    for (i, (got, want)) in logits
+        .iter()
+        .zip(fixture.expected_logits.iter())
+        .enumerate()
+    {
         let diff = (got - want).abs();
         assert!(
             diff < TOLERANCE,
