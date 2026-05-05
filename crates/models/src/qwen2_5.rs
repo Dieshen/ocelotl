@@ -31,6 +31,19 @@ use ocelotl_core::{DType, InvalidModelError, ModelMetadata, OcelotlError, Unsupp
 /// directly with any `architecture` string.
 const QWEN2_5_ARCHITECTURE: &str = "qwen2";
 
+/// Upper bound on `context_length` accepted at construction time.
+///
+/// The largest published Qwen2.5 context (with YaRN scaling, on the
+/// larger family members) is 131072. We pick `1 << 20` (= 1_048_576),
+/// roughly 8x that, as a generous guard rail: wide enough not to
+/// false-reject any real Qwen2.5 config (or any plausible near-future
+/// extension), narrow enough to catch obvious metadata-corruption
+/// values like u32::MAX or accidental byte-count-as-token-count.
+///
+/// The number is not load-bearing; if a future Qwen2.5 release
+/// genuinely needs more, raise it and update the pinning test.
+const QWEN2_5_MAX_CONTEXT_LENGTH: usize = 1 << 20;
+
 /// Dtypes the Qwen2.5 reference forward path accepts at construction time.
 ///
 /// The CPU reference path commits to f32 compute. The on-disk artifact
@@ -148,6 +161,24 @@ impl TryFrom<&ModelMetadata> for Qwen2_5Config {
             return Err(invalid(
                 "rope_theta",
                 &format!("must be > 0; got {}", m.rope_theta),
+            ));
+        }
+
+        // Context-length gate (M3.10). Zero context cannot describe a
+        // runnable model; an absurdly large value is almost certainly
+        // metadata corruption. The upper bound is wide (~8x the real
+        // Qwen2.5 max) so any future legitimate growth will not trip
+        // this gate before the team explicitly raises it.
+        if m.context_length == 0 {
+            return Err(invalid("context_length", "must be > 0"));
+        }
+        if m.context_length > QWEN2_5_MAX_CONTEXT_LENGTH {
+            return Err(invalid(
+                "context_length",
+                &format!(
+                    "must be <= {QWEN2_5_MAX_CONTEXT_LENGTH} (max); got {}",
+                    m.context_length,
+                ),
             ));
         }
 
@@ -443,6 +474,57 @@ mod tests {
                 assert_eq!(invalid.field.as_deref(), Some("rope_theta"));
             }
             other => panic!("expected InvalidModel for negative rope_theta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_zero_context_length_with_invalid_model_error() {
+        // context_length == 0 means the model "supports" zero tokens of
+        // context — there is no coherent forward pass for that. Reject
+        // at construction.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.context_length = 0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("zero context_length must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("context_length"));
+                assert!(
+                    invalid.message.contains("> 0") || invalid.message.contains("positive"),
+                    "expected positivity detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for zero context_length, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_oversized_context_length_with_invalid_model_error() {
+        // Sanity bound on context_length. The largest published Qwen2.5
+        // context (with YaRN scaling, on the larger family members) is
+        // 131072. A bound of 1 << 20 (= 1_048_576) is ~8x that, so it's
+        // wide enough not to false-reject any real Qwen2.5 config and
+        // still catches obvious metadata-corruption values like
+        // u32::MAX. The number is not load-bearing; it's a guard rail.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.context_length = (1 << 20) + 1;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("oversized context_length must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("context_length"));
+                assert!(
+                    invalid.message.contains("1048576") || invalid.message.contains("max"),
+                    "expected upper-bound detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for oversized context_length, got {other:?}"),
         }
     }
 
