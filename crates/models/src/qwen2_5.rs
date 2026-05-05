@@ -20,7 +20,7 @@
 //! M3.1 only encodes the shape contract. Tensor name/shape validation is
 //! M3.2 territory; kernel hookup is M3.3-M3.6.
 
-use ocelotl_core::{InvalidModelError, ModelMetadata, OcelotlError, UnsupportedError};
+use ocelotl_core::{DType, InvalidModelError, ModelMetadata, OcelotlError, UnsupportedError};
 
 /// The single architecture string this model family accepts on
 /// `ModelMetadata`. Qwen2.5 model artifacts share the `qwen2` model_type
@@ -30,6 +30,17 @@ use ocelotl_core::{InvalidModelError, ModelMetadata, OcelotlError, UnsupportedEr
 /// Rust type system stops a caller from constructing a `ModelMetadata`
 /// directly with any `architecture` string.
 const QWEN2_5_ARCHITECTURE: &str = "qwen2";
+
+/// Dtypes the Qwen2.5 reference forward path accepts at construction time.
+///
+/// The CPU reference path commits to f32 compute. The on-disk artifact
+/// dtype may be `F32` directly, or `BF16` (the published
+/// Qwen2.5-0.5B-Instruct dtype, upcast to f32 by the loader/forward path
+/// before kernels run). Anything else (`F16`, `Q4`, `Q8`) cannot be
+/// executed by the M3 reference path and must be rejected at construction
+/// time — runtime should never launch a forward pass for an unsupported
+/// dtype combination (per docs/tasks/m3-*.md M3.10 "Done when").
+const QWEN2_5_SUPPORTED_DTYPES: &[DType] = &[DType::F32, DType::BF16];
 
 /// Validated Qwen2.5 model-family configuration.
 ///
@@ -115,6 +126,21 @@ impl TryFrom<&ModelMetadata> for Qwen2_5Config {
                     m.head_dim, m.num_attention_heads, m.hidden_size,
                 ),
             ));
+        }
+
+        // Dtype gate (M3.10). The CPU reference path can only run F32 and
+        // BF16 (BF16 is upcast to F32 for compute). F16 and quantized
+        // formats are rejected here so the runtime never attempts a
+        // forward pass against an unrunnable dtype.
+        if !QWEN2_5_SUPPORTED_DTYPES.contains(&m.dtype) {
+            return Err(OcelotlError::from(UnsupportedError {
+                feature: "qwen2_5.dtype".to_string(),
+                requested: Some(format!("{:?}", m.dtype)),
+                supported: QWEN2_5_SUPPORTED_DTYPES
+                    .iter()
+                    .map(|d| format!("{d:?}"))
+                    .collect(),
+            }));
         }
 
         Ok(Qwen2_5Config {
@@ -236,6 +262,72 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidModel for GQA mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_unsupported_dtype_with_typed_unsupported_error() {
+        // M3.10 dtype gate. The CPU reference path commits to producing
+        // f32 compute outputs; the artifact-on-disk dtype is allowed to be
+        // BF16 (the published Qwen2.5-0.5B-Instruct dtype, upcast to f32
+        // for compute) or F32, but anything else (F16, Q4, Q8) cannot be
+        // executed by the M3 reference path. The rejection is `Unsupported`
+        // — the dtype is a coherent dtype, just not one this family can
+        // run today.
+        //
+        // BF16 is allow-listed because the M3.1 fixture uses it (it's the
+        // real Qwen2.5-0.5B artifact dtype, upcast to f32 at compute time).
+        // F16 is the cleanest "unsupported but coherent" dtype to pin
+        // against; Q4/Q8 cover the quantized-format rejection that M3
+        // explicitly defers (see docs/milestones/m3-*.md "Non-Goals").
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.dtype = DType::F16;
+
+        let err =
+            Qwen2_5Config::try_from(&meta).expect_err("F16 dtype must be rejected at construction");
+
+        match err {
+            OcelotlError::Unsupported(unsupported) => {
+                assert_eq!(
+                    unsupported.feature, "qwen2_5.dtype",
+                    "expected feature qualified to this model family, got {:?}",
+                    unsupported.feature,
+                );
+                assert_eq!(unsupported.requested.as_deref(), Some("F16"));
+                assert!(
+                    unsupported.supported.iter().any(|s| s == "F32")
+                        && unsupported.supported.iter().any(|s| s == "BF16"),
+                    "expected F32 and BF16 in supported list, got {:?}",
+                    unsupported.supported,
+                );
+            }
+            other => panic!("expected Unsupported for F16 dtype, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_quantized_dtype_with_typed_unsupported_error() {
+        // Q4/Q8 are explicitly out of scope per docs/milestones/m3-*.md
+        // ("Non-Goals: Quantized weights"). They must be rejected at
+        // construction time so the reference path never tries to compute
+        // against a dtype it has no kernel for.
+        for bad in [DType::Q4, DType::Q8] {
+            let mut meta = qwen2_5_0_5b_metadata();
+            meta.dtype = bad.clone();
+
+            let err = Qwen2_5Config::try_from(&meta)
+                .expect_err("quantized dtype must be rejected at construction");
+
+            match err {
+                OcelotlError::Unsupported(unsupported) => {
+                    assert_eq!(unsupported.feature, "qwen2_5.dtype");
+                    assert!(
+                        unsupported.requested.is_some(),
+                        "expected requested dtype name, got None",
+                    );
+                }
+                other => panic!("expected Unsupported for {bad:?}, got {other:?}"),
+            }
         }
     }
 
