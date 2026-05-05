@@ -34,12 +34,7 @@
 
 use ocelotl_core::{KernelError, OcelotlError, Result};
 
-fn kernel_err(message: impl Into<String>) -> OcelotlError {
-    OcelotlError::Kernel(KernelError {
-        backend: "cpu".to_string(),
-        message: message.into(),
-    })
-}
+use crate::kernel_err;
 
 /// Row-wise RMSNorm: `out[r, i] = (x[r, i] / sqrt(mean_i(x[r,i]^2) + eps)) * weight[i]`.
 ///

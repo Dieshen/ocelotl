@@ -12,12 +12,7 @@
 
 use ocelotl_core::{KernelError, OcelotlError, Result};
 
-fn kernel_err(message: impl Into<String>) -> OcelotlError {
-    OcelotlError::Kernel(KernelError {
-        backend: "cpu".to_string(),
-        message: message.into(),
-    })
-}
+use crate::kernel_err;
 
 /// Apply rotary position embeddings in place.
 ///

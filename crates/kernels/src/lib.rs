@@ -87,7 +87,7 @@ pub fn require_gpu(backend: &dyn KernelBackend) -> Result<()> {
 // future GPU kernels.
 // ---------------------------------------------------------------------------
 
-fn kernel_err(message: impl Into<String>) -> OcelotlError {
+pub(crate) fn kernel_err(message: impl Into<String>) -> OcelotlError {
     OcelotlError::Kernel(KernelError {
         backend: "cpu".to_string(),
         message: message.into(),
