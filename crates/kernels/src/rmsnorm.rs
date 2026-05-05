@@ -163,4 +163,164 @@ mod tests {
             );
         }
     }
+
+    /// Per-feature weight must scale each output element independently.
+    ///
+    /// Same input as the unit-weight baseline but with weight `[2, 0.5, 1]`,
+    /// epsilon `1e-6`. The shared `inv_rms ≈ 0.46291006` is multiplied
+    /// element-wise:
+    ///   out[0] = 1 * inv_rms * 2.0  ≈ 0.92582012
+    ///   out[1] = 2 * inv_rms * 0.5  ≈ 0.46291006
+    ///   out[2] = 3 * inv_rms * 1.0  ≈ 1.38873018
+    ///
+    /// Catches the bug where weight is applied as a scalar broadcast or
+    /// where the multiply order silently dropped the weight axis.
+    #[test]
+    fn rmsnorm_applies_weight_per_feature() {
+        let x = [1.0_f32, 2.0, 3.0];
+        let w = [2.0_f32, 0.5, 1.0];
+        let mut out = [0.0_f32; 3];
+
+        rmsnorm(&x, 1, 3, &w, 1e-6, &mut out).expect("well-formed rmsnorm must succeed");
+
+        let expected = [0.92582012_f32, 0.46291006, 1.38873018];
+        for (got, want) in out.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "rmsnorm weight scaling mismatch: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// Zero-vector input: rms = sqrt(0 + eps) = sqrt(eps); inv_rms =
+    /// 1 / sqrt(eps) is finite for any positive epsilon. With x = 0,
+    /// every output is `0 * inv_rms * weight = 0`. This pins the
+    /// epsilon's job: it keeps the kernel finite on a degenerate row
+    /// without changing the answer for non-degenerate ones.
+    #[test]
+    fn rmsnorm_zero_vector_input_yields_zero_output() {
+        let x = [0.0_f32; 4];
+        let w = [1.5_f32, 2.5, 3.5, 4.5];
+        let mut out = [42.0_f32; 4]; // sentinel — must be overwritten to 0.
+
+        rmsnorm(&x, 1, 4, &w, 1e-6, &mut out).expect("zero-vector rmsnorm must succeed");
+
+        for v in out.iter() {
+            assert_eq!(*v, 0.0, "zero input must yield zero output, got {v}");
+            assert!(v.is_finite(), "zero-vector output must be finite, got {v}");
+        }
+    }
+
+    /// Single-element input: hidden = 1 means mean(x^2) = x^2, rms =
+    /// sqrt(x^2 + eps), and out = x / sqrt(x^2 + eps) * weight. For
+    /// x = 5, eps = 0.0, weight = 1.0: out = 5 / 5 = 1.0. Confirms the
+    /// kernel handles the `hidden = 1` boundary without divide-by-zero
+    /// or off-by-one in the per-row loop.
+    #[test]
+    fn rmsnorm_single_element_row_normalizes_to_signed_unit() {
+        let x = [5.0_f32];
+        let w = [1.0_f32];
+        let mut out = [0.0_f32; 1];
+
+        rmsnorm(&x, 1, 1, &w, 0.0, &mut out).expect("single-element rmsnorm must succeed");
+
+        assert!((out[0] - 1.0).abs() < 1e-6, "got {}", out[0]);
+    }
+
+    /// Multi-row inputs must be normalized independently. Two rows with
+    /// different magnitudes share the same hand-checked behavior:
+    /// row 0 = [1, 2, 3] -> the baseline expected vector;
+    /// row 1 = [2, 4, 6] = 2 * row0 — same direction, double magnitude.
+    /// Because RMSNorm divides by the row's rms (which also doubles),
+    /// the normalized output for row 1 must equal row 0's output.
+    #[test]
+    fn rmsnorm_normalizes_each_row_independently() {
+        let x = [1.0_f32, 2.0, 3.0, 2.0, 4.0, 6.0];
+        let w = [1.0_f32, 1.0, 1.0];
+        let mut out = [0.0_f32; 6];
+
+        rmsnorm(&x, 2, 3, &w, 1e-6, &mut out).expect("multi-row rmsnorm must succeed");
+
+        let expected_row = [0.46291006_f32, 0.92582012, 1.38873018];
+        for r in 0..2 {
+            for i in 0..3 {
+                let got = out[r * 3 + i];
+                let want = expected_row[i];
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "row {r} col {i} mismatch: got {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    // --- validation errors ---
+
+    #[test]
+    fn rmsnorm_rejects_zero_hidden() {
+        let x: [f32; 0] = [];
+        let w: [f32; 0] = [];
+        let mut out: [f32; 0] = [];
+
+        let err = rmsnorm(&x, 0, 0, &w, 1e-6, &mut out).expect_err("must reject zero hidden");
+        match err {
+            OcelotlError::Kernel(KernelError { backend, message }) => {
+                assert_eq!(backend, "cpu");
+                assert!(
+                    message.contains("hidden"),
+                    "expected hidden-dim message, got {message:?}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rmsnorm_rejects_weight_length_mismatch() {
+        let x = [1.0_f32, 2.0, 3.0];
+        let w = [1.0_f32, 1.0]; // hidden claims 3, weight has 2
+        let mut out = [0.0_f32; 3];
+
+        let err =
+            rmsnorm(&x, 1, 3, &w, 1e-6, &mut out).expect_err("must reject weight length mismatch");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn rmsnorm_rejects_x_length_not_matching_shape() {
+        let x = [1.0_f32, 2.0, 3.0, 4.0]; // claims 1x3 = 3, has 4
+        let w = [1.0_f32, 1.0, 1.0];
+        let mut out = [0.0_f32; 3];
+
+        let err = rmsnorm(&x, 1, 3, &w, 1e-6, &mut out).expect_err("must reject x length mismatch");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn rmsnorm_rejects_out_length_mismatch() {
+        let x = [1.0_f32, 2.0, 3.0];
+        let w = [1.0_f32, 1.0, 1.0];
+        let mut out = [0.0_f32; 4]; // x is 3, out is 4
+
+        let err =
+            rmsnorm(&x, 1, 3, &w, 1e-6, &mut out).expect_err("must reject out length mismatch");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn rmsnorm_rejects_negative_or_nonfinite_epsilon() {
+        let x = [1.0_f32, 2.0, 3.0];
+        let w = [1.0_f32, 1.0, 1.0];
+        let mut out = [0.0_f32; 3];
+
+        let err = rmsnorm(&x, 1, 3, &w, -1e-6, &mut out).expect_err("must reject negative eps");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+
+        let err = rmsnorm(&x, 1, 3, &w, f32::NAN, &mut out).expect_err("must reject NaN eps");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+
+        let err =
+            rmsnorm(&x, 1, 3, &w, f32::INFINITY, &mut out).expect_err("must reject infinite eps");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
 }
