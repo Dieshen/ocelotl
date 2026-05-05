@@ -18,8 +18,8 @@
 //! `[3, 7, 11]` against a specific synthetic model. Decoding one token
 //! with greedy argmax on those exact logits MUST select index 16
 //! (lowest-index tie-break is irrelevant here -- 0.7908793 is a strict
-//! maximum, the next-largest value is 0.7888796 at index 5 of the
-//! negative half... actually 0.7776330 at index 15, comfortably below).
+//! maximum; the next-largest value is 0.7776330 at index 15, comfortably
+//! below).
 //! This pinning is therefore not an independently captured number: it's
 //! a direct consequence of the M3.7 fixture + the M1.8 greedy_sample
 //! contract. If either changes, this test fails -- which is exactly
