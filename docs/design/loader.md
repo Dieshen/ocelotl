@@ -96,10 +96,12 @@ The bridge is `impl From<SupportedDtype> for core::DType` in the loader
 crate. Total and lossless for the values that overlap. The impl lives in the
 loader crate so `ocelotl-core` does not need to know loader exists; this
 preserves the inward-only crate dependency direction documented in
-`.local/workflow/crossing-crate-boundaries.md`.
+the team workspace's `workflow/crossing-crate-boundaries.md`
+(Obsidian: `projects/ocelotl/devs/workflow/crossing-crate-boundaries.md`).
 
 Decided in M2.6 (paired) per the principle in
-`.local/concepts/external-crate-boundary.md`: "define your own subset enum
+the team workspace's `concepts/external-crate-boundary.md` (Obsidian:
+`projects/ocelotl/devs/concepts/external-crate-boundary.md`): "define your own subset enum
 that captures only what you support, with explicit conversion."
 
 ## Metadata Entry Points

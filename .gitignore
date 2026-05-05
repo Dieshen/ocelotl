@@ -2,8 +2,6 @@
 
 Cargo.lock
 
-**.local**
-
 # Local model artifacts. Contributors fetch these per docs/artifact-preparation.md.
 # Large weights and license-bearing files belong outside the repo (see
 # docs/validation/fixtures.md § Storage Policy).
