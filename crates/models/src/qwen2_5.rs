@@ -171,6 +171,41 @@ mod tests {
     }
 
     #[test]
+    fn try_from_rejects_non_divisible_gqa_grouping_with_invalid_model_error() {
+        // Qwen2.5 uses Grouped-Query Attention: every KV head fans out
+        // to an integer number of Q heads. If `num_attention_heads` is
+        // not a multiple of `num_key_value_heads`, the metadata cannot
+        // describe a runnable Qwen2.5 model, even if every other field
+        // is fine. This is a *model-specific* invariant — the loader
+        // (M2.6) does not enforce it.
+        let mut meta = qwen2_5_0_5b_metadata();
+        // 14 Q heads / 2 KV heads is the real Qwen2.5-0.5B group ratio
+        // (7 Q per KV). Pick num_key_value_heads=3 to break it: 14 % 3 != 0.
+        meta.num_key_value_heads = 3;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("non-divisible GQA grouping must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("num_attention_heads"),
+                    "expected field=num_attention_heads, got {:?}",
+                    invalid.field,
+                );
+                assert!(
+                    invalid.message.contains("divisible")
+                        && invalid.message.contains("num_key_value_heads"),
+                    "expected divisibility detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for GQA mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn try_from_accepts_real_qwen2_5_0_5b_metadata() {
         let meta = qwen2_5_0_5b_metadata();
 
