@@ -97,3 +97,28 @@ plus 1 `#[ignore]`'d in `qwen2_5_basic_prompt` and 1 in `qwen2_5_chat_template`.
 
 The M2.8 offline gate (`ci/check-offline.ps1`) extends acceptance enforcement
 beyond `cargo test`: criterion 6 is now CI-blocking, not advisory.
+
+## M3 Acceptance Traceability
+
+The table below maps each acceptance criterion in
+`docs/milestones/m3-single-model-forward.md` to the test (or test set) that
+proves it. Same shape as M1/M2: reviewers should be able to confirm every M3
+acceptance bullet has a green test in `cargo test --workspace`.
+
+| # | Acceptance criterion | Test(s) proving it | Status |
+| - | -------------------- | ------------------ | ------ |
+| 1 | Qwen2.5-style dense decoder-only inference has explicit support. | `ocelotl_models::qwen2_5::tests::try_from_accepts_real_qwen2_5_0_5b_metadata` proves the real Qwen2.5 metadata contract (`model_type = "qwen2"`, GQA, BF16). `ocelotl_models::qwen2_5_model::tests::{new_rejects_layer_count_mismatch_with_invalid_model, new_rejects_wrong_embed_tokens_length_with_invalid_model, prefill_returns_one_logit_per_vocab_entry_for_single_token_prompt}` prove the concrete `Qwen2_5Model` construction and output surface. Tensor coverage is pinned by `ocelotl_models::qwen2_5_tensors::tests::{required_tensor_names_enumerates_full_set_for_tied_and_untied, validate_accepts_complete_manifest_with_tied_embeddings, validate_accepts_complete_manifest_with_untied_embeddings}`. | green |
+| 2 | Prefill and decode are separate operations in the runtime path. | Prefill: `ocelotl_runtime::tests::prefill_returns_logits_through_runtime_api_surface` and `crates/models/tests/qwen2_5_tiny_synthetic_prefill.rs::prefill_matches_pinned_fixture_within_tolerance`. Decode: `ocelotl_runtime::tests::decode_one_token_returns_a_token_id_for_valid_prompt` and `crates/runtime/tests/qwen2_5_tiny_synthetic_decode.rs::{decode_one_token_is_deterministic_for_identical_inputs, decode_one_token_matches_pinned_argmax_of_m3_7_fixture, decode_one_token_propagates_invalid_request_for_empty_prompt}`. | green |
+| 3 | Reference fixtures cover at least one short prompt. | `fixtures/logits/qwen2_5_tiny_synthetic_prefill.json` pins final-token logits for prompt `[3, 7, 11]` on the tiny synthetic Qwen2.5 shape. `crates/models/tests/qwen2_5_tiny_synthetic_prefill.rs::prefill_matches_pinned_fixture_within_tolerance` loads that fixture and compares every logit. `crates/runtime/tests/qwen2_5_tiny_synthetic_decode.rs::decode_one_token_matches_pinned_argmax_of_m3_7_fixture` derives `TokenId(16)` from the same fixture and the greedy-sampling contract. | green |
+| 4 | Greedy output is deterministic. | `ocelotl_runtime::sampling::tests::{greedy_sample_picks_index_of_largest_logit, greedy_sample_breaks_ties_by_lowest_token_id}` pin the greedy contract. `crates/runtime/tests/qwen2_5_tiny_synthetic_decode.rs::decode_one_token_is_deterministic_for_identical_inputs` proves repeated decode calls return the same token through the public path. | green |
+| 5 | Unsupported model metadata fails before execution. | `ocelotl_models::qwen2_5::tests::{try_from_rejects_non_qwen2_architecture_with_unsupported_error, try_from_rejects_non_divisible_gqa_grouping_with_invalid_model_error, try_from_rejects_odd_head_dim_with_invalid_model_error, try_from_rejects_zero_rope_theta_with_invalid_model_error, try_from_rejects_negative_rope_theta_with_invalid_model_error, try_from_rejects_zero_context_length_with_invalid_model_error, try_from_rejects_oversized_context_length_with_invalid_model_error, try_from_rejects_zero_vocab_size_with_invalid_model_error, try_from_rejects_one_vocab_size_with_invalid_model_error, try_from_rejects_unsupported_dtype_with_typed_unsupported_error, try_from_rejects_quantized_dtype_with_typed_unsupported_error}`. Tensor shape/name failures are pinned by `qwen2_5_tensors::tests::{validate_rejects_missing_tensor_with_invalid_model_error_naming_the_tensor, validate_rejects_wrong_shape_with_invalid_model_error_naming_the_tensor, validate_rejects_missing_lm_head_only_when_embeddings_are_untied}`. Runtime prompt gates are pinned by `qwen2_5_model::tests::{prefill_rejects_empty_prompt_with_invalid_request, prefill_rejects_prompt_longer_than_context_with_invalid_request, prefill_rejects_token_id_outside_vocab_with_invalid_request}`. | green |
+| 6 | Tests document the reference source and tolerance. | `docs/validation/parity.md` names the M3 fixture source, `1e-4` prefill tolerance, exact-token decode rule, and deferred real-Qwen target tolerance. `crates/models/tests/qwen2_5_m3_parity_policy.rs::parity_doc_names_m3_sources_and_tolerances` makes that documentation executable by failing if the M3 parity doc stops naming the source, tolerance, or decode token. The fixture-side tolerance self-check remains in `prefill_matches_pinned_fixture_within_tolerance`. | green |
+
+### Closure note (2026-05-05)
+
+All six rows are green. M3 acceptance is provable from `cargo test --workspace`
+against main through `f463f70 test(validation): formalize M3 parity policy
+tripwires`. Total at M3 close: **157 default tests + 8 doctests passing**; the
+2 M2 local-artifact tests remain `#[ignore]`'d opt-in checks. The M2.8 offline
+gate (`ci/check-offline.ps1`) also passes, so the M3 default validation surface
+remains offline by construction.
