@@ -8,6 +8,9 @@
 //! to end. M3 will replace the synthetic forward with the real Qwen2.5
 //! forward; nothing else in the path needs to change at that point.
 
+pub mod qwen2_5;
+pub use qwen2_5::Qwen2_5Config;
+
 use ocelotl_core::{
     GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId,
 };
