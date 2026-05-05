@@ -157,6 +157,30 @@ struct HfConfig {
     /// HF's field is `torch_dtype` (e.g. `"bfloat16"`); we map it to
     /// `core::DType` via the `SUPPORTED_TORCH_DTYPES` allow-list.
     torch_dtype: String,
+    /// HF Qwen2 config carries `tie_word_embeddings`. Optional in JSON and
+    /// defaults to `false` when absent (matching HF's `PretrainedConfig`
+    /// default for Qwen2-family models). When `true`, the safetensors file
+    /// omits `lm_head.weight` and the output projection reuses
+    /// `model.embed_tokens.weight`.
+    #[serde(default)]
+    tie_word_embeddings: bool,
+}
+
+/// Output of `parse_hf_config`: the Ocelotl-shaped metadata plus the
+/// HF-specific extras that don't belong in `ocelotl-core::ModelMetadata`.
+///
+/// `ModelMetadata` is the cross-crate compute-surface contract; this struct
+/// is the loader-side bag of HF-config-only knowledge that the
+/// `ocelotl-models` family layer needs at construction time. Adding fields
+/// here is cheap; adding fields to `ModelMetadata` is a cross-crate
+/// breaking change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HfModelInfo {
+    pub metadata: ModelMetadata,
+    /// When `true`, the safetensors artifact does not contain
+    /// `lm_head.weight` and the model's output projection reuses
+    /// `model.embed_tokens.weight`.
+    pub tie_word_embeddings: bool,
 }
 
 /// Parse a Hugging Face `config.json` and return the equivalent Ocelotl
@@ -168,7 +192,7 @@ struct HfConfig {
 /// - `Unsupported` if `model_type` or `torch_dtype` is outside the allow-list.
 /// - `InvalidModel` (with `field = "head_dim"`) if `hidden_size` is not
 ///   divisible by `num_attention_heads`.
-pub fn parse_hf_config(path: &Path) -> Result<ModelMetadata> {
+pub fn parse_hf_config(path: &Path) -> Result<HfModelInfo> {
     let json = std::fs::read_to_string(path).map_err(|source| {
         OcelotlError::from(IoError {
             path: Some(path.to_path_buf()),
@@ -241,24 +265,27 @@ pub fn parse_hf_config(path: &Path) -> Result<ModelMetadata> {
 
     let dtype = map_torch_dtype(&cfg.torch_dtype);
 
-    Ok(ModelMetadata {
-        architecture: cfg.model_type,
-        vocab_size: cfg.vocab_size,
-        num_hidden_layers: cfg.num_hidden_layers,
-        hidden_size: cfg.hidden_size,
-        intermediate_size: cfg.intermediate_size,
-        num_attention_heads: cfg.num_attention_heads,
-        num_key_value_heads: cfg.num_key_value_heads,
-        head_dim,
-        context_length: cfg.max_position_embeddings,
-        rope_theta: cfg.rope_theta,
-        rms_norm_eps: cfg.rms_norm_eps,
-        dtype,
-        // HF config.json doesn't carry a tokenizer model hint; tokenizer
-        // discovery is the loader's responsibility (separate file, separate
-        // path), so we leave this None here. Setting it from a sibling
-        // tokenizer file is a future task.
-        tokenizer_model_hint: None,
+    Ok(HfModelInfo {
+        metadata: ModelMetadata {
+            architecture: cfg.model_type,
+            vocab_size: cfg.vocab_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim,
+            context_length: cfg.max_position_embeddings,
+            rope_theta: cfg.rope_theta,
+            rms_norm_eps: cfg.rms_norm_eps,
+            dtype,
+            // HF config.json doesn't carry a tokenizer model hint; tokenizer
+            // discovery is the loader's responsibility (separate file, separate
+            // path), so we leave this None here. Setting it from a sibling
+            // tokenizer file is a future task.
+            tokenizer_model_hint: None,
+        },
+        tie_word_embeddings: cfg.tie_word_embeddings,
     })
 }
 
@@ -419,7 +446,8 @@ mod tests {
         // context_length, model_type vs architecture, torch_dtype vs dtype,
         // and head_dim is absent and must be derived).
         let path = metadata_fixture_path("qwen2_5_0_5b_instruct_config.json");
-        let m = parse_hf_config(&path).expect("real Qwen2.5 config must parse");
+        let info = parse_hf_config(&path).expect("real Qwen2.5 config must parse");
+        let m = &info.metadata;
 
         // architecture from model_type (NOT from architectures[0], which is
         // the python class name "Qwen2ForCausalLM").
@@ -442,6 +470,54 @@ mod tests {
         assert_eq!(m.dtype, ocelotl_core::DType::BF16);
         // tokenizer hint isn't carried in config.json; should be absent.
         assert_eq!(m.tokenizer_model_hint, None);
+    }
+
+    #[test]
+    fn parse_hf_config_carries_tie_word_embeddings_true_for_qwen2_5_0_5b_instruct() {
+        // Qwen2.5-0.5B-Instruct ships with `tie_word_embeddings: true`. The
+        // safetensors file therefore omits `lm_head.weight` and the model
+        // forward path must reuse `model.embed_tokens.weight` as the output
+        // projection. The flag is a HF config-level concern that the
+        // `ModelMetadata` shape does not carry on its own (the brief
+        // explicitly forbids extending `ocelotl-core` in M3.7), so we surface
+        // it on a sibling struct returned alongside the metadata.
+        let path = metadata_fixture_path("qwen2_5_0_5b_instruct_config.json");
+        let info = parse_hf_config(&path).expect("real Qwen2.5 config must parse");
+        assert!(
+            info.tie_word_embeddings,
+            "Qwen2.5-0.5B-Instruct uses tied embeddings; got {}",
+            info.tie_word_embeddings,
+        );
+    }
+
+    #[test]
+    fn parse_hf_config_defaults_tie_word_embeddings_false_when_absent() {
+        // HF treats the field as optional in PretrainedConfig with a
+        // documented default of `false` for Qwen2-family models when the
+        // field is omitted. Pin that default explicitly so a future refactor
+        // that flips the default is loud.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ocelotl_m3_7_default_tie_{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{ "model_type": "qwen2",
+                 "vocab_size": 1, "hidden_size": 1, "intermediate_size": 1,
+                 "num_hidden_layers": 1, "num_attention_heads": 1,
+                 "num_key_value_heads": 1, "max_position_embeddings": 1,
+                 "rope_theta": 1.0, "rms_norm_eps": 1e-6,
+                 "torch_dtype": "float32" }"#,
+        )
+        .expect("write fixture");
+
+        let info = parse_hf_config(&path).expect("config without tie field must still parse");
+        assert!(
+            !info.tie_word_embeddings,
+            "tie_word_embeddings must default to false when absent",
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
