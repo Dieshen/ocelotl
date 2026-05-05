@@ -9,7 +9,7 @@ use ocelotl_core::{
     UnsupportedError,
 };
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
-use ocelotl_models::tiny_synthetic_forward;
+use ocelotl_models::{Qwen2_5Model, tiny_synthetic_forward};
 use serde::{Deserialize, Serialize};
 
 // Re-export the response vocabulary type so callers can
@@ -110,6 +110,29 @@ pub fn generate_one_token(
     Ok(GenerateResponse {
         tokens: vec![next_token],
     })
+}
+
+/// Run prefill on the given model and return final-position logits.
+///
+/// This is the public M3.7 entry point. It is a thin shim over
+/// `Qwen2_5Model::prefill` that exists so callers (server code, tests,
+/// future decoder loops) reach prefill through `ocelotl_runtime::prefill`
+/// rather than reaching directly into the model crate. The shape of this
+/// API is intentionally model-typed for now: M3 targets only Qwen2.5.
+/// When a second model family lands, this will become a method on a
+/// `CausalLanguageModel` trait. Until then, generic abstraction would be
+/// premature (the M3 design doc's "keep generic abstractions minimal until
+/// a second family is implemented" line).
+///
+/// # Errors
+///
+/// Propagates `OcelotlError` from the model's prefill verbatim:
+/// - `InvalidRequest` for empty prompts, out-of-range token ids, or
+///   prompt length exceeding `context_length`.
+/// - `Kernel` for unreachable shape violations (would indicate the
+///   `Qwen2_5Model::new` length checks have a bug).
+pub fn prefill(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<Vec<f32>> {
+    model.prefill(tokens)
 }
 
 pub struct Runtime<B: KernelBackend = CpuKernelBackend> {
@@ -319,6 +342,131 @@ mod tests {
             "sampled token must be within vocabulary, got {:?}",
             resp.tokens[0]
         );
+    }
+
+    // --- prefill (M3.7 wiring) ---
+
+    #[test]
+    fn prefill_returns_logits_through_runtime_api_surface() {
+        // M3.7 contract: the runtime exposes prefill on the public API
+        // so callers do not bypass the runtime layer to reach the model.
+        // We keep the model construction inline here because the runtime
+        // crate doesn't own model fixtures; the goal of this test is to
+        // pin the API shape, not to re-validate prefill numerics (that's
+        // pinned in the models crate's tiny-synthetic integration test).
+        use ocelotl_models::{
+            Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
+        };
+        let cfg = Qwen2_5Config {
+            vocab_size: 8,
+            num_hidden_layers: 1,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            context_length: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            dtype: DType::F32,
+        };
+        let h = cfg.hidden_size;
+        let v = cfg.vocab_size;
+        let q_out = cfg.num_attention_heads * cfg.head_dim;
+        let kv_out = cfg.num_key_value_heads * cfg.head_dim;
+        let i_size = cfg.intermediate_size;
+        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32) * 0.01).collect();
+        let lm_head_w = transpose_2d(&embed, v, h);
+        let weights = Qwen2_5Weights {
+            embed_tokens: embed,
+            layers: vec![Qwen2_5LayerWeights {
+                q_proj_w: vec![0.01; h * q_out],
+                q_proj_b: vec![0.0; q_out],
+                k_proj_w: vec![0.01; h * kv_out],
+                k_proj_b: vec![0.0; kv_out],
+                v_proj_w: vec![0.01; h * kv_out],
+                v_proj_b: vec![0.0; kv_out],
+                o_proj_w: vec![0.01; q_out * h],
+                input_layernorm_w: vec![1.0; h],
+                post_attention_layernorm_w: vec![1.0; h],
+                gate_proj_w: vec![0.01; h * i_size],
+                up_proj_w: vec![0.01; h * i_size],
+                down_proj_w: vec![0.01; i_size * h],
+            }],
+            final_norm_w: vec![1.0; h],
+            lm_head_w,
+            tie_word_embeddings: true,
+        };
+        let model = Qwen2_5Model::new(cfg, weights).expect("tiny model must construct");
+
+        let logits = prefill(&model, &[TokenId(1), TokenId(2)])
+            .expect("prefill via runtime API must succeed");
+
+        assert_eq!(logits.len(), 8);
+        for v in &logits {
+            assert!(v.is_finite(), "prefill logits must be finite");
+        }
+    }
+
+    #[test]
+    fn prefill_propagates_invalid_request_for_empty_prompt() {
+        // A runtime-level public API must surface model-level validation
+        // failures verbatim. An empty prompt is InvalidRequest at the
+        // model boundary (Qwen2_5Model::prefill); the runtime wrapper
+        // must not swallow or remap it.
+        use ocelotl_models::{
+            Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
+        };
+        let cfg = Qwen2_5Config {
+            vocab_size: 4,
+            num_hidden_layers: 1,
+            hidden_size: 2,
+            intermediate_size: 4,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            context_length: 8,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            dtype: DType::F32,
+        };
+        let h = cfg.hidden_size;
+        let v = cfg.vocab_size;
+        let q_out = cfg.num_attention_heads * cfg.head_dim;
+        let kv_out = cfg.num_key_value_heads * cfg.head_dim;
+        let i_size = cfg.intermediate_size;
+        let embed: Vec<f32> = vec![0.1; v * h];
+        let lm_head_w = transpose_2d(&embed, v, h);
+        let weights = Qwen2_5Weights {
+            embed_tokens: embed,
+            layers: vec![Qwen2_5LayerWeights {
+                q_proj_w: vec![0.1; h * q_out],
+                q_proj_b: vec![0.0; q_out],
+                k_proj_w: vec![0.1; h * kv_out],
+                k_proj_b: vec![0.0; kv_out],
+                v_proj_w: vec![0.1; h * kv_out],
+                v_proj_b: vec![0.0; kv_out],
+                o_proj_w: vec![0.1; q_out * h],
+                input_layernorm_w: vec![1.0; h],
+                post_attention_layernorm_w: vec![1.0; h],
+                gate_proj_w: vec![0.1; h * i_size],
+                up_proj_w: vec![0.1; h * i_size],
+                down_proj_w: vec![0.1; i_size * h],
+            }],
+            final_norm_w: vec![1.0; h],
+            lm_head_w,
+            tie_word_embeddings: true,
+        };
+        let model = Qwen2_5Model::new(cfg, weights).unwrap();
+
+        let err = prefill(&model, &[]).expect_err("empty prompt must be rejected");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "tokens");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     #[test]
