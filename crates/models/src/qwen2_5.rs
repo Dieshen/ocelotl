@@ -171,6 +171,40 @@ mod tests {
     }
 
     #[test]
+    fn try_from_rejects_non_qwen2_architecture_with_unsupported_error() {
+        // Sanity: even though the loader gates on architecture for its
+        // own surface, the model-family layer re-validates because
+        // nothing in the type system stops a caller from constructing
+        // a `ModelMetadata { architecture: "mistral", ... }` and
+        // handing it to the Qwen2.5 model. The rejection is
+        // `Unsupported`, not `InvalidModel` — a "mistral" model is a
+        // coherent thing in general; it's just not what *this* family
+        // implements.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.architecture = "mistral".to_string();
+
+        let err =
+            Qwen2_5Config::try_from(&meta).expect_err("non-qwen2 architecture must be rejected");
+
+        match err {
+            OcelotlError::Unsupported(unsupported) => {
+                assert_eq!(
+                    unsupported.feature, "qwen2_5.architecture",
+                    "expected feature qualified to this model family, got {:?}",
+                    unsupported.feature,
+                );
+                assert_eq!(unsupported.requested.as_deref(), Some("mistral"));
+                assert!(
+                    unsupported.supported.iter().any(|s| s == "qwen2"),
+                    "expected `qwen2` in supported list, got {:?}",
+                    unsupported.supported,
+                );
+            }
+            other => panic!("expected Unsupported for foreign architecture, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn try_from_rejects_non_divisible_gqa_grouping_with_invalid_model_error() {
         // Qwen2.5 uses Grouped-Query Attention: every KV head fans out
         // to an integer number of Q heads. If `num_attention_heads` is
