@@ -32,7 +32,7 @@
 //!   the M3.3 spec line defers to Phase 2 — it requires M3.1's metadata
 //!   contract (in flight) and a model block (M3.5+).
 
-use ocelotl_core::{KernelError, OcelotlError, Result};
+use ocelotl_core::Result;
 
 use crate::kernel_err;
 
@@ -130,6 +130,8 @@ pub fn rmsnorm(
 
 #[cfg(test)]
 mod tests {
+    use ocelotl_core::{KernelError, OcelotlError};
+
     use super::*;
 
     /// Hand-checked baseline (M3.3 first failing test).

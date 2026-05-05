@@ -10,7 +10,7 @@
 //! `docs/tasks/m3-single-model-forward.md` M3.4 "Done when" line + the
 //! M3 Phase 1 scope split recorded in the assignments board).
 
-use ocelotl_core::{KernelError, OcelotlError, Result};
+use ocelotl_core::Result;
 
 use crate::kernel_err;
 
@@ -108,6 +108,8 @@ pub fn rope_apply_inplace(
 
 #[cfg(test)]
 mod tests {
+    use ocelotl_core::{KernelError, OcelotlError};
+
     use super::*;
 
     // --- Test 1: position 0 identity ---

@@ -46,7 +46,7 @@
 //! - The "Done when: activation, gate, up, and down projections are wired
 //!   in the target model block" half of the spec defers to Phase 3 stitch.
 
-use ocelotl_core::{KernelError, OcelotlError, Result};
+use ocelotl_core::Result;
 
 use crate::{kernel_err, matmul};
 
@@ -236,6 +236,8 @@ pub fn mlp_gated_silu(
 
 #[cfg(test)]
 mod tests {
+    use ocelotl_core::{KernelError, OcelotlError};
+
     use super::*;
 
     // --- silu_inplace ---
