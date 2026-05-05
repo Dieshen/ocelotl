@@ -128,6 +128,29 @@ impl TryFrom<&ModelMetadata> for Qwen2_5Config {
             ));
         }
 
+        // RoPE head_dim parity (M3.10). RoPE pairs index `i` with
+        // `i + head_dim/2` (the upper-half pairing convention used by
+        // Qwen2.5/Llama/HF). An odd head_dim has no consistent
+        // half-pairing — the rotation is mathematically undefined.
+        // Reject here rather than letting the kernel error at compute.
+        if m.head_dim % 2 != 0 {
+            return Err(invalid(
+                "head_dim",
+                &format!("must be even for RoPE half-pairing; got {}", m.head_dim,),
+            ));
+        }
+
+        // RoPE theta gate (M3.10). `rope_theta` is the base of the
+        // inverse-frequency formula `1 / theta^(2i/head_dim)`; theta == 0
+        // yields division-by-zero, theta < 0 yields complex powers.
+        // Both are unrunnable.
+        if !(m.rope_theta > 0.0) {
+            return Err(invalid(
+                "rope_theta",
+                &format!("must be > 0; got {}", m.rope_theta),
+            ));
+        }
+
         // Dtype gate (M3.10). The CPU reference path can only run F32 and
         // BF16 (BF16 is upcast to F32 for compute). F16 and quantized
         // formats are rejected here so the runtime never attempts a
@@ -328,6 +351,98 @@ mod tests {
                 }
                 other => panic!("expected Unsupported for {bad:?}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_odd_head_dim_with_invalid_model_error() {
+        // RoPE pairs index `i` with `i + head_dim/2` (the upper-half
+        // pairing convention used by Qwen2.5/Llama/HF — see dev-04's
+        // M3.4 RoPE learning entry). An odd head_dim has no consistent
+        // half-pairing, so the rotation is mathematically undefined.
+        // Reject at construction time so the runtime never calls into a
+        // RoPE kernel that would either panic or silently produce wrong
+        // numbers.
+        //
+        // Construct a metadata that survives all earlier gates (positive
+        // dims, GQA divisibility, head_dim*heads == hidden_size,
+        // supported dtype) but has an odd head_dim. Pick head_dim=7,
+        // num_attention_heads=14, hidden_size=98, intermediate_size kept
+        // at 4*hidden ish.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.head_dim = 7;
+        meta.num_attention_heads = 14;
+        meta.num_key_value_heads = 2;
+        meta.hidden_size = 98; // 7 * 14
+        meta.intermediate_size = 256;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("odd head_dim must be rejected at construction (RoPE half-pairing)");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("head_dim"),
+                    "expected field=head_dim, got {:?}",
+                    invalid.field,
+                );
+                assert!(
+                    invalid.message.contains("even") || invalid.message.contains("RoPE"),
+                    "expected even/RoPE detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for odd head_dim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_zero_rope_theta_with_invalid_model_error() {
+        // rope_theta is the base of the RoPE inverse-frequency formula
+        // (`1 / theta^(2i/head_dim)`); theta == 0 yields division-by-zero
+        // / infinity at the kernel boundary. Reject at construction.
+        // Negative theta isn't expressible from a real HF config (the
+        // field is always positive in published Qwen2.5 configs) but
+        // we still reject it for completeness — `theta <= 0` is the
+        // single check.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.rope_theta = 0.0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("zero rope_theta must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("rope_theta"),
+                    "expected field=rope_theta, got {:?}",
+                    invalid.field,
+                );
+                assert!(
+                    invalid.message.contains("> 0") || invalid.message.contains("positive"),
+                    "expected positivity detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for zero rope_theta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_negative_rope_theta_with_invalid_model_error() {
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.rope_theta = -1.0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("negative rope_theta must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("rope_theta"));
+            }
+            other => panic!("expected InvalidModel for negative rope_theta, got {other:?}"),
         }
     }
 
