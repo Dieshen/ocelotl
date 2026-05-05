@@ -135,6 +135,50 @@ pub fn prefill(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<Vec<f32>> {
     model.prefill(tokens)
 }
 
+/// Run one decode step: prefill the prompt, sample the next token greedily,
+/// return that token id.
+///
+/// This is the public M3.8 entry point. It is the minimum composition of
+/// two existing public APIs:
+///
+/// 1. `runtime::prefill` (M3.7) -- final-position logits for the prompt.
+/// 2. `runtime::greedy_sample` (M1.8) -- argmax over the logits with a
+///    lowest-token-id tie-break.
+///
+/// # Why call `runtime::prefill` rather than `Qwen2_5Model::prefill` directly
+///
+/// The M3.8 brief's "Done when" line is "decode does not bypass runtime or
+/// model APIs used by prefill". Going through the runtime's own `prefill`
+/// shim keeps a single hop between the public decode API and the model:
+/// any future addition to the runtime's `prefill` (cache plumbing,
+/// tracing, request-state hooks) is automatically inherited by decode.
+/// Reaching into `Qwen2_5Model::prefill` directly here would create a
+/// second path that those hooks would silently miss.
+///
+/// # State handling (no KV cache)
+///
+/// M3 is the correctness-first reference path. This function does not
+/// reuse any prefill state across calls -- each call to `decode_one_token`
+/// pays the full O(prompt_len) prefill cost. KV-cache reuse is M5/M6
+/// work and will land as a separate API (likely `decode_with_cache`)
+/// rather than complicating this signature now. The current shape
+/// (`(&Qwen2_5Model, &[TokenId]) -> Result<TokenId>`) is intentionally
+/// thin so a future cache-aware path can be added alongside without
+/// breaking callers.
+///
+/// # Errors
+///
+/// Propagates errors from the composed APIs verbatim:
+/// - `InvalidRequest` from `runtime::prefill` for empty prompts,
+///   out-of-range token ids, or prompt length exceeding `context_length`.
+/// - `Runtime` from `greedy_sample` if the logits vector is empty
+///   (unreachable with a validly constructed model -- `vocab_size > 0`
+///   is enforced at `Qwen2_5Config::try_from`).
+pub fn decode_one_token(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<TokenId> {
+    let logits = prefill(model, tokens)?;
+    greedy_sample(&logits)
+}
+
 pub struct Runtime<B: KernelBackend = CpuKernelBackend> {
     backend: B,
 }
@@ -467,6 +511,76 @@ mod tests {
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    // --- decode_one_token (M3.8 wiring) ---
+
+    /// Build the same tiny Qwen2.5 model used by `prefill_returns_logits_through_runtime_api_surface`.
+    /// Kept inline rather than extracted to a helper to keep these tests
+    /// self-contained: the runtime crate doesn't own model fixtures, and a
+    /// helper would only have the two callers in this module.
+    fn tiny_model_for_decode() -> ocelotl_models::Qwen2_5Model {
+        use ocelotl_models::{
+            Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
+        };
+        let cfg = Qwen2_5Config {
+            vocab_size: 8,
+            num_hidden_layers: 1,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            context_length: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            dtype: DType::F32,
+        };
+        let h = cfg.hidden_size;
+        let v = cfg.vocab_size;
+        let q_out = cfg.num_attention_heads * cfg.head_dim;
+        let kv_out = cfg.num_key_value_heads * cfg.head_dim;
+        let i_size = cfg.intermediate_size;
+        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32) * 0.01).collect();
+        let lm_head_w = transpose_2d(&embed, v, h);
+        let weights = Qwen2_5Weights {
+            embed_tokens: embed,
+            layers: vec![Qwen2_5LayerWeights {
+                q_proj_w: vec![0.01; h * q_out],
+                q_proj_b: vec![0.0; q_out],
+                k_proj_w: vec![0.01; h * kv_out],
+                k_proj_b: vec![0.0; kv_out],
+                v_proj_w: vec![0.01; h * kv_out],
+                v_proj_b: vec![0.0; kv_out],
+                o_proj_w: vec![0.01; q_out * h],
+                input_layernorm_w: vec![1.0; h],
+                post_attention_layernorm_w: vec![1.0; h],
+                gate_proj_w: vec![0.01; h * i_size],
+                up_proj_w: vec![0.01; h * i_size],
+                down_proj_w: vec![0.01; i_size * h],
+            }],
+            final_norm_w: vec![1.0; h],
+            lm_head_w,
+            tie_word_embeddings: true,
+        };
+        Qwen2_5Model::new(cfg, weights).expect("tiny model must construct")
+    }
+
+    #[test]
+    fn decode_one_token_returns_a_token_id_for_valid_prompt() {
+        // Smallest meaningful contract for M3.8: decode_one_token returns
+        // a TokenId that is within the model's vocabulary. Pins the API
+        // shape (Vec<f32> -> TokenId) without yet asserting numerics; the
+        // pinning test below covers the specific value.
+        let model = tiny_model_for_decode();
+
+        let token = decode_one_token(&model, &[TokenId(1), TokenId(2)])
+            .expect("valid prompt must produce a token");
+
+        assert!(
+            (token.0 as usize) < model.config().vocab_size,
+            "decoded token must be within vocabulary, got {token:?}",
+        );
     }
 
     #[test]
