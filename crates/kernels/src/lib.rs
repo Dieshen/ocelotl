@@ -26,6 +26,9 @@
 //!    `debug_assert!`. We do not extract a shared validation helper until ≥3
 //!    kernels share the same pattern.
 
+pub mod rope;
+pub use rope::rope_apply_inplace;
+
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
 #[derive(Debug, Clone)]
