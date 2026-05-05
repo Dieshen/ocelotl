@@ -20,7 +20,7 @@
 //! M3.1 only encodes the shape contract. Tensor name/shape validation is
 //! M3.2 territory; kernel hookup is M3.3-M3.6.
 
-use ocelotl_core::{InvalidModelError, ModelMetadata, OcelotlError, UnsupportedError};
+use ocelotl_core::{DType, InvalidModelError, ModelMetadata, OcelotlError, UnsupportedError};
 
 /// The single architecture string this model family accepts on
 /// `ModelMetadata`. Qwen2.5 model artifacts share the `qwen2` model_type
@@ -30,6 +30,42 @@ use ocelotl_core::{InvalidModelError, ModelMetadata, OcelotlError, UnsupportedEr
 /// Rust type system stops a caller from constructing a `ModelMetadata`
 /// directly with any `architecture` string.
 const QWEN2_5_ARCHITECTURE: &str = "qwen2";
+
+/// Minimum `vocab_size` accepted at construction time.
+///
+/// A vocabulary with 0 or 1 tokens is degenerate: the embedding matrix
+/// would be empty/single-row, every sample would produce the same
+/// token, and the metadata is almost certainly corrupted. The minimum
+/// (`>= 2`) is intentionally lenient — real Qwen2.5 vocabs are
+/// ~150_000 tokens, so any reasonable upper bound (e.g. "must be
+/// >= 100") would risk false-rejecting a future small synthetic
+/// fixture. The single sharp boundary is "at least two distinct
+/// tokens".
+const QWEN2_5_MIN_VOCAB_SIZE: usize = 2;
+
+/// Upper bound on `context_length` accepted at construction time.
+///
+/// The largest published Qwen2.5 context (with YaRN scaling, on the
+/// larger family members) is 131072. We pick `1 << 20` (= 1_048_576),
+/// roughly 8x that, as a generous guard rail: wide enough not to
+/// false-reject any real Qwen2.5 config (or any plausible near-future
+/// extension), narrow enough to catch obvious metadata-corruption
+/// values like u32::MAX or accidental byte-count-as-token-count.
+///
+/// The number is not load-bearing; if a future Qwen2.5 release
+/// genuinely needs more, raise it and update the pinning test.
+const QWEN2_5_MAX_CONTEXT_LENGTH: usize = 1 << 20;
+
+/// Dtypes the Qwen2.5 reference forward path accepts at construction time.
+///
+/// The CPU reference path commits to f32 compute. The on-disk artifact
+/// dtype may be `F32` directly, or `BF16` (the published
+/// Qwen2.5-0.5B-Instruct dtype, upcast to f32 by the loader/forward path
+/// before kernels run). Anything else (`F16`, `Q4`, `Q8`) cannot be
+/// executed by the M3 reference path and must be rejected at construction
+/// time — runtime should never launch a forward pass for an unsupported
+/// dtype combination (per docs/tasks/m3-*.md M3.10 "Done when").
+const QWEN2_5_SUPPORTED_DTYPES: &[DType] = &[DType::F32, DType::BF16];
 
 /// Validated Qwen2.5 model-family configuration.
 ///
@@ -115,6 +151,75 @@ impl TryFrom<&ModelMetadata> for Qwen2_5Config {
                     m.head_dim, m.num_attention_heads, m.hidden_size,
                 ),
             ));
+        }
+
+        // RoPE head_dim parity (M3.10). RoPE pairs index `i` with
+        // `i + head_dim/2` (the upper-half pairing convention used by
+        // Qwen2.5/Llama/HF). An odd head_dim has no consistent
+        // half-pairing — the rotation is mathematically undefined.
+        // Reject here rather than letting the kernel error at compute.
+        if m.head_dim % 2 != 0 {
+            return Err(invalid(
+                "head_dim",
+                &format!("must be even for RoPE half-pairing; got {}", m.head_dim,),
+            ));
+        }
+
+        // RoPE theta gate (M3.10). `rope_theta` is the base of the
+        // inverse-frequency formula `1 / theta^(2i/head_dim)`; theta == 0
+        // yields division-by-zero, theta < 0 yields complex powers.
+        // Both are unrunnable.
+        if !(m.rope_theta > 0.0) {
+            return Err(invalid(
+                "rope_theta",
+                &format!("must be > 0; got {}", m.rope_theta),
+            ));
+        }
+
+        // Vocab-size gate (M3.10). 0 or 1 token is degenerate; reject
+        // at construction so the embedding/output-projection paths never
+        // see a metadata that cannot describe a sample-able model.
+        if m.vocab_size < QWEN2_5_MIN_VOCAB_SIZE {
+            return Err(invalid(
+                "vocab_size",
+                &format!(
+                    "must be >= {QWEN2_5_MIN_VOCAB_SIZE} (at least two distinct tokens); got {}",
+                    m.vocab_size,
+                ),
+            ));
+        }
+
+        // Context-length gate (M3.10). Zero context cannot describe a
+        // runnable model; an absurdly large value is almost certainly
+        // metadata corruption. The upper bound is wide (~8x the real
+        // Qwen2.5 max) so any future legitimate growth will not trip
+        // this gate before the team explicitly raises it.
+        if m.context_length == 0 {
+            return Err(invalid("context_length", "must be > 0"));
+        }
+        if m.context_length > QWEN2_5_MAX_CONTEXT_LENGTH {
+            return Err(invalid(
+                "context_length",
+                &format!(
+                    "must be <= {QWEN2_5_MAX_CONTEXT_LENGTH} (max); got {}",
+                    m.context_length,
+                ),
+            ));
+        }
+
+        // Dtype gate (M3.10). The CPU reference path can only run F32 and
+        // BF16 (BF16 is upcast to F32 for compute). F16 and quantized
+        // formats are rejected here so the runtime never attempts a
+        // forward pass against an unrunnable dtype.
+        if !QWEN2_5_SUPPORTED_DTYPES.contains(&m.dtype) {
+            return Err(OcelotlError::from(UnsupportedError {
+                feature: "qwen2_5.dtype".to_string(),
+                requested: Some(format!("{:?}", m.dtype)),
+                supported: QWEN2_5_SUPPORTED_DTYPES
+                    .iter()
+                    .map(|d| format!("{d:?}"))
+                    .collect(),
+            }));
         }
 
         Ok(Qwen2_5Config {
@@ -236,6 +341,264 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidModel for GQA mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_unsupported_dtype_with_typed_unsupported_error() {
+        // M3.10 dtype gate. The CPU reference path commits to producing
+        // f32 compute outputs; the artifact-on-disk dtype is allowed to be
+        // BF16 (the published Qwen2.5-0.5B-Instruct dtype, upcast to f32
+        // for compute) or F32, but anything else (F16, Q4, Q8) cannot be
+        // executed by the M3 reference path. The rejection is `Unsupported`
+        // — the dtype is a coherent dtype, just not one this family can
+        // run today.
+        //
+        // BF16 is allow-listed because the M3.1 fixture uses it (it's the
+        // real Qwen2.5-0.5B artifact dtype, upcast to f32 at compute time).
+        // F16 is the cleanest "unsupported but coherent" dtype to pin
+        // against; Q4/Q8 cover the quantized-format rejection that M3
+        // explicitly defers (see docs/milestones/m3-*.md "Non-Goals").
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.dtype = DType::F16;
+
+        let err =
+            Qwen2_5Config::try_from(&meta).expect_err("F16 dtype must be rejected at construction");
+
+        match err {
+            OcelotlError::Unsupported(unsupported) => {
+                assert_eq!(
+                    unsupported.feature, "qwen2_5.dtype",
+                    "expected feature qualified to this model family, got {:?}",
+                    unsupported.feature,
+                );
+                assert_eq!(unsupported.requested.as_deref(), Some("F16"));
+                assert!(
+                    unsupported.supported.iter().any(|s| s == "F32")
+                        && unsupported.supported.iter().any(|s| s == "BF16"),
+                    "expected F32 and BF16 in supported list, got {:?}",
+                    unsupported.supported,
+                );
+            }
+            other => panic!("expected Unsupported for F16 dtype, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_quantized_dtype_with_typed_unsupported_error() {
+        // Q4/Q8 are explicitly out of scope per docs/milestones/m3-*.md
+        // ("Non-Goals: Quantized weights"). They must be rejected at
+        // construction time so the reference path never tries to compute
+        // against a dtype it has no kernel for.
+        for bad in [DType::Q4, DType::Q8] {
+            let mut meta = qwen2_5_0_5b_metadata();
+            meta.dtype = bad.clone();
+
+            let err = Qwen2_5Config::try_from(&meta)
+                .expect_err("quantized dtype must be rejected at construction");
+
+            match err {
+                OcelotlError::Unsupported(unsupported) => {
+                    assert_eq!(unsupported.feature, "qwen2_5.dtype");
+                    assert!(
+                        unsupported.requested.is_some(),
+                        "expected requested dtype name, got None",
+                    );
+                }
+                other => panic!("expected Unsupported for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_odd_head_dim_with_invalid_model_error() {
+        // RoPE pairs index `i` with `i + head_dim/2` (the upper-half
+        // pairing convention used by Qwen2.5/Llama/HF — see dev-04's
+        // M3.4 RoPE learning entry). An odd head_dim has no consistent
+        // half-pairing, so the rotation is mathematically undefined.
+        // Reject at construction time so the runtime never calls into a
+        // RoPE kernel that would either panic or silently produce wrong
+        // numbers.
+        //
+        // Construct a metadata that survives all earlier gates (positive
+        // dims, GQA divisibility, head_dim*heads == hidden_size,
+        // supported dtype) but has an odd head_dim. Pick head_dim=7,
+        // num_attention_heads=14, hidden_size=98, intermediate_size kept
+        // at 4*hidden ish.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.head_dim = 7;
+        meta.num_attention_heads = 14;
+        meta.num_key_value_heads = 2;
+        meta.hidden_size = 98; // 7 * 14
+        meta.intermediate_size = 256;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("odd head_dim must be rejected at construction (RoPE half-pairing)");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("head_dim"),
+                    "expected field=head_dim, got {:?}",
+                    invalid.field,
+                );
+                assert!(
+                    invalid.message.contains("even") || invalid.message.contains("RoPE"),
+                    "expected even/RoPE detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for odd head_dim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_zero_rope_theta_with_invalid_model_error() {
+        // rope_theta is the base of the RoPE inverse-frequency formula
+        // (`1 / theta^(2i/head_dim)`); theta == 0 yields division-by-zero
+        // / infinity at the kernel boundary. Reject at construction.
+        // Negative theta isn't expressible from a real HF config (the
+        // field is always positive in published Qwen2.5 configs) but
+        // we still reject it for completeness — `theta <= 0` is the
+        // single check.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.rope_theta = 0.0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("zero rope_theta must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("rope_theta"),
+                    "expected field=rope_theta, got {:?}",
+                    invalid.field,
+                );
+                assert!(
+                    invalid.message.contains("> 0") || invalid.message.contains("positive"),
+                    "expected positivity detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for zero rope_theta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_negative_rope_theta_with_invalid_model_error() {
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.rope_theta = -1.0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("negative rope_theta must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("rope_theta"));
+            }
+            other => panic!("expected InvalidModel for negative rope_theta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_zero_context_length_with_invalid_model_error() {
+        // context_length == 0 means the model "supports" zero tokens of
+        // context — there is no coherent forward pass for that. Reject
+        // at construction.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.context_length = 0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("zero context_length must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("context_length"));
+                assert!(
+                    invalid.message.contains("> 0") || invalid.message.contains("positive"),
+                    "expected positivity detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for zero context_length, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_oversized_context_length_with_invalid_model_error() {
+        // Sanity bound on context_length. The largest published Qwen2.5
+        // context (with YaRN scaling, on the larger family members) is
+        // 131072. A bound of 1 << 20 (= 1_048_576) is ~8x that, so it's
+        // wide enough not to false-reject any real Qwen2.5 config and
+        // still catches obvious metadata-corruption values like
+        // u32::MAX. The number is not load-bearing; it's a guard rail.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.context_length = (1 << 20) + 1;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("oversized context_length must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("context_length"));
+                assert!(
+                    invalid.message.contains("1048576") || invalid.message.contains("max"),
+                    "expected upper-bound detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for oversized context_length, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_zero_vocab_size_with_invalid_model_error() {
+        // vocab_size == 0 means there are no tokens; the embedding
+        // matrix would be zero rows, the output projection would have
+        // zero outputs, and there is nothing the runtime can sample.
+        // Reject at construction.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.vocab_size = 0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("zero vocab_size must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("vocab_size"));
+                assert!(
+                    invalid.message.contains(">= 2") || invalid.message.contains("at least"),
+                    "expected minimum-vocab detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for zero vocab_size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_one_vocab_size_with_invalid_model_error() {
+        // A vocabulary with a single token is degenerate: every
+        // sample necessarily produces the same token, the model has
+        // nothing to learn, and the metadata is almost certainly
+        // corrupted. The minimum is `>= 2`. We pin this even though
+        // the loader is unlikely to produce it, because the Qwen2.5
+        // metadata path is reachable from synthetic test fixtures and
+        // we want a single sharp boundary, not a fuzzy "small is
+        // probably wrong" rule.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.vocab_size = 1;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("vocab_size == 1 must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("vocab_size"));
+            }
+            other => panic!("expected InvalidModel for vocab_size=1, got {other:?}"),
         }
     }
 
