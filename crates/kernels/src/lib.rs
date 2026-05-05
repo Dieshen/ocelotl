@@ -31,7 +31,12 @@ pub use rope::rope_apply_inplace;
 
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
+<<<<<<< HEAD
 pub mod attention;
+||||||| 54ebdda
+=======
+pub mod mlp;
+>>>>>>> m3/dev-02-james-mlp
 pub mod rmsnorm;
 
 #[derive(Debug, Clone)]
