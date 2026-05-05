@@ -31,6 +31,7 @@ pub use rope::rope_apply_inplace;
 
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
+pub mod mlp;
 pub mod rmsnorm;
 
 #[derive(Debug, Clone)]
