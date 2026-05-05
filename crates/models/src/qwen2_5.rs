@@ -31,6 +31,18 @@ use ocelotl_core::{DType, InvalidModelError, ModelMetadata, OcelotlError, Unsupp
 /// directly with any `architecture` string.
 const QWEN2_5_ARCHITECTURE: &str = "qwen2";
 
+/// Minimum `vocab_size` accepted at construction time.
+///
+/// A vocabulary with 0 or 1 tokens is degenerate: the embedding matrix
+/// would be empty/single-row, every sample would produce the same
+/// token, and the metadata is almost certainly corrupted. The minimum
+/// (`>= 2`) is intentionally lenient — real Qwen2.5 vocabs are
+/// ~150_000 tokens, so any reasonable upper bound (e.g. "must be
+/// >= 100") would risk false-rejecting a future small synthetic
+/// fixture. The single sharp boundary is "at least two distinct
+/// tokens".
+const QWEN2_5_MIN_VOCAB_SIZE: usize = 2;
+
 /// Upper bound on `context_length` accepted at construction time.
 ///
 /// The largest published Qwen2.5 context (with YaRN scaling, on the
@@ -161,6 +173,19 @@ impl TryFrom<&ModelMetadata> for Qwen2_5Config {
             return Err(invalid(
                 "rope_theta",
                 &format!("must be > 0; got {}", m.rope_theta),
+            ));
+        }
+
+        // Vocab-size gate (M3.10). 0 or 1 token is degenerate; reject
+        // at construction so the embedding/output-projection paths never
+        // see a metadata that cannot describe a sample-able model.
+        if m.vocab_size < QWEN2_5_MIN_VOCAB_SIZE {
+            return Err(invalid(
+                "vocab_size",
+                &format!(
+                    "must be >= {QWEN2_5_MIN_VOCAB_SIZE} (at least two distinct tokens); got {}",
+                    m.vocab_size,
+                ),
             ));
         }
 
@@ -525,6 +550,55 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidModel for oversized context_length, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_zero_vocab_size_with_invalid_model_error() {
+        // vocab_size == 0 means there are no tokens; the embedding
+        // matrix would be zero rows, the output projection would have
+        // zero outputs, and there is nothing the runtime can sample.
+        // Reject at construction.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.vocab_size = 0;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("zero vocab_size must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("vocab_size"));
+                assert!(
+                    invalid.message.contains(">= 2") || invalid.message.contains("at least"),
+                    "expected minimum-vocab detail in message, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for zero vocab_size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_one_vocab_size_with_invalid_model_error() {
+        // A vocabulary with a single token is degenerate: every
+        // sample necessarily produces the same token, the model has
+        // nothing to learn, and the metadata is almost certainly
+        // corrupted. The minimum is `>= 2`. We pin this even though
+        // the loader is unlikely to produce it, because the Qwen2.5
+        // metadata path is reachable from synthetic test fixtures and
+        // we want a single sharp boundary, not a fuzzy "small is
+        // probably wrong" rule.
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.vocab_size = 1;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("vocab_size == 1 must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("vocab_size"));
+            }
+            other => panic!("expected InvalidModel for vocab_size=1, got {other:?}"),
         }
     }
 
