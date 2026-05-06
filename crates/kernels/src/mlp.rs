@@ -48,7 +48,7 @@
 
 use ocelotl_core::Result;
 
-use crate::{kernel_err, matmul};
+use crate::{checked_len_product, kernel_err, matmul};
 
 /// Sigmoid Linear Unit: `silu(z) = z * sigmoid(z) = z / (1 + exp(-z))`.
 ///
@@ -163,43 +163,51 @@ pub fn mlp_gated_silu(
             "mlp_gated_silu intermediate must be non-zero".to_string(),
         ));
     }
-    if x.len() != seq_len * hidden {
+    let x_expected = checked_len_product("mlp_gated_silu", "x", &[seq_len, hidden])?;
+    let proj_expected =
+        checked_len_product("mlp_gated_silu", "projection", &[hidden, intermediate])?;
+    let down_expected =
+        checked_len_product("mlp_gated_silu", "down projection", &[intermediate, hidden])?;
+    let scratch_expected =
+        checked_len_product("mlp_gated_silu", "scratch", &[seq_len, intermediate])?;
+
+    if x.len() != x_expected {
         return Err(kernel_err(format!(
             "mlp_gated_silu x slice length {} does not match shape {seq_len}x{hidden}",
             x.len()
         )));
     }
-    if gate_w.len() != hidden * intermediate {
+    if gate_w.len() != proj_expected {
         return Err(kernel_err(format!(
             "mlp_gated_silu gate_w length {} does not match shape {hidden}x{intermediate}",
             gate_w.len()
         )));
     }
-    if up_w.len() != hidden * intermediate {
+    if up_w.len() != proj_expected {
         return Err(kernel_err(format!(
             "mlp_gated_silu up_w length {} does not match shape {hidden}x{intermediate}",
             up_w.len()
         )));
     }
-    if down_w.len() != intermediate * hidden {
+    if down_w.len() != down_expected {
         return Err(kernel_err(format!(
             "mlp_gated_silu down_w length {} does not match shape {intermediate}x{hidden}",
             down_w.len()
         )));
     }
-    if gate_buf.len() != seq_len * intermediate {
+    if gate_buf.len() != scratch_expected {
         return Err(kernel_err(format!(
             "mlp_gated_silu gate_buf length {} does not match shape {seq_len}x{intermediate}",
             gate_buf.len()
         )));
     }
-    if up_buf.len() != seq_len * intermediate {
+    if up_buf.len() != scratch_expected {
         return Err(kernel_err(format!(
             "mlp_gated_silu up_buf length {} does not match shape {seq_len}x{intermediate}",
             up_buf.len()
         )));
     }
-    if out.len() != seq_len * hidden {
+    if out.len() != x_expected {
         return Err(kernel_err(format!(
             "mlp_gated_silu out length {} does not match shape {seq_len}x{hidden}",
             out.len()
@@ -512,6 +520,33 @@ mod tests {
         )
         .expect_err("must reject x length mismatch");
         assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn mlp_gated_silu_rejects_shape_product_overflow() {
+        let err = mlp_gated_silu(
+            &[],
+            usize::MAX,
+            2,
+            1,
+            &[0.0; 2],
+            &[0.0; 2],
+            &[0.0; 2],
+            &mut [],
+            &mut [],
+            &mut [],
+        )
+        .expect_err("overflowing seq_len*hidden must be rejected");
+
+        match err {
+            OcelotlError::Kernel(KernelError { message, .. }) => {
+                assert!(
+                    message.contains("overflows"),
+                    "expected overflow diagnostic, got {message:?}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
     }
 
     #[test]

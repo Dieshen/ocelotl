@@ -65,7 +65,7 @@
 
 use ocelotl_core::Result;
 
-use crate::{kernel_err, softmax};
+use crate::{checked_len_product, kernel_err, softmax};
 
 /// Scaled-dot-product attention with causal mask and GQA, single request.
 ///
@@ -92,6 +92,7 @@ use crate::{kernel_err, softmax};
 /// - `num_q_heads % num_kv_heads != 0` (GQA group sizing invalid),
 /// - any of `q`, `k`, `v`, `out` slice lengths do not match the declared
 ///   shape implied by `(seq_len, num_q_heads | num_kv_heads, head_dim)`.
+#[allow(clippy::too_many_arguments)]
 pub fn scaled_dot_product_attention(
     q: &[f32],
     k: &[f32],
@@ -129,8 +130,16 @@ pub fn scaled_dot_product_attention(
         )));
     }
 
-    let q_total = seq_len * num_q_heads * head_dim;
-    let kv_total = seq_len * num_kv_heads * head_dim;
+    let q_total = checked_len_product(
+        "scaled_dot_product_attention",
+        "q/out",
+        &[seq_len, num_q_heads, head_dim],
+    )?;
+    let kv_total = checked_len_product(
+        "scaled_dot_product_attention",
+        "k/v",
+        &[seq_len, num_kv_heads, head_dim],
+    )?;
 
     if q.len() != q_total {
         return Err(kernel_err(format!(
@@ -193,14 +202,14 @@ pub fn scaled_dot_product_attention(
             //    untouched and is never read (we only softmax/accumulate
             //    over the unmasked prefix). Setting -inf is unnecessary
             //    when we slice the prefix; numerically equivalent.
-            for j in 0..=i {
+            let q_base = (i * num_q_heads + h) * head_dim;
+            for (j, score) in scores.iter_mut().enumerate().take(i + 1) {
                 let mut acc = 0.0_f32;
-                let q_base = (i * num_q_heads + h) * head_dim;
                 let k_base = (j * num_kv_heads + kh) * head_dim;
                 for d in 0..head_dim {
                     acc += q[q_base + d] * k[k_base + d];
                 }
-                scores[j] = acc * scale;
+                *score = acc * scale;
             }
 
             // 2) Softmax over the unmasked prefix [0..=i]. Reuse the
@@ -213,8 +222,7 @@ pub fn scaled_dot_product_attention(
             for d in 0..head_dim {
                 out[out_base + d] = 0.0_f32;
             }
-            for j in 0..=i {
-                let p = scores[j];
+            for (j, &p) in scores.iter().enumerate().take(i + 1) {
                 let v_base = (j * num_kv_heads + kh) * head_dim;
                 for d in 0..head_dim {
                     out[out_base + d] += p * v[v_base + d];
@@ -284,7 +292,7 @@ mod tests {
         )
         .expect("well-formed attention call must succeed");
 
-        let expected = [1.0_f32, 2.0, 2.339_520_83, 3.339_520_83];
+        let expected = [1.0_f32, 2.0, 2.339_521, 3.339_521];
         let tol = 5.0e-6_f32;
         for (idx, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -447,14 +455,29 @@ mod tests {
         // Build slices large enough that the *length* checks would also
         // fail; we want the multiple-of check to fire first, so size them
         // to match the declared shape.
-        let q = vec![0.0_f32; 1 * 3 * 2]; // seq_len=1, 3 q_heads, head_dim=2
-        let k = vec![0.0_f32; 1 * 2 * 2];
-        let v = vec![0.0_f32; 1 * 2 * 2];
-        let mut out = vec![0.0_f32; 1 * 3 * 2];
+        let seq_len = 1;
+        let q_heads = 3;
+        let kv_heads = 2;
+        let head_dim = 2;
+        let q = vec![0.0_f32; seq_len * q_heads * head_dim];
+        let k = vec![0.0_f32; seq_len * kv_heads * head_dim];
+        let v = vec![0.0_f32; seq_len * kv_heads * head_dim];
+        let mut out = vec![0.0_f32; seq_len * q_heads * head_dim];
 
-        let err = scaled_dot_product_attention(&q, &k, &v, 1, 3, 2, 2, &mut out)
-            .expect_err("non-multiple q/kv head count must be rejected");
+        let err = scaled_dot_product_attention(
+            &q, &k, &v, seq_len, q_heads, kv_heads, head_dim, &mut out,
+        )
+        .expect_err("non-multiple q/kv head count must be rejected");
         assert_kernel_err_contains(err, "multiple of num_kv_heads");
+    }
+
+    #[test]
+    fn rejects_shape_product_overflow() {
+        let mut out = [];
+        let err = scaled_dot_product_attention(&[], &[], &[], usize::MAX, 2, 1, 1, &mut out)
+            .expect_err("overflowing shape product must be rejected");
+
+        assert_kernel_err_contains(err, "overflows");
     }
 
     #[test]

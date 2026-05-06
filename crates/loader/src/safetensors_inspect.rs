@@ -6,9 +6,19 @@
 //! `ocelotl-core::ModelMetadata`; this module deliberately stops at the
 //! artifact-shape boundary and does not import model-family knowledge.
 
-use std::path::Path;
+use std::{
+    fs::File,
+    io::{ErrorKind, Read},
+    path::Path,
+};
 
 use ocelotl_core::{InvalidModelError, IoError, OcelotlError, Result, UnsupportedError};
+
+const SAFETENSORS_HEADER_LEN_BYTES: usize = std::mem::size_of::<u64>();
+// Mirrors safetensors 0.7.0's header cap. Keep this local so header-only
+// inspection does not need to allocate a whole-file buffer just to reuse the
+// upstream parser's length gate.
+const SAFETENSORS_MAX_HEADER_SIZE: usize = 100_000_000;
 
 /// Dtypes the loader currently accepts for inspected tensors. Anything else in
 /// a header is rejected with `OcelotlError::Unsupported` so the caller can
@@ -54,21 +64,77 @@ pub fn inspect_safetensors(path: &Path) -> Result<SafetensorsManifest> {
     // missing or unreadable file is a storage problem, not a malformed
     // artifact. Decided in M2.6 (paired); previous M2.5 mapping to
     // InvalidModel was wrong.
-    let bytes = std::fs::read(path).map_err(|source| {
-        OcelotlError::from(IoError {
-            path: Some(path.to_path_buf()),
-            source,
-        })
-    })?;
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| io_error(path, source))?
+        .len();
 
-    let (_header_size, metadata) =
-        safetensors::SafeTensors::read_metadata(&bytes).map_err(|e| {
-            OcelotlError::from(InvalidModelError {
-                path: Some(path.to_path_buf()),
-                field: None,
-                message: format!("failed to parse safetensors header: {e}"),
-            })
+    let mut header_len_bytes = [0u8; SAFETENSORS_HEADER_LEN_BYTES];
+    read_exact_header_part(&mut file, path, &mut header_len_bytes)?;
+    let header_len_u64 = u64::from_le_bytes(header_len_bytes);
+    let header_len: usize = header_len_u64.try_into().map_err(|_| {
+        invalid_safetensors_header(
+            path,
+            format!("safetensors header length {header_len_u64} does not fit in usize"),
+        )
+    })?;
+    if header_len > SAFETENSORS_MAX_HEADER_SIZE {
+        return Err(invalid_safetensors_header(
+            path,
+            format!(
+                "safetensors header length {header_len} exceeds max {SAFETENSORS_MAX_HEADER_SIZE}"
+            ),
+        ));
+    }
+
+    let header_end = SAFETENSORS_HEADER_LEN_BYTES
+        .checked_add(header_len)
+        .ok_or_else(|| {
+            invalid_safetensors_header(
+                path,
+                format!("safetensors header length {header_len} overflows file offset"),
+            )
         })?;
+    if file_len < header_end as u64 {
+        return Err(invalid_safetensors_header(
+            path,
+            format!(
+                "safetensors header is truncated: file is {file_len} bytes, header ends at {header_end}"
+            ),
+        ));
+    }
+
+    let mut header_bytes = vec![0u8; header_len];
+    read_exact_header_part(&mut file, path, &mut header_bytes)?;
+    let header_str = std::str::from_utf8(&header_bytes).map_err(|e| {
+        invalid_safetensors_header(path, format!("failed to parse safetensors header: {e}"))
+    })?;
+    let metadata: safetensors::tensor::Metadata =
+        serde_json::from_str(header_str).map_err(|e| {
+            invalid_safetensors_header(path, format!("failed to parse safetensors header: {e}"))
+        })?;
+
+    let expected_file_len = (header_end as u64)
+        .checked_add(metadata.data_len() as u64)
+        .ok_or_else(|| {
+            invalid_safetensors_header(
+                path,
+                format!(
+                    "safetensors data length {} overflows file length",
+                    metadata.data_len()
+                ),
+            )
+        })?;
+    if expected_file_len != file_len {
+        return Err(invalid_safetensors_header(
+            path,
+            format!(
+                "safetensors file length mismatch: header declares {} data bytes, expected total {expected_file_len}, got {file_len}",
+                metadata.data_len()
+            ),
+        ));
+    }
 
     // `metadata.tensors()` returns a HashMap; iterate `offset_keys()` so the
     // order is deterministic by data layout, which is what most callers want
@@ -99,6 +165,31 @@ pub fn inspect_safetensors(path: &Path) -> Result<SafetensorsManifest> {
     Ok(SafetensorsManifest {
         tensors,
         data_len: metadata.data_len(),
+    })
+}
+
+fn read_exact_header_part(file: &mut File, path: &Path, buf: &mut [u8]) -> Result<()> {
+    file.read_exact(buf).map_err(|source| {
+        if source.kind() == ErrorKind::UnexpectedEof {
+            invalid_safetensors_header(path, "safetensors header is truncated".to_string())
+        } else {
+            io_error(path, source)
+        }
+    })
+}
+
+fn io_error(path: &Path, source: std::io::Error) -> OcelotlError {
+    OcelotlError::from(IoError {
+        path: Some(path.to_path_buf()),
+        source,
+    })
+}
+
+fn invalid_safetensors_header(path: &Path, message: String) -> OcelotlError {
+    OcelotlError::from(InvalidModelError {
+        path: Some(path.to_path_buf()),
+        field: None,
+        message,
     })
 }
 
@@ -333,6 +424,43 @@ mod tests {
         assert_eq!(lm_head.byte_range, (256, 384));
 
         assert_eq!(manifest.data_len, 384);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inspect_safetensors_accepts_large_data_section_without_reading_tensor_bytes() {
+        use std::io::Write;
+
+        let path = tmp_path("large_data_header_only");
+        let data_len: u64 = 4 * 1024 * 1024;
+        let header = serde_json::json!({
+            "large_weight": {
+                "dtype": "F32",
+                "shape": [1024, 1024],
+                "data_offsets": [0, data_len],
+            }
+        });
+        let header_json = serde_json::to_string(&header).expect("serialize header");
+        let header_bytes = header_json.as_bytes();
+        let header_len = header_bytes.len() as u64;
+
+        let mut file = std::fs::File::create(&path).expect("create large-data fixture");
+        file.write_all(&header_len.to_le_bytes())
+            .expect("write header length");
+        file.write_all(header_bytes).expect("write header");
+        let total_len = SAFETENSORS_HEADER_LEN_BYTES as u64 + header_len + data_len;
+        file.set_len(total_len)
+            .expect("extend data section without writing tensor bytes");
+        drop(file);
+
+        let manifest =
+            inspect_safetensors(&path).expect("header-only inspection must not need data bytes");
+
+        assert_eq!(manifest.data_len, data_len as usize);
+        assert_eq!(manifest.tensors.len(), 1);
+        assert_eq!(manifest.tensors[0].name, "large_weight");
+        assert_eq!(manifest.tensors[0].byte_range, (0, data_len as usize));
 
         let _ = std::fs::remove_file(&path);
     }

@@ -1,7 +1,7 @@
 //! Qwen2.5 tensor-name and shape validation against a safetensors manifest.
 //!
 //! This module owns the model-family knowledge of *which* tensors a Qwen2.5
-//! artifact must contain and *what shapes* they must have. The loader's
+//! artifact must contain and *what shapes/dtypes* they must have. The loader's
 //! `require_tensors` helper provides generic presence checking; the
 //! shape-derivation rules and the canonical name list live here because
 //! they are model-specific.
@@ -15,11 +15,11 @@
 //! every failure path here returns `OcelotlError::InvalidModel`, never a
 //! new error type.
 
-use ocelotl_core::{InvalidModelError, OcelotlError, Result};
-use ocelotl_loader::{SafetensorsManifest, require_tensors};
+use ocelotl_core::{DType, InvalidModelError, OcelotlError, Result};
+use ocelotl_loader::{SafetensorsManifest, SupportedDtype, require_tensors};
 use std::path::Path;
 
-use crate::Qwen2_5Config;
+use super::Qwen2_5Config;
 
 /// Validate a safetensors manifest against the Qwen2.5 tensor contract for
 /// the given config.
@@ -88,83 +88,103 @@ pub fn validate_qwen2_5_tensors(
     let required_refs: Vec<&str> = required.iter().map(|s| s.as_str()).collect();
     require_tensors(manifest, &required_refs, path)?;
 
-    // Step 2: shapes. Walk the same list, look each tensor up in the
-    // manifest, and compare against the expected shape derived from
-    // config. The presence check above guarantees every name resolves.
-    let q_out = config.num_attention_heads * config.head_dim;
-    let kv_out = config.num_key_value_heads * config.head_dim;
+    // Step 2: shapes + dtype. Walk the same list, look each tensor up in
+    // the manifest, and compare against the expected shape and dtype derived
+    // from config. The presence check above guarantees every name resolves.
+    let q_out = checked_dim_product(
+        "num_attention_heads*head_dim",
+        &[config.num_attention_heads, config.head_dim],
+        path,
+    )?;
+    let kv_out = checked_dim_product(
+        "num_key_value_heads*head_dim",
+        &[config.num_key_value_heads, config.head_dim],
+        path,
+    )?;
 
     for layer in 0..config.num_hidden_layers {
         check_shape(
             manifest,
             &format!("model.layers.{layer}.self_attn.q_proj.weight"),
             &[q_out, config.hidden_size],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.self_attn.q_proj.bias"),
             &[q_out],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.self_attn.k_proj.weight"),
             &[kv_out, config.hidden_size],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.self_attn.k_proj.bias"),
             &[kv_out],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.self_attn.v_proj.weight"),
             &[kv_out, config.hidden_size],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.self_attn.v_proj.bias"),
             &[kv_out],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.self_attn.o_proj.weight"),
             &[config.hidden_size, q_out],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.mlp.gate_proj.weight"),
             &[config.intermediate_size, config.hidden_size],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.mlp.up_proj.weight"),
             &[config.intermediate_size, config.hidden_size],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.mlp.down_proj.weight"),
             &[config.hidden_size, config.intermediate_size],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.input_layernorm.weight"),
             &[config.hidden_size],
+            &config.dtype,
             path,
         )?;
         check_shape(
             manifest,
             &format!("model.layers.{layer}.post_attention_layernorm.weight"),
             &[config.hidden_size],
+            &config.dtype,
             path,
         )?;
     }
@@ -173,15 +193,23 @@ pub fn validate_qwen2_5_tensors(
         manifest,
         "model.embed_tokens.weight",
         &[config.vocab_size, config.hidden_size],
+        &config.dtype,
         path,
     )?;
-    check_shape(manifest, "model.norm.weight", &[config.hidden_size], path)?;
+    check_shape(
+        manifest,
+        "model.norm.weight",
+        &[config.hidden_size],
+        &config.dtype,
+        path,
+    )?;
 
     if !tie_word_embeddings {
         check_shape(
             manifest,
             "lm_head.weight",
             &[config.vocab_size, config.hidden_size],
+            &config.dtype,
             path,
         )?;
     }
@@ -228,6 +256,7 @@ fn check_shape(
     manifest: &SafetensorsManifest,
     name: &str,
     expected: &[usize],
+    expected_dtype: &DType,
     path: Option<&Path>,
 ) -> Result<()> {
     let entry = manifest
@@ -254,7 +283,48 @@ fn check_shape(
             ),
         }));
     }
+    if !dtype_matches(entry.dtype, expected_dtype) {
+        return Err(OcelotlError::from(InvalidModelError {
+            path: path.map(|p| p.to_path_buf()),
+            field: Some(name.to_string()),
+            message: format!(
+                "tensor `{name}` has dtype {}, expected {:?}",
+                supported_dtype_name(entry.dtype),
+                expected_dtype,
+            ),
+        }));
+    }
     Ok(())
+}
+
+fn dtype_matches(actual: SupportedDtype, expected: &DType) -> bool {
+    matches!(
+        (actual, expected),
+        (SupportedDtype::F32, DType::F32)
+            | (SupportedDtype::F16, DType::F16)
+            | (SupportedDtype::BF16, DType::BF16)
+    )
+}
+
+fn supported_dtype_name(dtype: SupportedDtype) -> &'static str {
+    match dtype {
+        SupportedDtype::F32 => "F32",
+        SupportedDtype::F16 => "F16",
+        SupportedDtype::BF16 => "BF16",
+    }
+}
+
+fn checked_dim_product(label: &str, dims: &[usize], path: Option<&Path>) -> Result<usize> {
+    dims.iter()
+        .copied()
+        .try_fold(1usize, usize::checked_mul)
+        .ok_or_else(|| {
+            OcelotlError::from(InvalidModelError {
+                path: path.map(|p| p.to_path_buf()),
+                field: Some(label.to_string()),
+                message: format!("shape product overflows usize: {:?}", dims),
+            })
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -289,8 +359,8 @@ mod tests {
 
     /// Build a synthetic SafetensorsManifest containing exactly the tensors
     /// in `names`, each with the shape returned by `shape_for(name)`.
-    /// Byte ranges and dtype don't matter for tensor-name/shape validation,
-    /// so we set them to zero / F32.
+    /// Byte ranges don't matter for tensor-name/shape/dtype validation, so we
+    /// set them to zero. Dtype defaults to F32 to match `tiny_config()`.
     fn manifest_with(
         names: &[String],
         shape_for: impl Fn(&str) -> Vec<usize>,
@@ -466,6 +536,73 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidModel for wrong shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_wrong_dtype_with_invalid_model_error_naming_the_tensor() {
+        let cfg = tiny_config();
+        let names = required_tensor_names(&cfg, true);
+        let bad = "model.embed_tokens.weight".to_string();
+        let mut manifest = manifest_with(&names, |n| shape_of(n, &cfg));
+        let entry = manifest
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == bad)
+            .expect("bad tensor must exist in manifest");
+        entry.dtype = SupportedDtype::F16;
+
+        let err = validate_qwen2_5_tensors(&manifest, &cfg, true, None)
+            .expect_err("wrong-dtype tensor must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some(bad.as_str()));
+                assert!(
+                    invalid.message.contains("dtype") && invalid.message.contains("F16"),
+                    "expected dtype mismatch detail, got {:?}",
+                    invalid.message,
+                );
+            }
+            other => panic!("expected InvalidModel for wrong dtype, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_bf16_manifest_when_config_dtype_is_bf16() {
+        let mut cfg = tiny_config();
+        cfg.dtype = DType::BF16;
+        let names = required_tensor_names(&cfg, true);
+        let mut manifest = manifest_with(&names, |n| shape_of(n, &cfg));
+        for entry in &mut manifest.tensors {
+            entry.dtype = SupportedDtype::BF16;
+        }
+
+        validate_qwen2_5_tensors(&manifest, &cfg, true, None)
+            .expect("BF16 config must accept BF16 tensor headers");
+    }
+
+    #[test]
+    fn validate_rejects_shape_product_overflow_with_invalid_model() {
+        let mut cfg = tiny_config();
+        cfg.num_hidden_layers = 0;
+        cfg.num_attention_heads = usize::MAX;
+        cfg.head_dim = 2;
+        let names = required_tensor_names(&cfg, true);
+        let manifest = manifest_with(&names, |n| shape_of(n, &tiny_config()));
+
+        let err = validate_qwen2_5_tensors(&manifest, &cfg, true, None)
+            .expect_err("overflowing q_out shape product must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert!(
+                    invalid.message.contains("overflows"),
+                    "expected overflow diagnostic, got {:?}",
+                    invalid.message
+                );
+            }
+            other => panic!("expected InvalidModel for shape overflow, got {other:?}"),
         }
     }
 

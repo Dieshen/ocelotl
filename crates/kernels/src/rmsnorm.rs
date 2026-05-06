@@ -34,7 +34,7 @@
 
 use ocelotl_core::Result;
 
-use crate::kernel_err;
+use crate::{checked_len_product, kernel_err};
 
 /// Row-wise RMSNorm: `out[r, i] = (x[r, i] / sqrt(mean_i(x[r,i]^2) + eps)) * weight[i]`.
 ///
@@ -87,7 +87,9 @@ pub fn rmsnorm(
             weight.len()
         )));
     }
-    if x.len() != rows * hidden {
+    let x_expected = checked_len_product("rmsnorm", "x", &[rows, hidden])?;
+
+    if x.len() != x_expected {
         return Err(kernel_err(format!(
             "rmsnorm x slice length {} does not match shape {rows}x{hidden}",
             x.len()
@@ -152,7 +154,7 @@ mod tests {
 
         rmsnorm(&x, 1, 3, &w, 1e-6, &mut out).expect("well-formed rmsnorm must succeed");
 
-        let expected = [0.46291006_f32, 0.92582012, 1.38873018];
+        let expected = [0.46291006_f32, 0.925_820_1, 1.388_730_2];
         for (got, want) in out.iter().zip(expected.iter()) {
             assert!(
                 (got - want).abs() < 1e-6,
@@ -180,7 +182,7 @@ mod tests {
 
         rmsnorm(&x, 1, 3, &w, 1e-6, &mut out).expect("well-formed rmsnorm must succeed");
 
-        let expected = [0.92582012_f32, 0.46291006, 1.38873018];
+        let expected = [0.925_820_1_f32, 0.46291006, 1.388_730_2];
         for (got, want) in out.iter().zip(expected.iter()) {
             assert!(
                 (got - want).abs() < 1e-6,
@@ -238,7 +240,7 @@ mod tests {
 
         rmsnorm(&x, 2, 3, &w, 1e-6, &mut out).expect("multi-row rmsnorm must succeed");
 
-        let expected_row = [0.46291006_f32, 0.92582012, 1.38873018];
+        let expected_row = [0.46291006_f32, 0.925_820_1, 1.388_730_2];
         for r in 0..2 {
             for i in 0..3 {
                 let got = out[r * 3 + i];
@@ -291,6 +293,26 @@ mod tests {
 
         let err = rmsnorm(&x, 1, 3, &w, 1e-6, &mut out).expect_err("must reject x length mismatch");
         assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn rmsnorm_rejects_shape_product_overflow() {
+        let x = [];
+        let w = [1.0_f32, 1.0];
+        let mut out = [];
+
+        let err = rmsnorm(&x, usize::MAX, 2, &w, 1e-6, &mut out)
+            .expect_err("overflowing rows*hidden must be rejected");
+
+        match err {
+            OcelotlError::Kernel(KernelError { message, .. }) => {
+                assert!(
+                    message.contains("overflows"),
+                    "expected overflow diagnostic, got {message:?}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
     }
 
     #[test]

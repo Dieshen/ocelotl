@@ -5,15 +5,15 @@
 //! `ocelotl_runtime::greedy_sample`) without implementing real attention,
 //! RoPE, or RMSNorm. Its only job is to produce reproducible logits given a
 //! fixed prompt so the M1 integration test can prove the wiring works end
-//! to end. M3 will replace the synthetic forward with the real Qwen2.5
-//! forward; nothing else in the path needs to change at that point.
+//! to end. The real Qwen2.5 implementation now lives under `qwen`; the
+//! synthetic path remains as a small compatibility fixture for the original
+//! M1 runtime smoke test.
 
-pub mod qwen2_5;
-pub mod qwen2_5_model;
-pub mod qwen2_5_tensors;
-pub use qwen2_5::Qwen2_5Config;
-pub use qwen2_5_model::{Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d};
-pub use qwen2_5_tensors::{required_tensor_names, validate_qwen2_5_tensors};
+pub mod qwen;
+pub use qwen::{
+    Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, required_tensor_names,
+    transpose_2d, validate_qwen2_5_tensors,
+};
 
 use ocelotl_core::{
     GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId,

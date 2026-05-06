@@ -96,6 +96,18 @@ pub(crate) fn kernel_err(message: impl Into<String>) -> OcelotlError {
     })
 }
 
+pub(crate) fn checked_len_product(kernel: &str, label: &str, dims: &[usize]) -> Result<usize> {
+    dims.iter()
+        .copied()
+        .try_fold(1usize, usize::checked_mul)
+        .ok_or_else(|| {
+            kernel_err(format!(
+                "{kernel} {label} shape product overflows usize: {:?}",
+                dims
+            ))
+        })
+}
+
 /// Element-wise addition: `out[i] = a[i] + b[i]`.
 ///
 /// All three slices must have the same length. M1 is contiguous-only — there
@@ -252,19 +264,23 @@ pub fn matmul(
             "matmul inner-dimension mismatch: a is {m}x{k_a}, b is {k_b}x{n}"
         )));
     }
-    if a.len() != m * k_a {
+    let a_expected = checked_len_product("matmul", "a", &[m, k_a])?;
+    let b_expected = checked_len_product("matmul", "b", &[k_b, n])?;
+    let out_expected = checked_len_product("matmul", "out", &[m, n])?;
+
+    if a.len() != a_expected {
         return Err(kernel_err(format!(
             "matmul a slice length {} does not match shape {m}x{k_a}",
             a.len()
         )));
     }
-    if b.len() != k_b * n {
+    if b.len() != b_expected {
         return Err(kernel_err(format!(
             "matmul b slice length {} does not match shape {k_b}x{n}",
             b.len()
         )));
     }
-    if out.len() != m * n {
+    if out.len() != out_expected {
         return Err(kernel_err(format!(
             "matmul out slice length {} does not match shape {m}x{n}",
             out.len()
@@ -506,5 +522,25 @@ mod tests {
         let err =
             matmul(&a, (2, 3), &b, (3, 2), &mut out).expect_err("must reject wrong out length");
         assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn matmul_rejects_shape_product_overflow() {
+        let a = [];
+        let b = [];
+        let mut out = [];
+
+        let err = matmul(&a, (usize::MAX, 2), &b, (2, 1), &mut out)
+            .expect_err("overflowing shapes must be rejected");
+
+        match err {
+            OcelotlError::Kernel(KernelError { message, .. }) => {
+                assert!(
+                    message.contains("overflows"),
+                    "expected overflow diagnostic, got {message:?}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
     }
 }

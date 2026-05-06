@@ -196,9 +196,9 @@ mod tests {
 
         // Hand-computed values (see test comment for derivation).
         let c0 = 0.540_302_3_f32; // cos(1.0)
-        let s0 = 0.841_471_0_f32; // sin(1.0)
-        let c1 = 0.999_950_0_f32; // cos(0.01)
-        let s1 = 0.009_999_833_5_f32; // sin(0.01)
+        let s0 = 0.841_471_f32; // sin(1.0)
+        let c1 = 0.999_95_f32; // cos(0.01)
+        let s1 = 0.009_999_833_f32; // sin(0.01)
         let expected = [c0, -s1, s0, c1];
 
         let tol = 1.0e-6_f32;

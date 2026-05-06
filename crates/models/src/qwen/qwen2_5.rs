@@ -37,8 +37,8 @@ const QWEN2_5_ARCHITECTURE: &str = "qwen2";
 /// would be empty/single-row, every sample would produce the same
 /// token, and the metadata is almost certainly corrupted. The minimum
 /// (`>= 2`) is intentionally lenient — real Qwen2.5 vocabs are
-/// ~150_000 tokens, so any reasonable upper bound (e.g. "must be
-/// >= 100") would risk false-rejecting a future small synthetic
+/// ~150_000 tokens, so any reasonable upper bound (e.g. "must be >= 100")
+/// would risk false-rejecting a future small synthetic
 /// fixture. The single sharp boundary is "at least two distinct
 /// tokens".
 const QWEN2_5_MIN_VOCAB_SIZE: usize = 2;
@@ -119,6 +119,12 @@ impl TryFrom<&ModelMetadata> for Qwen2_5Config {
         if m.hidden_size == 0 {
             return Err(invalid("hidden_size", "must be > 0"));
         }
+        if m.intermediate_size == 0 {
+            return Err(invalid("intermediate_size", "must be > 0"));
+        }
+        if m.num_hidden_layers == 0 {
+            return Err(invalid("num_hidden_layers", "must be > 0"));
+        }
         if m.head_dim == 0 {
             return Err(invalid("head_dim", "must be > 0"));
         }
@@ -169,10 +175,20 @@ impl TryFrom<&ModelMetadata> for Qwen2_5Config {
         // inverse-frequency formula `1 / theta^(2i/head_dim)`; theta == 0
         // yields division-by-zero, theta < 0 yields complex powers.
         // Both are unrunnable.
-        if !(m.rope_theta > 0.0) {
+        if !m.rope_theta.is_finite() || m.rope_theta <= 0.0 {
             return Err(invalid(
                 "rope_theta",
-                &format!("must be > 0; got {}", m.rope_theta),
+                &format!("must be finite and > 0; got {}", m.rope_theta),
+            ));
+        }
+
+        // RMSNorm epsilon is fed directly to the RMSNorm kernel. Reject
+        // non-finite, zero, or negative values here so the model never
+        // constructs with a normalization config that only fails at compute.
+        if !m.rms_norm_eps.is_finite() || m.rms_norm_eps <= 0.0 {
+            return Err(invalid(
+                "rms_norm_eps",
+                &format!("must be finite and > 0; got {}", m.rms_norm_eps),
             ));
         }
 
@@ -500,6 +516,66 @@ mod tests {
             }
             other => panic!("expected InvalidModel for negative rope_theta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn try_from_rejects_nonfinite_rope_theta_with_invalid_model_error() {
+        let mut meta = qwen2_5_0_5b_metadata();
+        meta.rope_theta = f64::INFINITY;
+
+        let err = Qwen2_5Config::try_from(&meta)
+            .expect_err("non-finite rope_theta must be rejected at construction");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("rope_theta"));
+                assert!(
+                    invalid.message.contains("finite"),
+                    "expected finite diagnostic, got {:?}",
+                    invalid.message
+                );
+            }
+            other => panic!("expected InvalidModel for non-finite rope_theta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_nonpositive_rms_norm_eps_with_invalid_model_error() {
+        for bad in [0.0, -1e-6, f64::NAN] {
+            let mut meta = qwen2_5_0_5b_metadata();
+            meta.rms_norm_eps = bad;
+
+            let err = Qwen2_5Config::try_from(&meta)
+                .expect_err("non-positive or non-finite rms_norm_eps must be rejected");
+
+            match err {
+                OcelotlError::InvalidModel(invalid) => {
+                    assert_eq!(invalid.field.as_deref(), Some("rms_norm_eps"));
+                }
+                other => panic!("expected InvalidModel for rms_norm_eps={bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_zero_layer_count_and_intermediate_size() {
+        fn assert_rejected(field: &str, mutate: fn(&mut ModelMetadata)) {
+            let mut meta = qwen2_5_0_5b_metadata();
+            mutate(&mut meta);
+
+            let err = Qwen2_5Config::try_from(&meta)
+                .expect_err("zero structural dimensions must be rejected");
+
+            match err {
+                OcelotlError::InvalidModel(invalid) => {
+                    assert_eq!(invalid.field.as_deref(), Some(field));
+                }
+                other => panic!("expected InvalidModel for {field}, got {other:?}"),
+            }
+        }
+
+        assert_rejected("num_hidden_layers", |meta| meta.num_hidden_layers = 0);
+        assert_rejected("intermediate_size", |meta| meta.intermediate_size = 0);
     }
 
     #[test]

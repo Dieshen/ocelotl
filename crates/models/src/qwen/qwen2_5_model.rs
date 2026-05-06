@@ -54,11 +54,11 @@
 //! M1.7 / M3.3-3.6 boundary contract; M4+ is when a typed tensor view
 //! becomes worth its overhead.
 
-use ocelotl_core::{InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId};
+use ocelotl_core::{DType, InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId};
 use ocelotl_kernels::{attention::scaled_dot_product_attention, vec_add};
 use ocelotl_kernels::{matmul, mlp::mlp_gated_silu, rmsnorm::rmsnorm, rope_apply_inplace};
 
-use crate::Qwen2_5Config;
+use super::Qwen2_5Config;
 
 /// Per-layer weight bundle. All tensors stored as contiguous row-major
 /// `Vec<f32>` (HF layout). The model layer transposes weights as needed
@@ -134,15 +134,30 @@ impl Qwen2_5Model {
     /// before the kernel boundary; downstream forward code can assume
     /// every length is correct.
     pub fn new(config: Qwen2_5Config, weights: Qwen2_5Weights) -> Result<Self> {
+        validate_config_for_model(&config)?;
         let h = config.hidden_size;
         let v = config.vocab_size;
-        let q_out = config.num_attention_heads * config.head_dim;
-        let kv_out = config.num_key_value_heads * config.head_dim;
+        let q_out = checked_len_product(
+            "num_attention_heads*head_dim",
+            &[config.num_attention_heads, config.head_dim],
+        )?;
+        let kv_out = checked_len_product(
+            "num_key_value_heads*head_dim",
+            &[config.num_key_value_heads, config.head_dim],
+        )?;
         let i_size = config.intermediate_size;
 
-        check_len("embed_tokens", weights.embed_tokens.len(), v * h)?;
+        let embed_len = checked_len_product("vocab_size*hidden_size", &[v, h])?;
+        let lm_head_len = checked_len_product("hidden_size*vocab_size", &[h, v])?;
+        let q_proj_len = checked_len_product("hidden_size*q_out", &[h, q_out])?;
+        let kv_proj_len = checked_len_product("hidden_size*kv_out", &[h, kv_out])?;
+        let o_proj_len = checked_len_product("q_out*hidden_size", &[q_out, h])?;
+        let mlp_in_len = checked_len_product("hidden_size*intermediate_size", &[h, i_size])?;
+        let mlp_down_len = checked_len_product("intermediate_size*hidden_size", &[i_size, h])?;
+
+        check_len("embed_tokens", weights.embed_tokens.len(), embed_len)?;
         check_len("final_norm_w", weights.final_norm_w.len(), h)?;
-        check_len("lm_head_w", weights.lm_head_w.len(), h * v)?;
+        check_len("lm_head_w", weights.lm_head_w.len(), lm_head_len)?;
 
         if weights.layers.len() != config.num_hidden_layers {
             return Err(invalid_model(
@@ -159,7 +174,7 @@ impl Qwen2_5Model {
             check_len(
                 &format!("layers[{i}].q_proj_w"),
                 layer.q_proj_w.len(),
-                h * q_out,
+                q_proj_len,
             )?;
             check_len(
                 &format!("layers[{i}].q_proj_b"),
@@ -169,7 +184,7 @@ impl Qwen2_5Model {
             check_len(
                 &format!("layers[{i}].k_proj_w"),
                 layer.k_proj_w.len(),
-                h * kv_out,
+                kv_proj_len,
             )?;
             check_len(
                 &format!("layers[{i}].k_proj_b"),
@@ -179,7 +194,7 @@ impl Qwen2_5Model {
             check_len(
                 &format!("layers[{i}].v_proj_w"),
                 layer.v_proj_w.len(),
-                h * kv_out,
+                kv_proj_len,
             )?;
             check_len(
                 &format!("layers[{i}].v_proj_b"),
@@ -189,7 +204,7 @@ impl Qwen2_5Model {
             check_len(
                 &format!("layers[{i}].o_proj_w"),
                 layer.o_proj_w.len(),
-                q_out * h,
+                o_proj_len,
             )?;
             check_len(
                 &format!("layers[{i}].input_layernorm_w"),
@@ -204,17 +219,17 @@ impl Qwen2_5Model {
             check_len(
                 &format!("layers[{i}].gate_proj_w"),
                 layer.gate_proj_w.len(),
-                h * i_size,
+                mlp_in_len,
             )?;
             check_len(
                 &format!("layers[{i}].up_proj_w"),
                 layer.up_proj_w.len(),
-                h * i_size,
+                mlp_in_len,
             )?;
             check_len(
                 &format!("layers[{i}].down_proj_w"),
                 layer.down_proj_w.len(),
-                i_size * h,
+                mlp_down_len,
             )?;
         }
 
@@ -490,6 +505,72 @@ fn check_len(name: &str, got: usize, expected: usize) -> Result<()> {
     }
 }
 
+fn validate_config_for_model(config: &Qwen2_5Config) -> Result<()> {
+    if config.vocab_size < 2 {
+        return Err(invalid_model("vocab_size", "must be >= 2"));
+    }
+    if config.num_hidden_layers == 0 {
+        return Err(invalid_model("num_hidden_layers", "must be > 0"));
+    }
+    if config.hidden_size == 0 {
+        return Err(invalid_model("hidden_size", "must be > 0"));
+    }
+    if config.intermediate_size == 0 {
+        return Err(invalid_model("intermediate_size", "must be > 0"));
+    }
+    if config.num_attention_heads == 0 {
+        return Err(invalid_model("num_attention_heads", "must be > 0"));
+    }
+    if config.num_key_value_heads == 0 {
+        return Err(invalid_model("num_key_value_heads", "must be > 0"));
+    }
+    if config.head_dim == 0 {
+        return Err(invalid_model("head_dim", "must be > 0"));
+    }
+    if config.num_attention_heads % config.num_key_value_heads != 0 {
+        return Err(invalid_model(
+            "num_attention_heads",
+            "must be divisible by num_key_value_heads",
+        ));
+    }
+    let hidden_from_heads = checked_len_product(
+        "head_dim*num_attention_heads",
+        &[config.head_dim, config.num_attention_heads],
+    )?;
+    if hidden_from_heads != config.hidden_size {
+        return Err(invalid_model(
+            "head_dim",
+            &format!(
+                "head_dim ({}) * num_attention_heads ({}) must equal hidden_size ({})",
+                config.head_dim, config.num_attention_heads, config.hidden_size,
+            ),
+        ));
+    }
+    if config.head_dim % 2 != 0 {
+        return Err(invalid_model("head_dim", "must be even"));
+    }
+    if config.context_length == 0 {
+        return Err(invalid_model("context_length", "must be > 0"));
+    }
+    if !config.rope_theta.is_finite() || config.rope_theta <= 0.0 {
+        return Err(invalid_model("rope_theta", "must be finite and > 0"));
+    }
+    if !config.rms_norm_eps.is_finite() || config.rms_norm_eps <= 0.0 {
+        return Err(invalid_model("rms_norm_eps", "must be finite and > 0"));
+    }
+    if !matches!(config.dtype, DType::F32 | DType::BF16) {
+        return Err(invalid_model("dtype", "must be F32 or BF16"));
+    }
+    Ok(())
+}
+
+fn checked_len_product(label: &str, dims: &[usize]) -> Result<usize> {
+    dims.iter()
+        .copied()
+        .try_fold(1usize, usize::checked_mul)
+        .ok_or_else(|| invalid_model(label, &format!("shape product overflows usize: {:?}", dims)))
+}
+
 fn invalid_model(field: &str, message: &str) -> OcelotlError {
     OcelotlError::from(InvalidModelError {
         path: None,
@@ -724,6 +805,53 @@ mod tests {
         match err {
             OcelotlError::InvalidModel(invalid) => {
                 assert_eq!(invalid.field.as_deref(), Some("embed_tokens"));
+            }
+            other => panic!("expected InvalidModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_revalidates_public_config_before_weight_length_math() {
+        let mut cfg = tiny_config();
+        cfg.rms_norm_eps = f64::NAN;
+        let weights = tiny_weights(&tiny_config());
+
+        let err = Qwen2_5Model::new(cfg, weights)
+            .expect_err("directly constructed invalid config must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("rms_norm_eps"));
+            }
+            other => panic!("expected InvalidModel(rms_norm_eps), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_config_shape_product_overflow() {
+        let mut cfg = tiny_config();
+        cfg.hidden_size = usize::MAX;
+        cfg.num_attention_heads = 1;
+        cfg.num_key_value_heads = 1;
+        cfg.head_dim = usize::MAX;
+        let weights = Qwen2_5Weights {
+            embed_tokens: Vec::new(),
+            layers: Vec::new(),
+            final_norm_w: Vec::new(),
+            lm_head_w: Vec::new(),
+            tie_word_embeddings: true,
+        };
+
+        let err = Qwen2_5Model::new(cfg, weights).expect_err("overflowing config must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert!(
+                    invalid.message.contains("overflows")
+                        || invalid.field.as_deref() == Some("head_dim"),
+                    "expected overflow or head_dim diagnostic, got {:?}",
+                    invalid
+                );
             }
             other => panic!("expected InvalidModel, got {other:?}"),
         }

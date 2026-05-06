@@ -62,7 +62,20 @@ pub fn validate_request(req: &GenerateRequest, model: &ModelMetadata) -> Result<
         }));
     }
 
-    let total = req.prompt_tokens.len() + req.options.max_new_tokens;
+    let total = req
+        .prompt_tokens
+        .len()
+        .checked_add(req.options.max_new_tokens)
+        .ok_or_else(|| {
+            OcelotlError::InvalidRequest(InvalidRequestError {
+                field: "context_length".to_string(),
+                message: format!(
+                    "prompt_tokens ({}) + max_new_tokens ({}) overflows usize",
+                    req.prompt_tokens.len(),
+                    req.options.max_new_tokens,
+                ),
+            })
+        })?;
     if total > model.context_length {
         return Err(OcelotlError::InvalidRequest(InvalidRequestError {
             field: "context_length".to_string(),
@@ -331,6 +344,27 @@ mod tests {
                 assert!(
                     invalid.message.contains("16"),
                     "expected context_length 16 in message, got {:?}",
+                    invalid.message
+                );
+            }
+            other => panic!("expected InvalidRequest(context_length), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_request_rejects_context_sum_usize_overflow() {
+        let model = make_model(usize::MAX);
+        let req = make_request(1, usize::MAX);
+
+        let err = validate_request(&req, &model)
+            .expect_err("prompt + max_new_tokens overflow must be rejected");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "context_length");
+                assert!(
+                    invalid.message.contains("overflows"),
+                    "expected overflow diagnostic, got {:?}",
                     invalid.message
                 );
             }
