@@ -6,7 +6,12 @@ pub use ocelotl_core::TokenId;
 use ocelotl_core::{OcelotlError, Result, TokenizerError, UnsupportedError};
 
 mod chat_template;
+mod whisper;
 pub use chat_template::{ChatMessage, ChatTemplate};
+pub use whisper::{
+    WhisperDecodeMask, WhisperStartupTokens, WhisperTokenMaskDecision, WhisperTokenRole,
+    whisper_multilingual_english_transcribe_tokens,
+};
 
 pub trait Tokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<Vec<TokenId>>;
