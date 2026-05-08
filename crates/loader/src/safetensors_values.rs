@@ -275,8 +275,8 @@ mod tests {
         assert_eq!(loaded.values[0], 1.0);
         assert_eq!(loaded.values[1], -2.5);
         assert_eq!(loaded.values[2], 0.0);
-        assert_eq!(loaded.values[3], 0.00006103515625);
-        assert_eq!(loaded.values[4], 0.000000059604645);
+        assert_eq!(loaded.values[3], f32::from_bits(0x3880_0000));
+        assert_eq!(loaded.values[4], f32::from_bits(0x3380_0000));
         assert_eq!(loaded.values[5], f32::INFINITY);
 
         let _ = fs::remove_file(&path);
