@@ -20,7 +20,7 @@ const CONV_KERNEL_WIDTH: usize = 3;
 /// config.
 pub fn required_whisper_tensor_names(config: &WhisperConfig) -> Vec<String> {
     let mut names =
-        Vec::with_capacity(5 + config.audio_layers * 15 + 2 + config.text_layers * 24 + 3);
+        Vec::with_capacity(7 + config.audio_layers * 15 + 2 + config.text_layers * 24 + 3);
 
     names.push("encoder.conv1.weight".to_string());
     names.push("encoder.conv1.bias".to_string());
@@ -31,6 +31,9 @@ pub fn required_whisper_tensor_names(config: &WhisperConfig) -> Vec<String> {
     for layer in 0..config.audio_layers {
         push_self_attention_block(&mut names, "encoder", layer);
     }
+
+    names.push("encoder.ln_post.weight".to_string());
+    names.push("encoder.ln_post.bias".to_string());
 
     names.push("decoder.token_embedding.weight".to_string());
     names.push("decoder.positional_embedding".to_string());
@@ -120,6 +123,20 @@ pub fn validate_whisper_tensors(
             path,
         )?;
     }
+    check_shape(
+        manifest,
+        "encoder.ln_post.weight",
+        &[config.audio_state_size],
+        &config.dtype,
+        path,
+    )?;
+    check_shape(
+        manifest,
+        "encoder.ln_post.bias",
+        &[config.audio_state_size],
+        &config.dtype,
+        path,
+    )?;
 
     check_shape(
         manifest,
@@ -520,6 +537,9 @@ mod tests {
         if name == "decoder.positional_embedding" {
             return vec![cfg.text_context_length, cfg.text_state_size];
         }
+        if name == "encoder.ln_post.weight" || name == "encoder.ln_post.bias" {
+            return vec![cfg.audio_state_size];
+        }
         if name == "decoder.ln.weight" || name == "decoder.ln.bias" {
             return vec![cfg.text_state_size];
         }
@@ -581,6 +601,8 @@ mod tests {
         assert!(names.contains(&"encoder.positional_embedding".to_string()));
         assert!(names.contains(&"encoder.blocks.0.attn.query.weight".to_string()));
         assert!(names.contains(&"encoder.blocks.0.mlp.0.weight".to_string()));
+        assert!(names.contains(&"encoder.ln_post.weight".to_string()));
+        assert!(names.contains(&"encoder.ln_post.bias".to_string()));
         assert!(names.contains(&"decoder.token_embedding.weight".to_string()));
         assert!(names.contains(&"decoder.positional_embedding".to_string()));
         assert!(names.contains(&"decoder.blocks.0.attn.key.weight".to_string()));
@@ -590,7 +612,7 @@ mod tests {
         assert!(!names.contains(&"decoder.proj_out.weight".to_string()));
         assert_eq!(
             names.len(),
-            5 + cfg.audio_layers * 15 + 2 + cfg.text_layers * 24 + 2
+            7 + cfg.audio_layers * 15 + 2 + cfg.text_layers * 24 + 2
         );
     }
 
