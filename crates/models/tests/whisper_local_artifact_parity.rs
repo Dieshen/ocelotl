@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use ocelotl_loader::inspect_safetensors;
+use ocelotl_models::whisper::{parse_whisper_config_json, validate_whisper_tensors};
 use serde::Deserialize;
 
 const LOCAL_ARTIFACT_DIR: &str = "local-artifacts/whisper_tiny_en";
@@ -142,7 +143,18 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
     }
 
     let config_path = repo_artifact_path(CONFIG_JSON);
-    assert_json_object(&config_path, "config.json");
+    let config_raw = std::fs::read_to_string(&config_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read config.json at {} - {err}",
+            config_path.display()
+        )
+    });
+    let whisper_config = parse_whisper_config_json(&config_raw).unwrap_or_else(|err| {
+        panic!(
+            "invalid Whisper config contract at {} - {err:?}",
+            config_path.display()
+        )
+    });
 
     let tokenizer_path = repo_artifact_path(TOKENIZER_JSON);
     assert_json_object(&tokenizer_path, "tokenizer.json");
@@ -159,6 +171,12 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
         "model.safetensors header at {} must contain at least one tensor",
         model_path.display(),
     );
+    validate_whisper_tensors(&manifest, &whisper_config, Some(&model_path)).unwrap_or_else(|err| {
+        panic!(
+            "model.safetensors at {} does not match the Whisper tensor contract - {err:?}",
+            model_path.display()
+        )
+    });
 
     let audio_path = repo_artifact_path(REFERENCE_AUDIO);
     let wav = read_wav_metadata(&audio_path);

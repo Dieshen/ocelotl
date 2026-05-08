@@ -5,6 +5,10 @@
 //! frames and decoder token IDs without depending on the tokenizer crate.
 
 pub mod audio;
+pub mod config;
 pub mod model;
+pub mod tensors;
 
+pub use config::{WhisperConfig, parse_whisper_config_json};
 pub use model::{WhisperTinyConfig, WhisperTinyModel, WhisperTinyWeights};
+pub use tensors::{required_whisper_tensor_names, validate_whisper_tensors};
