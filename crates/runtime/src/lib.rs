@@ -9,6 +9,8 @@ use ocelotl_core::{
     UnsupportedError,
 };
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
+use ocelotl_models::whisper::WhisperTinyModel;
+use ocelotl_models::whisper::audio::{AudioMetadata, log_mel_spectrogram, validate_audio_metadata};
 use ocelotl_models::{Qwen2_5Model, tiny_synthetic_forward};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +28,30 @@ pub use ocelotl_core::GenerateResponse;
 pub struct GenerateRequest {
     pub prompt_tokens: Vec<TokenId>,
     pub options: GenerationOptions,
+}
+
+/// A Whisper transcription request after audio loading and tokenizer startup
+/// policy have already run.
+///
+/// Runtime accepts raw mono samples and decoder prompt token IDs. Text decoding
+/// is deliberately out of scope for W-ASR.6: the tokenizer crate owns Whisper
+/// special-token policy and future token-to-text behavior.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptionRequest {
+    pub audio_samples: Vec<f32>,
+    pub audio_metadata: AudioMetadata,
+    pub decoder_prompt_tokens: Vec<TokenId>,
+}
+
+/// One synthetic Whisper decode step through the runtime API.
+///
+/// `tokens` is the greedy-selected next token. `logits` is returned alongside
+/// it so early ASR tests can pin the model/runtime shape before text decoding
+/// exists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptionResponse {
+    pub tokens: Vec<TokenId>,
+    pub logits: Vec<f32>,
 }
 
 /// Validate a generation request against the loaded model's metadata before
@@ -190,6 +216,39 @@ pub fn prefill(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<Vec<f32>> {
 pub fn decode_one_token(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<TokenId> {
     let logits = prefill(model, tokens)?;
     greedy_sample(&logits)
+}
+
+/// Run one synthetic Whisper transcription step through the runtime boundary.
+///
+/// W-ASR.6 keeps this intentionally narrow: runtime validates request-owned
+/// audio shape, calls the Whisper log-mel reference path, reaches the
+/// `WhisperTinyModel::forward` public model API, and greedily selects one next
+/// token. Multi-token decode, timestamp policy, and token-to-text decoding are
+/// future tokenizer/runtime work.
+pub fn transcribe(
+    model: &WhisperTinyModel,
+    request: &TranscriptionRequest,
+) -> Result<TranscriptionResponse> {
+    validate_transcription_request(request)?;
+    let mel = log_mel_spectrogram(&request.audio_samples, request.audio_metadata)?;
+    let logits = model.forward(&mel, &request.decoder_prompt_tokens)?;
+    let token = greedy_sample(&logits)?;
+
+    Ok(TranscriptionResponse {
+        tokens: vec![token],
+        logits,
+    })
+}
+
+fn validate_transcription_request(request: &TranscriptionRequest) -> Result<()> {
+    if request.audio_samples.is_empty() {
+        return Err(OcelotlError::InvalidRequest(InvalidRequestError {
+            field: "audio_samples".to_string(),
+            message: "must contain at least one sample".to_string(),
+        }));
+    }
+
+    validate_audio_metadata(request.audio_metadata)
 }
 
 pub struct Runtime<B: KernelBackend = CpuKernelBackend> {
