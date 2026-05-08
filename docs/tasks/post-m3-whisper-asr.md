@@ -15,6 +15,10 @@ Phase split:
 - Phase 1: W-ASR.2 audio/log-mel fixture and W-ASR.3 tokenizer startup rules.
 - Phase 2: W-ASR.4 tiny synthetic Whisper path.
 - Phase 3: W-ASR.5 local-artifact parity and W-ASR.6 runtime API shape.
+- Phase 4: W-ASR.7 safetensors value loading and W-ASR.8 Whisper real-artifact
+  config/tensor contract.
+- Phase 5: W-ASR.9 real Whisper model adapter and W-ASR.10 output-token
+  parity.
 
 ## W-ASR.1 Define The Whisper Boundary
 
@@ -95,3 +99,52 @@ track and the ignored local-artifact harness. Real output-token parity remains
 blocked on a converted Whisper tiny.en weight loader/model adapter; W-ASR.5
 documents the exact bundle and reference-token contract but does not claim that
 Ocelotl can run real Whisper weights yet.
+
+## W-ASR.7 Add Safetensors Value Loading
+
+- `Crates`: `ocelotl-loader`.
+- `Test first`: construct tiny safetensors fixtures with F32, F16, and BF16
+  payloads and assert loading a named tensor returns Ocelotl-owned `Vec<f32>`
+  values plus shape metadata.
+- `Done when`: loader can read a single named tensor from safetensors without
+  exposing the foreign `safetensors` crate outside `ocelotl-loader`; missing
+  tensors, dtype mismatch, data-length mismatch, and malformed payloads return
+  typed `OcelotlError`s. This is generic loader groundwork for Whisper and
+  later Qwen real-weight parity.
+
+## W-ASR.8 Add Whisper Config And Tensor Contract
+
+- `Crates`: `ocelotl-models`.
+- `Test first`: parse a tiny Whisper config fixture and validate a synthetic
+  safetensors manifest against the real Whisper tensor-name and shape contract.
+- `Done when`: `ocelotl_models::whisper` has Ocelotl-owned real-config and
+  tensor-contract types covering tiny.en-shaped dimensions, encoder convs,
+  encoder blocks, decoder token/position embeddings, decoder self/cross
+  attention, GELU MLP projections, and layer norms. The contract should reject
+  missing tensors, wrong shapes, unsupported dtypes, and inconsistent head
+  dimensions before any model compute.
+
+## W-ASR.9 Build Real Whisper Model Adapter
+
+- `Crates`: `ocelotl-models`, `ocelotl-kernels` if new CPU primitives are
+  needed.
+- `Test first`: use tiny hand-checked layer fixtures for the operations the
+  synthetic path does not cover: conv1d, LayerNorm, GELU MLP, encoder
+  self-attention, decoder causal self-attention, and decoder cross-attention.
+- `Done when`: a real Whisper-shaped model struct can be constructed from a
+  `WhisperConfig` plus loaded weights and can produce next-token logits for one
+  decoder prompt against log-mel input. This task still may use committed tiny
+  synthetic weights for default tests; real weights remain `#[ignore]`.
+
+## W-ASR.10 Extend Local-Artifact Parity To Output Tokens
+
+- `Crates`: `ocelotl-models`, `ocelotl-runtime`, `ocelotl-tokenizer` if text
+  decode is included.
+- `Test first`: extend the existing ignored
+  `whisper_local_artifact_parity.rs` harness so it runs
+  `local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav` through the
+  real adapter and compares exact generated token IDs against
+  `reference/expected_tokens.json`.
+- `Done when`: the opt-in local-artifact test proves exact token parity for the
+  pinned tiny.en bundle. Text output can remain optional unless the fixture
+  includes `expected_text`.
