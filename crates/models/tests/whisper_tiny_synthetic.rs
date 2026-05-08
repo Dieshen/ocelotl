@@ -1,8 +1,6 @@
 use ocelotl_core::{OcelotlError, TokenId};
 use ocelotl_models::whisper::audio::{LogMelSpectrogram, WHISPER_MEL_BINS};
-use ocelotl_models::whisper::{
-    WhisperTinyConfig, WhisperTinyModel, WhisperTinyWeights, transpose_2d,
-};
+use ocelotl_models::whisper::{WhisperTinyConfig, WhisperTinyModel, WhisperTinyWeights};
 
 #[test]
 fn tiny_synthetic_whisper_path_matches_pinned_logits() {
@@ -103,6 +101,26 @@ fn forward_rejects_mel_shape_mismatch_before_compute() {
 }
 
 #[test]
+fn forward_rejects_too_many_mel_frames_before_compute() {
+    let model = tiny_model();
+    let mut mel = tiny_log_mel();
+    mel.frames = 3;
+    mel.values.resize(3 * WHISPER_MEL_BINS, 0.0);
+
+    let err = model
+        .forward(&mel, &[TokenId(1)])
+        .expect_err("mel input longer than max_audio_frames must fail before compute");
+
+    match err {
+        OcelotlError::InvalidRequest(invalid) => {
+            assert_eq!(invalid.field, "mel.frames");
+            assert!(invalid.message.contains("max_audio_frames"));
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+#[test]
 fn new_rejects_invalid_config_before_weight_validation() {
     let mut cfg = tiny_config();
     cfg.hidden_size = 0;
@@ -113,6 +131,37 @@ fn new_rejects_invalid_config_before_weight_validation() {
     match err {
         OcelotlError::InvalidModel(invalid) => {
             assert_eq!(invalid.field.as_deref(), Some("hidden_size"));
+        }
+        other => panic!("expected InvalidModel, got {other:?}"),
+    }
+}
+
+#[test]
+fn new_rejects_audio_frame_shape_product_overflow() {
+    let mut cfg = tiny_config();
+    cfg.mel_bins = 1;
+    cfg.hidden_size = 2;
+    cfg.max_audio_frames = (usize::MAX / 2) + 1;
+    let weights = WhisperTinyWeights {
+        encoder_projection: vec![0.0; cfg.mel_bins * cfg.hidden_size],
+        encoder_bias: vec![0.0; cfg.hidden_size],
+        decoder_token_embedding: vec![0.0; cfg.vocab_size * cfg.hidden_size],
+        decoder_query_projection: identity(cfg.hidden_size),
+        cross_attention_key_projection: identity(cfg.hidden_size),
+        cross_attention_value_projection: identity(cfg.hidden_size),
+        cross_attention_output_projection: identity(cfg.hidden_size),
+        token_projection: vec![0.0; cfg.hidden_size * cfg.vocab_size],
+    };
+
+    let err = WhisperTinyModel::new(cfg, weights).expect_err("overflowing frame shape must fail");
+
+    match err {
+        OcelotlError::InvalidModel(invalid) => {
+            assert_eq!(
+                invalid.field.as_deref(),
+                Some("max_audio_frames*hidden_size")
+            );
+            assert!(invalid.message.contains("overflows"));
         }
         other => panic!("expected InvalidModel, got {other:?}"),
     }
@@ -210,6 +259,17 @@ fn identity(size: usize) -> Vec<f32> {
         values[idx * size + idx] = 1.0;
     }
     values
+}
+
+fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(src.len(), rows * cols);
+    let mut dst = vec![0.0_f32; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            dst[col * rows + row] = src[row * cols + col];
+        }
+    }
+    dst
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

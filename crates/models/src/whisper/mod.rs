@@ -7,4 +7,4 @@
 pub mod audio;
 pub mod model;
 
-pub use model::{WhisperTinyConfig, WhisperTinyModel, WhisperTinyWeights, transpose_2d};
+pub use model::{WhisperTinyConfig, WhisperTinyModel, WhisperTinyWeights};

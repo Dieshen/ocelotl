@@ -203,18 +203,6 @@ impl WhisperTinyModel {
     }
 }
 
-/// Transpose a `[rows, cols]` row-major slice into `[cols, rows]` row-major.
-pub fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    debug_assert_eq!(src.len(), rows * cols);
-    let mut dst = vec![0.0_f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            dst[c * rows + r] = src[r * cols + c];
-        }
-    }
-    dst
-}
-
 fn validate_config(config: &WhisperTinyConfig) -> Result<()> {
     if config.mel_bins == 0 {
         return Err(invalid_model("mel_bins", "must be > 0"));
@@ -231,6 +219,14 @@ fn validate_config(config: &WhisperTinyConfig) -> Result<()> {
     if config.hidden_size == 0 {
         return Err(invalid_model("hidden_size", "must be > 0"));
     }
+    checked_len_product(
+        "max_audio_frames*mel_bins",
+        &[config.max_audio_frames, config.mel_bins],
+    )?;
+    checked_len_product(
+        "max_audio_frames*hidden_size",
+        &[config.max_audio_frames, config.hidden_size],
+    )?;
     Ok(())
 }
 
