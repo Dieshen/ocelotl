@@ -10,6 +10,7 @@ pub const WHISPER_HOP_LENGTH: usize = 160;
 pub const WHISPER_MEL_BINS: usize = 80;
 
 const WHISPER_POWER_FLOOR: f32 = 1e-10;
+const SLANEY_LOG_STEP: f32 = 1.856_298 / 27.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioMetadata {
@@ -47,14 +48,26 @@ pub fn validate_audio_metadata(metadata: AudioMetadata) -> Result<()> {
 pub fn log_mel_spectrogram(audio: &[f32], metadata: AudioMetadata) -> Result<LogMelSpectrogram> {
     validate_audio_metadata(metadata)?;
 
-    let frames = frame_count(audio.len());
+    if audio.len() < WHISPER_FFT_SIZE {
+        return Err(OcelotlError::InvalidRequest(
+            ocelotl_core::InvalidRequestError {
+                field: "audio.samples".to_string(),
+                message: format!(
+                    "Whisper audio preprocessing requires at least {WHISPER_FFT_SIZE} samples"
+                ),
+            },
+        ));
+    }
+
+    let centered = reflect_pad_centered(audio);
+    let frames = stft_frame_count(centered.len()).saturating_sub(1);
     let window = hann_window();
     let mel_filters = mel_filterbank();
     let mut values = Vec::with_capacity(frames * WHISPER_MEL_BINS);
 
     for frame_idx in 0..frames {
         let start = frame_idx * WHISPER_HOP_LENGTH;
-        let power = power_spectrum(audio, start, &window);
+        let power = power_spectrum(&centered, start, &window);
 
         for filter in &mel_filters {
             let energy = power
@@ -66,6 +79,8 @@ pub fn log_mel_spectrogram(audio: &[f32], metadata: AudioMetadata) -> Result<Log
         }
     }
 
+    apply_whisper_log_mel_postprocess(&mut values);
+
     Ok(LogMelSpectrogram {
         frames,
         mel_bins: WHISPER_MEL_BINS,
@@ -73,12 +88,24 @@ pub fn log_mel_spectrogram(audio: &[f32], metadata: AudioMetadata) -> Result<Log
     })
 }
 
-fn frame_count(samples: usize) -> usize {
-    if samples <= WHISPER_FFT_SIZE {
-        1
-    } else {
-        1 + (samples - WHISPER_FFT_SIZE) / WHISPER_HOP_LENGTH
-    }
+fn reflect_pad_centered(audio: &[f32]) -> Vec<f32> {
+    let pad = WHISPER_FFT_SIZE / 2;
+    let mut centered = Vec::with_capacity(audio.len() + 2 * pad);
+
+    centered.extend(audio[1..=pad].iter().rev().copied());
+    centered.extend_from_slice(audio);
+    centered.extend(
+        audio[(audio.len() - pad - 1)..(audio.len() - 1)]
+            .iter()
+            .rev()
+            .copied(),
+    );
+
+    centered
+}
+
+fn stft_frame_count(samples: usize) -> usize {
+    (samples - WHISPER_FFT_SIZE) / WHISPER_HOP_LENGTH + 1
 }
 
 fn hann_window() -> [f32; WHISPER_FFT_SIZE] {
@@ -115,12 +142,12 @@ fn power_spectrum(
 }
 
 fn mel_filterbank() -> Vec<[f32; WHISPER_FFT_SIZE / 2 + 1]> {
-    let min_mel = hz_to_mel(0.0);
-    let max_mel = hz_to_mel((WHISPER_SAMPLE_RATE_HZ / 2) as f32);
+    let min_mel = hz_to_slaney_mel(0.0);
+    let max_mel = hz_to_slaney_mel((WHISPER_SAMPLE_RATE_HZ / 2) as f32);
     let mel_step = (max_mel - min_mel) / ((WHISPER_MEL_BINS + 1) as f32);
 
     let mel_points = (0..WHISPER_MEL_BINS + 2)
-        .map(|idx| mel_to_hz(min_mel + mel_step * (idx as f32)))
+        .map(|idx| slaney_mel_to_hz(min_mel + mel_step * (idx as f32)))
         .collect::<Vec<_>>();
 
     (0..WHISPER_MEL_BINS)
@@ -140,6 +167,7 @@ fn mel_filterbank() -> Vec<[f32; WHISPER_FFT_SIZE / 2 + 1]> {
                 } else {
                     (right - hz) / (right - center)
                 };
+                *weight *= 2.0 / (right - left);
             }
 
             filter
@@ -147,12 +175,39 @@ fn mel_filterbank() -> Vec<[f32; WHISPER_FFT_SIZE / 2 + 1]> {
         .collect()
 }
 
-fn hz_to_mel(hz: f32) -> f32 {
-    2595.0 * (1.0 + hz / 700.0).log10()
+fn apply_whisper_log_mel_postprocess(values: &mut [f32]) {
+    let max_floor = values.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 8.0;
+
+    for value in values {
+        *value = value.max(max_floor);
+        *value = (*value + 4.0) / 4.0;
+    }
 }
 
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
+fn hz_to_slaney_mel(hz: f32) -> f32 {
+    const F_MIN: f32 = 0.0;
+    const F_SP: f32 = 200.0 / 3.0;
+    const MIN_LOG_HZ: f32 = 1000.0;
+    const MIN_LOG_MEL: f32 = (MIN_LOG_HZ - F_MIN) / F_SP;
+
+    if hz >= MIN_LOG_HZ {
+        MIN_LOG_MEL + (hz / MIN_LOG_HZ).ln() / SLANEY_LOG_STEP
+    } else {
+        (hz - F_MIN) / F_SP
+    }
+}
+
+fn slaney_mel_to_hz(mel: f32) -> f32 {
+    const F_MIN: f32 = 0.0;
+    const F_SP: f32 = 200.0 / 3.0;
+    const MIN_LOG_HZ: f32 = 1000.0;
+    const MIN_LOG_MEL: f32 = (MIN_LOG_HZ - F_MIN) / F_SP;
+
+    if mel >= MIN_LOG_MEL {
+        MIN_LOG_HZ * (SLANEY_LOG_STEP * (mel - MIN_LOG_MEL)).exp()
+    } else {
+        F_MIN + F_SP * mel
+    }
 }
 
 #[cfg(test)]
@@ -228,19 +283,28 @@ mod tests {
 
         let spectrogram = log_mel_spectrogram(&audio, metadata).expect("fixture should preprocess");
 
-        assert_eq!(spectrogram.frames, 1);
+        assert_eq!(spectrogram.frames, 2);
         assert_eq!(spectrogram.mel_bins, WHISPER_MEL_BINS);
-        assert_eq!(spectrogram.values.len(), WHISPER_MEL_BINS);
+        assert_eq!(spectrogram.values.len(), 2 * WHISPER_MEL_BINS);
 
         let expected = [
-            -2.3789787_f32,
-            -1.8202623,
-            -0.9458493,
-            -0.9903331,
-            -0.7048625,
-            -1.5901269,
+            0.5390415_f32,
+            0.6864456,
+            0.6932472,
+            0.60004145,
+            0.46436572,
+            0.50140697,
         ];
         assert_close(&spectrogram.values[..expected.len()], &expected, 1e-5);
+    }
+
+    #[test]
+    fn whisper_log_mel_postprocess_clamps_to_eight_decades_and_normalizes() {
+        let mut values = vec![-20.0, -8.0, -4.0, 0.0];
+
+        apply_whisper_log_mel_postprocess(&mut values);
+
+        assert_close(&values, &[-1.0, -1.0, 0.0, 1.0], 1e-6);
     }
 
     fn tiny_waveform_fixture() -> Vec<f32> {

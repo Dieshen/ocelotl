@@ -33,9 +33,9 @@ Phase split:
 - `Done when`: unsupported sample rates and non-mono input fail before compute,
   and the deterministic log-mel fixture passes offline.
 - `Status note`: first slice landed in `ocelotl-models::whisper::audio` with a
-  scalar CPU reference and no Burn dependency. If the audio surface grows beyond
-  Whisper model-family semantics, split a dedicated audio crate before exposing
-  it through runtime APIs.
+  Whisper-style scalar CPU reference and no Burn dependency. If the audio
+  surface grows beyond Whisper model-family semantics, split a dedicated audio
+  crate before exposing it through runtime APIs.
 
 ## W-ASR.3 Pin Whisper Tokenizer Startup Rules
 
