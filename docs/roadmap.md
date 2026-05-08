@@ -21,6 +21,17 @@ Executable task backlogs for each milestone live in `docs/tasks/README.md`.
 | M7 | `docs/milestones/m7-continuous-batching.md` | `docs/tasks/m7-continuous-batching.md` | Scheduler and continuous batching without changing deterministic outputs. |
 | M8 | `docs/milestones/m8-server-api.md` | `docs/tasks/m8-server-api.md` | Server layer around runtime APIs with intentional error and streaming semantics. |
 
+## Post-M3 Expansion Candidates
+
+These are intentionally not inserted into the closed M3 task numbering. They are
+candidate tracks for broadening Ocelotl after the Qwen2.5 M3 path, and should be
+scheduled explicitly before implementation starts.
+
+| Track | Spec | Tasks | Summary |
+| --- | --- | --- | --- |
+| Whisper ASR | `docs/milestones/post-m3-whisper-asr.md` | `docs/tasks/post-m3-whisper-asr.md` | Speech-to-text track using `whisper-burn` as reference material and Burn behind Ocelotl-owned APIs. |
+| Qwen3.5 + Gemma4 | `docs/milestones/post-m3-model-family-expansion.md` | `docs/tasks/post-m3-model-family-expansion.md` | Compatibility discovery and model-family expansion for Qwen3.5 and Gemma4/GGUF without treating either as a small Qwen2.5 extension. |
+
 ## CI Baseline
 
 The baseline CI policy is documented in `docs/ci.md`. Default CI must stay
@@ -37,6 +48,7 @@ implement the minimal change. Benchmarks follow correctness, not the reverse.
 - Multi-GPU execution.
 - Broad model-family support.
 - Broad quantization support.
+- Speech-to-text and multimodal model support.
 - Speculative decoding.
 - Distributed serving.
 - Tool/function calling semantics.

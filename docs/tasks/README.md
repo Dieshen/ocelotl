@@ -30,6 +30,16 @@ Do not treat a task as complete because code exists. A task is complete when its
 | M7 | `docs/tasks/m7-continuous-batching.md` | `docs/milestones/m7-continuous-batching.md` |
 | M8 | `docs/tasks/m8-server-api.md` | `docs/milestones/m8-server-api.md` |
 
+## Post-M3 Expansion Task Documents
+
+These tracks preserve M3 closure. They can be pulled into the active milestone
+plan later, but they are not part of the accepted M3.1-M3.10 task set.
+
+| Track | Task Backlog | Milestone Spec |
+| --- | --- | --- |
+| Whisper ASR | `docs/tasks/post-m3-whisper-asr.md` | `docs/milestones/post-m3-whisper-asr.md` |
+| Qwen3.5 + Gemma4 | `docs/tasks/post-m3-model-family-expansion.md` | `docs/milestones/post-m3-model-family-expansion.md` |
+
 ## Task Format
 
 Each task should include:
