@@ -9,12 +9,12 @@ If you only need to run the default workspace test suite (`cargo test
 --workspace`), you do **not** need to follow this guide. Default tests are
 offline and use the small fixtures committed under `fixtures/`. Follow this
 guide when you start working on a task that explicitly opts into real artifact
-behavior — currently the M2.2/M2.3/M2.5 task families and anything downstream
-that re-uses the same paths.
+behavior — currently the Qwen2.5 M2/M3 task families, the post-M3 Whisper ASR
+local-parity harness, and anything downstream that re-uses the same paths.
 
-## 1. Which Artifact
+## 1. Qwen2.5 Artifact
 
-Ocelotl's first real model target is `Qwen/Qwen2.5-0.5B-Instruct`. The exact
+Ocelotl's first real LLM target is `Qwen/Qwen2.5-0.5B-Instruct`. The exact
 revision SHA the project pins is recorded in `docs/model-target.md`
 § Pinned Revision (lands via M2.1) — always fetch the pinned SHA, not the
 moving `main` branch on Hugging Face. If the doc has not been updated yet, ask
@@ -27,7 +27,7 @@ files carry license headers and `LICENSE` / `NOTICE` files in the upstream
 repo — respect them even though we don't redistribute the files via this
 repository.
 
-## 2. Files To Fetch
+## 2. Qwen2.5 Files To Fetch
 
 The following files from the pinned Qwen2.5-0.5B-Instruct revision are needed
 across M2 and M3. Approximate sizes are from the public repo as of
@@ -47,7 +47,7 @@ across M2 and M3. Approximate sizes are from the public repo as of
 The four files load-bearing for M2 are `config.json`, `tokenizer.json`,
 `tokenizer_config.json`, and `model.safetensors`. The others are nice to have.
 
-## 3. Where To Put Them
+## 3. Qwen2.5 Directory
 
 Place all files under a single directory at the repository root:
 
@@ -79,7 +79,64 @@ short SHA suffix: `qwen2_5_0_5b_instruct_<short-sha>/`. The plain name
 without a suffix always means "the pinned revision from
 `docs/model-target.md`".
 
-## 4. Keeping Artifacts Out Of Git
+## 4. Whisper tiny.en Artifact
+
+The first post-M3 Whisper ASR local-artifact contract is a converted tiny.en
+bundle under the repository root:
+
+```text
+local-artifacts/
+  whisper_tiny_en/
+    config.json
+    tokenizer.json
+    model.safetensors
+    reference/
+      sample_16khz_mono.wav
+      expected_tokens.json
+```
+
+The default workspace tests do not require this bundle. The W-ASR.5 opt-in
+harness checks it only when explicitly run:
+
+```powershell
+cargo test -p ocelotl-models --test whisper_local_artifact_parity -- --ignored
+```
+
+The harness expects:
+
+- `config.json`: a JSON object describing the converted Whisper tiny.en model.
+- `tokenizer.json`: a JSON object for the tokenizer artifact.
+- `model.safetensors`: a safetensors file with a valid, non-empty header.
+- `reference/sample_16khz_mono.wav`: RIFF/WAVE PCM or IEEE-float audio with 1
+  channel, 16,000 Hz, a positive bits-per-sample value, and a non-empty `data`
+  chunk.
+- `reference/expected_tokens.json`: the pinned reference token sequence for
+  the sample audio.
+
+`expected_tokens.json` uses this schema:
+
+```json
+{
+  "fixture_version": 1,
+  "name": "whisper_tiny_en_sample_16khz_mono",
+  "source": "describe the converter/reference command used to capture this",
+  "audio": "reference/sample_16khz_mono.wav",
+  "task": "transcribe",
+  "language": "en",
+  "timestamps": false,
+  "expected_token_ids": [50258, 50259, 50359, 50363, 50257],
+  "expected_text": "optional transcript text"
+}
+```
+
+`expected_token_ids` must be non-empty. `expected_text` is optional for W-ASR.5,
+but if present it must be non-empty. The first harness validates the bundle and
+reference shape; it does not yet prove end-to-end real-model token parity
+because the converted Whisper weight loader/model adapter is still future work.
+When that converter exists, extend the ignored test to run the sample audio
+through Ocelotl and compare exact output tokens against `expected_token_ids`.
+
+## 5. Keeping Artifacts Out Of Git
 
 `local-artifacts/` is listed in `.gitignore`. This is intentional and
 enforced by tooling, not by convention:
@@ -94,7 +151,7 @@ If `git status` ever lists a file under `local-artifacts/`, do not force-add
 it. Either the path is wrong or the `.gitignore` entry is broken — fix the
 root cause before committing anything else.
 
-## 5. How Tests Find The Artifacts
+## 6. How Tests Find The Artifacts
 
 Tests that depend on real artifacts MUST be `#[ignore]` by default and run
 explicitly with `cargo test -- --ignored` (or a focused
@@ -147,7 +204,7 @@ Tests that use only the small committed fixtures under `fixtures/` should
 **not** be marked `#[ignore]`. The distinction is: committed fixtures =
 default-on; local artifacts = opt-in.
 
-## 6. How To Fetch
+## 7. How To Fetch
 
 The project does not ship a fetch script. Each contributor runs the command
 manually so that the pinned SHA is visible at the call site (matching the
@@ -185,7 +242,7 @@ Get-ChildItem local-artifacts/qwen2_5_0_5b_instruct
 
 You should see the files listed in section 2.
 
-## 7. License Reminder
+## 8. License Reminder
 
 Apache-2.0 means redistribution is permitted with attribution. We avoid
 checking the artifacts into this repository for size and review-friction

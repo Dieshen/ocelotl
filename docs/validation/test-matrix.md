@@ -14,6 +14,7 @@ but it should not provide less than this baseline.
 | M6 Paged KV Cache | Page allocation tests, multi-page decode test, contiguous/paged parity. |
 | M7 Continuous Batching | Scheduler ordering tests, cancellation tests, batched/unbatched parity. |
 | M8 Server API | API request validation, runtime error mapping, streaming lifecycle tests. |
+| Post-M3 Whisper ASR | Audio metadata/log-mel tests, tokenizer startup/mask tests, tiny synthetic Whisper path tests, ignored local-artifact parity harness. |
 
 ## Validation Tiers
 
@@ -122,3 +123,26 @@ tripwires`. Total at M3 close: **157 default tests + 8 doctests passing**; the
 2 M2 local-artifact tests remain `#[ignore]`'d opt-in checks. The M2.8 offline
 gate (`ci/check-offline.ps1`) also passes, so the M3 default validation surface
 remains offline by construction.
+
+## Post-M3 Whisper ASR Acceptance Traceability
+
+The table below maps `docs/milestones/post-m3-whisper-asr.md` acceptance
+criteria to the tests and docs that prove the current post-M3 Whisper track.
+
+| # | Acceptance criterion | Test(s) proving it | Status |
+| - | -------------------- | ------------------ | ------ |
+| 1 | A Whisper track has explicit docs, task backlog, and validation commands. | `docs/milestones/post-m3-whisper-asr.md`, `docs/tasks/post-m3-whisper-asr.md`, and the validation commands in the milestone doc. | green |
+| 2 | Audio preprocessing rejects unsupported sample rates/channels before compute. | `ocelotl_models::whisper::audio::tests::{audio_metadata_rejects_unsupported_sample_rate_before_compute,audio_metadata_rejects_non_mono_before_compute}`. | green |
+| 3 | Log-mel preprocessing has a deterministic fixture test. | `ocelotl_models::whisper::audio::tests::tiny_waveform_fixture_maps_to_pinned_log_mel_values`. | green |
+| 4 | Whisper token startup/masking rules are fixture-tested. | `crates/tokenizer/tests/whisper_startup.rs::{whisper_transcribe_no_timestamps_startup_sequence_is_explicit,whisper_no_timestamps_decode_mask_suppresses_timestamps_and_prompt_specials}`. | green |
+| 5 | A tiny synthetic Whisper-shaped path proves encoder/decoder shape and decode flow without network access. | `crates/models/tests/whisper_tiny_synthetic.rs::tiny_synthetic_whisper_path_matches_pinned_logits` plus the request/model validation tests in the same file. | green |
+| 6 | Any real-model parity test is opt-in, local-artifact gated, and documented. | `crates/models/tests/whisper_local_artifact_parity.rs::{whisper_local_artifact_contract_lists_exact_required_paths,expected_tokens_schema_accepts_documented_shape,expected_tokens_schema_rejects_empty_reference_sequence}` run by default. `local_whisper_tiny_en_artifact_contract_is_well_formed` is `#[ignore]`'d and names every required file under `local-artifacts/whisper_tiny_en/`. `docs/artifact-preparation.md` and `docs/validation/parity.md` document the bundle and current limit. | green (harness) |
+| 7 | Burn remains an internal implementation detail. | Current W-ASR.2-W-ASR.5 code uses Ocelotl-owned structs/tests and does not expose Burn types. | green |
+
+### Note - W-ASR.5 real parity limit
+
+The W-ASR.5 ignored test proves that a local Whisper tiny.en bundle is shaped
+correctly for parity, not that Ocelotl can already run converted real Whisper
+weights. Exact output-token comparison against `expected_token_ids` should be
+added to the same ignored harness after the converted Whisper loader/model
+adapter exists.
