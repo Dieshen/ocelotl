@@ -76,9 +76,22 @@ Phase split:
 - `Done when`: runtime exposes Ocelotl-owned transcription request/result types
   and reaches the Whisper model through the same public lifecycle discipline as
   Qwen prefill/decode.
+- `Status note`: W-ASR.6 now exposes `TranscriptionRequest`,
+  `TranscriptionResponse`, and `transcribe` in `ocelotl-runtime`. The default
+  runtime tests reject empty audio and unsupported audio metadata before model
+  compute, then run the synthetic path through
+  `log_mel_spectrogram -> WhisperTinyModel::forward -> greedy_sample`. The
+  response is token/logit shaped; token-to-text decoding, multi-token ASR
+  decode, timestamp policy, and real Whisper weights remain follow-up work.
 
 ## Track Closure
 
 The track closes when a default-on offline fixture proves audio preprocessing and
 a tiny synthetic Whisper-shaped decode path, and an ignored local-artifact test
 documents real-model parity.
+
+Current status: W-ASR.1 through W-ASR.6 have shipped the synthetic/default-on
+track and the ignored local-artifact harness. Real output-token parity remains
+blocked on a converted Whisper tiny.en weight loader/model adapter; W-ASR.5
+documents the exact bundle and reference-token contract but does not claim that
+Ocelotl can run real Whisper weights yet.

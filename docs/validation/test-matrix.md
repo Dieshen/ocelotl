@@ -137,7 +137,8 @@ criteria to the tests and docs that prove the current post-M3 Whisper track.
 | 4 | Whisper token startup/masking rules are fixture-tested. | `crates/tokenizer/tests/whisper_startup.rs::{whisper_transcribe_no_timestamps_startup_sequence_is_explicit,whisper_no_timestamps_decode_mask_suppresses_timestamps_and_prompt_specials}`. | green |
 | 5 | A tiny synthetic Whisper-shaped path proves encoder/decoder shape and decode flow without network access. | `crates/models/tests/whisper_tiny_synthetic.rs::tiny_synthetic_whisper_path_matches_pinned_logits` plus the request/model validation tests in the same file. | green |
 | 6 | Any real-model parity test is opt-in, local-artifact gated, and documented. | `crates/models/tests/whisper_local_artifact_parity.rs::{whisper_local_artifact_contract_lists_exact_required_paths,expected_tokens_schema_accepts_documented_shape,expected_tokens_schema_rejects_empty_reference_sequence}` run by default. `local_whisper_tiny_en_artifact_contract_is_well_formed` is `#[ignore]`'d and names every required file under `local-artifacts/whisper_tiny_en/`. `docs/artifact-preparation.md` and `docs/validation/parity.md` document the bundle and current limit. | green (harness) |
-| 7 | Burn remains an internal implementation detail. | Current W-ASR.2-W-ASR.5 code uses Ocelotl-owned structs/tests and does not expose Burn types. | green |
+| 7 | Burn remains an internal implementation detail. | Current W-ASR.2-W-ASR.6 code uses Ocelotl-owned structs/tests and does not expose Burn types. | green |
+| 8 | Runtime exposes Ocelotl-owned transcription request/result types and reaches the Whisper model through the public lifecycle. | `crates/runtime/tests/whisper_transcription.rs::{transcribe_rejects_empty_audio_before_preprocessing_or_model_compute,transcribe_rejects_unsupported_audio_metadata_before_model_compute,transcribe_runs_tiny_synthetic_whisper_path_and_returns_token_plus_logits,transcribe_propagates_model_errors_after_runtime_audio_validation}`. | green (synthetic) |
 
 ### Note - W-ASR.5 real parity limit
 
@@ -146,3 +147,9 @@ correctly for parity, not that Ocelotl can already run converted real Whisper
 weights. Exact output-token comparison against `expected_token_ids` should be
 added to the same ignored harness after the converted Whisper loader/model
 adapter exists.
+
+### Note - W-ASR.6 runtime limit
+
+The W-ASR.6 runtime API returns a greedy token plus logits from the tiny
+synthetic Whisper model. It does not yet perform multi-token transcription,
+timestamp handling, decode masking, or token-to-text decoding.
