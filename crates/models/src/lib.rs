@@ -10,6 +10,7 @@
 //! M1 runtime smoke test.
 
 pub mod qwen;
+pub mod whisper;
 pub use qwen::{
     Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, required_tensor_names,
     transpose_2d, validate_qwen2_5_tensors,
