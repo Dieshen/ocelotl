@@ -60,6 +60,13 @@ Phase split:
   and skips with a clear message when missing.
 - `Done when`: the test documents exact artifact paths and compares one short
   audio clip against a pinned reference transcript or token sequence.
+- `Status note`: W-ASR.5 now has a default-on schema/path contract and an
+  ignored local-artifact harness at
+  `crates/models/tests/whisper_local_artifact_parity.rs`. The ignored test
+  checks `local-artifacts/whisper_tiny_en/`, parses the expected-token
+  reference shape, validates 16 kHz mono WAV metadata, and inspects the
+  safetensors header. Real output-token comparison remains blocked on a
+  converted Whisper tiny.en weight loader/model adapter.
 
 ## W-ASR.6 Add Runtime Transcription API Shape
 

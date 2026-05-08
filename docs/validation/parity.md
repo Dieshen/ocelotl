@@ -121,3 +121,37 @@ floating-point comparison documented above. Both must hold.
   exists. The first implementation should commit the capture script, captured
   metadata, observed max absolute error, and any adjustment to the target
   `1e-3` tolerance in one patch.
+
+## Post-M3 Whisper ASR
+
+Whisper ASR parity is split into default-on synthetic coverage and an opt-in
+local-artifact harness:
+
+- **Tiny synthetic Whisper path, default-on**:
+  `crates/models/tests/whisper_tiny_synthetic.rs` proves the W-ASR.4
+  encoder/decoder wiring shape without network or local artifacts.
+- **Whisper tiny.en local bundle, opt-in**:
+  `crates/models/tests/whisper_local_artifact_parity.rs` documents and checks
+  `local-artifacts/whisper_tiny_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json}`.
+  The default-on tests in that file validate the expected token-reference
+  schema. The ignored test validates the local bundle exists, parses
+  `config.json`, `tokenizer.json`, and `expected_tokens.json`, inspects the
+  safetensors header without reading tensor payloads, and checks the reference
+  WAV metadata is 16 kHz mono.
+
+### Reference
+
+The opt-in Whisper reference is `reference/expected_tokens.json` inside the
+local bundle. It must name the sample audio path, use task `transcribe`,
+language `en`, `timestamps = false`, and carry a non-empty
+`expected_token_ids` sequence. Exact token equality is the intended parity
+contract once Ocelotl has a converted Whisper tiny.en weight loader/model
+adapter.
+
+### Current Limit
+
+W-ASR.5 proves the local-artifact contract and reference shape only. It does
+not yet run real Whisper model inference or compare produced tokens because the
+converted artifact loader/model adapter does not exist. Extending the ignored
+test from "bundle is well-formed" to "output tokens equal expected tokens" is
+the follow-up that closes real local-artifact parity.
