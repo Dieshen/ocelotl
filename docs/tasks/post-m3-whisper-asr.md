@@ -111,6 +111,12 @@ Ocelotl can run real Whisper weights yet.
   tensors, dtype mismatch, data-length mismatch, and malformed payloads return
   typed `OcelotlError`s. This is generic loader groundwork for Whisper and
   later Qwen real-weight parity.
+- `Status note`: W-ASR.7 landed `LoadedTensor` and
+  `load_safetensors_tensor_f32` in `ocelotl-loader`. The API loads one named
+  safetensors tensor into Ocelotl-owned shape/dtype/value data and converts
+  F32, F16, and BF16 payloads into `Vec<f32>` while preserving typed error
+  behavior for missing files, missing tensors, unsupported dtypes, and malformed
+  payloads.
 
 ## W-ASR.8 Add Whisper Config And Tensor Contract
 
@@ -123,6 +129,15 @@ Ocelotl can run real Whisper weights yet.
   attention, GELU MLP projections, and layer norms. The contract should reject
   missing tensors, wrong shapes, unsupported dtypes, and inconsistent head
   dimensions before any model compute.
+- `Status note`: W-ASR.8 landed `WhisperConfig`,
+  `parse_whisper_config_json`, `required_whisper_tensor_names`, and
+  `validate_whisper_tensors`. The ignored local-artifact harness now parses the
+  real config and validates the safetensors manifest against the canonical
+  OpenAI-style Whisper tensor contract, including encoder convs, encoder
+  `ln_post`, decoder embeddings, decoder self-attention, decoder
+  cross-attention, MLP projections, and final decoder layer norm. Alias support
+  for HF/Burn-converted tensor names remains intentionally deferred until an
+  actual local manifest proves the needed alternate names.
 
 ## W-ASR.9 Build Real Whisper Model Adapter
 

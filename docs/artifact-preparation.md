@@ -105,6 +105,9 @@ cargo test -p ocelotl-models --test whisper_local_artifact_parity -- --ignored
 The harness expects:
 
 - `config.json`: a JSON object describing the converted Whisper tiny.en model.
+  It must parse through `ocelotl_models::whisper::parse_whisper_config_json`;
+  Hugging Face-style Whisper fields and OpenAI-style dimension fields are both
+  accepted.
 - `tokenizer.json`: a JSON object for the tokenizer artifact.
 - `model.safetensors`: a safetensors file with a valid, non-empty header.
 - `reference/sample_16khz_mono.wav`: RIFF/WAVE PCM or IEEE-float audio with 1
@@ -130,11 +133,16 @@ The harness expects:
 ```
 
 `expected_token_ids` must be non-empty. `expected_text` is optional for W-ASR.5,
-but if present it must be non-empty. The first harness validates the bundle and
-reference shape; it does not yet prove end-to-end real-model token parity
-because the converted Whisper weight loader/model adapter is still future work.
-When that converter exists, extend the ignored test to run the sample audio
-through Ocelotl and compare exact output tokens against `expected_token_ids`.
+but if present it must be non-empty. The current ignored harness validates the
+bundle, parses the real config, and checks `model.safetensors` against
+Ocelotl's canonical OpenAI-style Whisper tensor contract. It does not yet prove
+end-to-end real-model token parity because the real Whisper forward adapter is
+still future work. If your converted artifact uses HF/Burn-style tensor names
+instead of the canonical `encoder.*` / `decoder.*` names, keep the manifest for
+the next adapter task; alias support should be added from real manifest
+evidence, not guessed in advance. When that adapter exists, extend the ignored
+test to run the sample audio through Ocelotl and compare exact output tokens
+against `expected_token_ids`.
 
 ## 5. Keeping Artifacts Out Of Git
 

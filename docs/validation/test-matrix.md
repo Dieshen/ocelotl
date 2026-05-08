@@ -137,8 +137,10 @@ criteria to the tests and docs that prove the current post-M3 Whisper track.
 | 4 | Whisper token startup/masking rules are fixture-tested. | `crates/tokenizer/tests/whisper_startup.rs::{whisper_transcribe_no_timestamps_startup_sequence_is_explicit,whisper_no_timestamps_decode_mask_suppresses_timestamps_and_prompt_specials}`. | green |
 | 5 | A tiny synthetic Whisper-shaped path proves encoder/decoder shape and decode flow without network access. | `crates/models/tests/whisper_tiny_synthetic.rs::tiny_synthetic_whisper_path_matches_pinned_logits` plus the request/model validation tests in the same file. | green |
 | 6 | Any real-model parity test is opt-in, local-artifact gated, and documented. | `crates/models/tests/whisper_local_artifact_parity.rs::{whisper_local_artifact_contract_lists_exact_required_paths,expected_tokens_schema_accepts_documented_shape,expected_tokens_schema_rejects_empty_reference_sequence}` run by default. `local_whisper_tiny_en_artifact_contract_is_well_formed` is `#[ignore]`'d and names every required file under `local-artifacts/whisper_tiny_en/`. `docs/artifact-preparation.md` and `docs/validation/parity.md` document the bundle and current limit. | green (harness) |
-| 7 | Burn remains an internal implementation detail. | Current W-ASR.2-W-ASR.6 code uses Ocelotl-owned structs/tests and does not expose Burn types. | green |
+| 7 | Burn remains an internal implementation detail. | Current W-ASR.2-W-ASR.8 code uses Ocelotl-owned structs/tests and does not expose Burn types. | green |
 | 8 | Runtime exposes Ocelotl-owned transcription request/result types and reaches the Whisper model through the public lifecycle. | `crates/runtime/tests/whisper_transcription.rs::{transcribe_rejects_empty_audio_before_preprocessing_or_model_compute,transcribe_rejects_unsupported_audio_metadata_before_model_compute,transcribe_runs_tiny_synthetic_whisper_path_and_returns_token_plus_logits,transcribe_propagates_model_errors_after_runtime_audio_validation}`. | green (synthetic) |
+| 9 | Loader can read safetensors tensor values without exposing foreign safetensors types. | `ocelotl_loader::safetensors_values::tests::{load_safetensors_tensor_f32_loads_f32_values_and_metadata,load_safetensors_tensor_f32_converts_bf16_values,load_safetensors_tensor_f32_converts_f16_values,load_safetensors_tensor_f32_preserves_f16_nan,load_safetensors_tensor_f32_returns_io_for_missing_file,load_safetensors_tensor_f32_returns_invalid_model_for_missing_tensor,load_safetensors_tensor_f32_returns_unsupported_for_unsupported_dtype,load_safetensors_tensor_f32_returns_invalid_model_for_malformed_payload}`. | green |
+| 10 | Real Whisper config and tensor manifest validation fail before compute. | `ocelotl_models::whisper::config::tests::{parses_hf_tiny_en_config_shape,parses_openai_style_dims_shape,rejects_non_whisper_architecture,rejects_zero_dimension_before_compute,rejects_inconsistent_head_divisibility}` and `ocelotl_models::whisper::tensors::tests::{required_names_cover_real_whisper_tiny_en_families,untied_projection_requires_extra_projection_tensor,validate_accepts_complete_manifest,validate_rejects_invalid_config_before_manifest_walk,validate_rejects_missing_cross_attention_tensor,validate_rejects_wrong_shape,validate_rejects_wrong_dtype,validate_accepts_f16_manifest_when_config_is_f16}`. The ignored local-artifact harness now runs `parse_whisper_config_json` and `validate_whisper_tensors` against local `config.json` and `model.safetensors`. | green (contract) |
 
 ### Note - W-ASR.5 real parity limit
 
@@ -153,3 +155,11 @@ adapter exists.
 The W-ASR.6 runtime API returns a greedy token plus logits from the tiny
 synthetic Whisper model. It does not yet perform multi-token transcription,
 timestamp handling, decode masking, or token-to-text decoding.
+
+### Note - W-ASR.7/W-ASR.8 adapter groundwork limit
+
+W-ASR.7 and W-ASR.8 unblock real Whisper adapter work by adding generic
+safetensors value loading and a canonical OpenAI-style Whisper config/tensor
+contract. They still do not run a real Whisper forward pass. W-ASR.8
+intentionally defers HF/Burn-converted tensor-name aliases until a local
+`model.safetensors` manifest proves which alternate names are needed.

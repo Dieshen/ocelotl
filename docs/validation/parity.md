@@ -150,8 +150,15 @@ adapter.
 
 ### Current Limit
 
-W-ASR.5 proves the local-artifact contract and reference shape only. It does
-not yet run real Whisper model inference or compare produced tokens because the
-converted artifact loader/model adapter does not exist. Extending the ignored
-test from "bundle is well-formed" to "output tokens equal expected tokens" is
-the follow-up that closes real local-artifact parity.
+W-ASR.5 proves the local-artifact contract and reference shape. W-ASR.7 adds
+generic safetensors tensor-value loading, and W-ASR.8 adds a real Whisper
+config/tensor-manifest contract plus wires the ignored harness through
+`parse_whisper_config_json` and `validate_whisper_tensors`.
+
+The current contract still does not run real Whisper model inference or compare
+produced tokens. W-ASR.8 uses OpenAI Whisper state-dict names as the canonical
+Ocelotl tensor contract; aliases for HF/Burn-converted safetensors names should
+be added only after the local `model.safetensors` manifest proves the needed
+alternate names. Extending the ignored test from "bundle is well-formed" to
+"output tokens equal expected tokens" is the follow-up that closes real
+local-artifact parity.
