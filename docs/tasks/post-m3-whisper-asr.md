@@ -19,6 +19,11 @@ Phase split:
   config/tensor contract.
 - Phase 5: W-ASR.9 real Whisper model adapter and W-ASR.10 output-token
   parity.
+- Phase 6: W-ASR.11 timestamp decode policy, W-ASR.12 WER corpus harness,
+  W-ASR.13 whisper.cpp benchmark harness, and W-ASR.14 model-size
+  compatibility audit. Multilingual remains deferred until after the English
+  ASR path has timestamps, corpus quality checks, chunking, and baseline
+  performance coverage.
 
 ## W-ASR.1 Define The Whisper Boundary
 
@@ -163,3 +168,60 @@ Ocelotl can run real Whisper weights yet.
 - `Done when`: the opt-in local-artifact test proves exact token parity for the
   pinned tiny.en bundle. Text output can remain optional unless the fixture
   includes `expected_text`.
+
+## W-ASR.11 Add English Timestamp Decode Policy
+
+- `Crates`: `ocelotl-tokenizer`, `ocelotl-models`, `ocelotl-runtime` if the
+  runtime result shape needs timestamp fields.
+- `Test first`: add timestamp-token fixtures that prove timestamp tokens are
+  allowed when no-timestamps mode is disabled, text tokens and timestamp tokens
+  obey distinct masking rules, and decoded segments have deterministic start/end
+  boundaries for a tiny fixture.
+- `Done when`: English transcription can run with timestamp tokens enabled
+  through Ocelotl-owned policy types, default tests pin the mask/segment rules,
+  and the opt-in local-artifact harness can validate a timestamped reference
+  without changing the no-timestamps parity contract.
+- `Out of scope`: multilingual language prompts, streaming chunk stitching, and
+  performance tuning.
+
+## W-ASR.12 Add WER Corpus Harness
+
+- `Crates`: likely `ocelotl-models` tests first; `ocelotl-runtime` only if the
+  harness uses the public transcription API.
+- `Test first`: add a tiny committed transcript-normalization fixture that
+  proves lowercasing, punctuation handling, whitespace folding, and insertion /
+  deletion / substitution counting before any real-audio corpus is wired in.
+- `Done when`: an ignored corpus harness can read a manifest of local WAV files
+  plus expected transcripts, run deterministic transcription, compute WER, and
+  report per-sample plus aggregate results. The first pass may be
+  transcript-only; timestamp-aware scoring can be added after W-ASR.11 lands.
+- `Out of scope`: claiming model quality from one sample, downloading corpora in
+  default tests, or making WER thresholds block CI before a real corpus policy is
+  approved.
+
+## W-ASR.13 Add whisper.cpp Benchmark Harness
+
+- `Crates`: docs and test tooling first; avoid runtime changes unless benchmark
+  instrumentation needs an Ocelotl-owned timing hook.
+- `Test first`: add a manifest/parser test or command-shape test that proves the
+  benchmark harness records model path, audio path, thread count, command, wall
+  time, and output token/text summary without requiring whisper.cpp to be
+  installed.
+- `Done when`: contributors can run an ignored/local benchmark comparing Ocelotl
+  and whisper.cpp on the same audio/model inputs, with clear skip behavior when
+  whisper.cpp is absent and no performance parity claim until numbers are
+  captured.
+- `Out of scope`: optimization work, GPU comparison, and treating whisper.cpp
+  output as the canonical correctness oracle.
+
+## W-ASR.14 Audit Whisper Model-Size Compatibility
+
+- `Crates`: `ocelotl-models`, `ocelotl-loader`; docs if artifact paths are added.
+- `Test first`: add config/tensor-contract fixtures for at least one non-tiny
+  Whisper size, or table-driven tests that cover the known OpenAI Whisper size
+  dimensions without loading large weights.
+- `Done when`: the config and tensor contract are proven not to be tiny-only,
+  local-artifact paths for additional sizes are documented, and any unsupported
+  size-specific assumption fails with a typed error before compute.
+- `Out of scope`: full output-token parity for every size; that comes after
+  timestamps, WER, streaming/chunking, and baseline performance measurement.

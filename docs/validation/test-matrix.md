@@ -145,9 +145,14 @@ criteria to the tests and docs that prove the current post-M3 Whisper track.
 ### Note - W-ASR.10 real parity limit
 
 The W-ASR.10 ignored test now performs real output-token comparison when the
-local Whisper tiny.en bundle is present. The current checkout does not include
-`local-artifacts/whisper_tiny_en`, so exact local parity remains unproven until
-that bundle is supplied and the ignored test is run.
+local Whisper tiny.en bundle is present. The repository does not commit
+`local-artifacts/whisper_tiny_en`, so each contributor must supply that bundle
+locally and run the ignored test to refresh the proof on their machine. The
+senior run on 2026-05-09 verified the opt-in proof with:
+
+```powershell
+cargo test -p ocelotl-models --release --test whisper_local_artifact_parity -- --ignored --nocapture
+```
 
 ### Note - W-ASR.6 runtime limit
 

@@ -85,6 +85,21 @@ weights. Real `whisper_tiny_en` tests are `#[ignore]` and local-artifact gated.
 - Public Burn types in Ocelotl APIs.
 - Network-dependent default tests.
 
+## Follow-On Priority
+
+After the W-ASR.10 exact-token local parity proof, English ASR follow-up work
+should proceed in this order:
+
+1. Timestamp decode policy and timestamped segment fixtures.
+2. WER across a local corpus.
+3. Streaming and chunked transcription.
+4. Performance comparison against whisper.cpp on the same local inputs.
+5. Compatibility coverage across Whisper model sizes.
+
+Multilingual support is intentionally later than these English ASR milestones.
+It should not be used to expand the decode surface until timestamps, quality
+measurement, chunking, and baseline performance behavior are understood.
+
 ## TDD Plan
 
 Write tests before implementation for:
