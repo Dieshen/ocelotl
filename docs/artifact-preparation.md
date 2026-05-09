@@ -206,8 +206,9 @@ manifest evidence, not guessed in advance.
 
 W-ASR.14 audits config and tensor-contract compatibility across OpenAI Whisper
 size dimensions without loading large weights or claiming output-token parity
-for every size. If later local-artifact tasks need size-specific bundles, use
-one directory per upstream artifact name:
+for every size. W-ASR.19 extends the opt-in local-artifact parity harness to the
+classic English ASR bundle set plus `large`: `tiny.en`, `base.en`, `small.en`,
+`medium.en`, and `large`. Use one directory per upstream artifact name:
 
 | Upstream artifact | Local directory |
 | --- | --- |
@@ -223,7 +224,12 @@ one directory per upstream artifact name:
 
 The directory name only identifies the artifact family and size. It does not
 expand the current English ASR decode surface, and it does not make non-tiny
-parity part of the default test suite.
+parity part of the default test suite. Each W-ASR.19 ignored test reports one
+size independently: absent bundles print a skip message with this remediation,
+while present bundles run the same `reference/expected_tokens.json` exact-token
+check used by `tiny.en`. If `reference/expected_tokens_timestamped.json` is
+present for a size, the same ignored test also validates the optional timestamped
+reference with the W-ASR.15 segment schema.
 
 ## 5. Keeping Artifacts Out Of Git
 
@@ -248,6 +254,13 @@ explicitly with `cargo test -- --ignored` (or a focused
 offline-by-default contract documented in `docs/ci.md` § Offline Rule and
 § Offline By Default Across Milestones, where M2 is the milestone that owns
 network/local-artifact enforcement.
+
+By default, tests resolve artifacts from `<repo>/local-artifacts/`. Worktree
+runs can point at a shared artifact directory by setting
+`OCELOTL_LOCAL_ARTIFACTS_DIR` to the directory that contains the model
+subdirectories, for example `D:\Dev\ai\ocelotl\local-artifacts`. The
+subdirectory names still stay the same (`whisper_tiny_en`,
+`qwen2_5_0_5b_instruct`, and so on).
 
 Concrete pattern for new tests:
 

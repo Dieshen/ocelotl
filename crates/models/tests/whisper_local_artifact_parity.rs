@@ -1,11 +1,11 @@
-//! W-ASR.10 opt-in local-artifact harness for Whisper tiny.en.
+//! W-ASR.10/W-ASR.19 opt-in local-artifact harness for Whisper classic sizes.
 //!
 //! The default-on tests in this file validate the harness schema without
-//! touching local artifacts. The ignored test checks the local bundle contract
-//! and, when the bundle is present, runs exact output-token parity:
+//! touching local artifacts. The ignored tests check each local bundle contract
+//! independently and, when a bundle is present, run exact output-token parity:
 //!
 //! ```text
-//! local-artifacts/whisper_tiny_en/
+//! local-artifacts/whisper_{tiny_en,base_en,small_en,medium_en,large}/
 //!   config.json
 //!   tokenizer.json
 //!   model.safetensors
@@ -36,7 +36,8 @@ use ocelotl_tokenizer::{
 use serde::Deserialize;
 
 const OPENAI_MULTILINGUAL_VOCAB_THRESHOLD: usize = 51_865;
-const LOCAL_ARTIFACT_DIR: &str = "local-artifacts/whisper_tiny_en";
+const LOCAL_ARTIFACT_ROOT_ENV: &str = "OCELOTL_LOCAL_ARTIFACTS_DIR";
+const LOCAL_ARTIFACT_ROOT: &str = "local-artifacts";
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
 const MODEL_SAFETENSORS: &str = "model.safetensors";
@@ -44,6 +45,43 @@ const REFERENCE_AUDIO: &str = "reference/sample_16khz_mono.wav";
 const EXPECTED_TOKENS_JSON: &str = "reference/expected_tokens.json";
 const TIMESTAMPED_EXPECTED_TOKENS_JSON: &str = "reference/expected_tokens_timestamped.json";
 const EXPECTED_AUDIO_FIELD: &str = "reference/sample_16khz_mono.wav";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WhisperLocalBundle {
+    artifact: &'static str,
+    dir_name: &'static str,
+    reference_name: &'static str,
+}
+
+const WHISPER_TINY_EN_BUNDLE: WhisperLocalBundle = WhisperLocalBundle {
+    artifact: "tiny.en",
+    dir_name: "whisper_tiny_en",
+    reference_name: "whisper_tiny_en_sample_16khz_mono",
+};
+
+const CLASSIC_WHISPER_LOCAL_BUNDLES: &[WhisperLocalBundle] = &[
+    WHISPER_TINY_EN_BUNDLE,
+    WhisperLocalBundle {
+        artifact: "base.en",
+        dir_name: "whisper_base_en",
+        reference_name: "whisper_base_en_sample_16khz_mono",
+    },
+    WhisperLocalBundle {
+        artifact: "small.en",
+        dir_name: "whisper_small_en",
+        reference_name: "whisper_small_en_sample_16khz_mono",
+    },
+    WhisperLocalBundle {
+        artifact: "medium.en",
+        dir_name: "whisper_medium_en",
+        reference_name: "whisper_medium_en_sample_16khz_mono",
+    },
+    WhisperLocalBundle {
+        artifact: "large",
+        dir_name: "whisper_large",
+        reference_name: "whisper_large_sample_16khz_mono",
+    },
+];
 
 #[derive(Debug, Deserialize)]
 struct ExpectedTokens {
@@ -149,12 +187,38 @@ impl WhisperArtifactDecodePolicy {
     }
 }
 
+impl WhisperLocalBundle {
+    fn relative_dir(self) -> String {
+        format!("{LOCAL_ARTIFACT_ROOT}/{}", self.dir_name)
+    }
+
+    fn path(self, relative: &str) -> PathBuf {
+        local_artifact_root().join(self.dir_name).join(relative)
+    }
+
+    fn required_relative_paths(self) -> Vec<String> {
+        required_artifacts()
+            .into_iter()
+            .map(|relative| format!("{}/{}", self.relative_dir(), relative))
+            .collect()
+    }
+}
+
+fn local_artifact_root() -> PathBuf {
+    std::env::var_os(LOCAL_ARTIFACT_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_local_artifact_root)
+}
+
 fn repo_artifact_path(relative: &str) -> PathBuf {
+    WHISPER_TINY_EN_BUNDLE.path(relative)
+}
+
+fn default_local_artifact_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join(LOCAL_ARTIFACT_DIR)
-        .join(relative)
+        .join(LOCAL_ARTIFACT_ROOT)
 }
 
 fn required_artifacts() -> [&'static str; 5] {
@@ -188,7 +252,10 @@ fn tiny_whisper_config() -> WhisperConfig {
 
 #[test]
 fn whisper_local_artifact_contract_lists_exact_required_paths() {
-    assert_eq!(LOCAL_ARTIFACT_DIR, "local-artifacts/whisper_tiny_en");
+    assert_eq!(
+        WHISPER_TINY_EN_BUNDLE.relative_dir(),
+        "local-artifacts/whisper_tiny_en"
+    );
     assert_eq!(
         required_artifacts(),
         [
@@ -199,6 +266,117 @@ fn whisper_local_artifact_contract_lists_exact_required_paths() {
             "reference/expected_tokens.json",
         ]
     );
+}
+
+#[test]
+fn classic_whisper_local_artifact_contract_lists_all_size_paths() {
+    let cases: Vec<(&str, String, Vec<String>)> = CLASSIC_WHISPER_LOCAL_BUNDLES
+        .iter()
+        .copied()
+        .map(|bundle| {
+            (
+                bundle.artifact,
+                bundle.relative_dir(),
+                bundle.required_relative_paths(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        cases,
+        vec![
+            (
+                "tiny.en",
+                "local-artifacts/whisper_tiny_en".to_string(),
+                vec![
+                    "local-artifacts/whisper_tiny_en/config.json".to_string(),
+                    "local-artifacts/whisper_tiny_en/tokenizer.json".to_string(),
+                    "local-artifacts/whisper_tiny_en/model.safetensors".to_string(),
+                    "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav".to_string(),
+                    "local-artifacts/whisper_tiny_en/reference/expected_tokens.json".to_string(),
+                ],
+            ),
+            (
+                "base.en",
+                "local-artifacts/whisper_base_en".to_string(),
+                vec![
+                    "local-artifacts/whisper_base_en/config.json".to_string(),
+                    "local-artifacts/whisper_base_en/tokenizer.json".to_string(),
+                    "local-artifacts/whisper_base_en/model.safetensors".to_string(),
+                    "local-artifacts/whisper_base_en/reference/sample_16khz_mono.wav".to_string(),
+                    "local-artifacts/whisper_base_en/reference/expected_tokens.json".to_string(),
+                ],
+            ),
+            (
+                "small.en",
+                "local-artifacts/whisper_small_en".to_string(),
+                vec![
+                    "local-artifacts/whisper_small_en/config.json".to_string(),
+                    "local-artifacts/whisper_small_en/tokenizer.json".to_string(),
+                    "local-artifacts/whisper_small_en/model.safetensors".to_string(),
+                    "local-artifacts/whisper_small_en/reference/sample_16khz_mono.wav".to_string(),
+                    "local-artifacts/whisper_small_en/reference/expected_tokens.json".to_string(),
+                ],
+            ),
+            (
+                "medium.en",
+                "local-artifacts/whisper_medium_en".to_string(),
+                vec![
+                    "local-artifacts/whisper_medium_en/config.json".to_string(),
+                    "local-artifacts/whisper_medium_en/tokenizer.json".to_string(),
+                    "local-artifacts/whisper_medium_en/model.safetensors".to_string(),
+                    "local-artifacts/whisper_medium_en/reference/sample_16khz_mono.wav".to_string(),
+                    "local-artifacts/whisper_medium_en/reference/expected_tokens.json".to_string(),
+                ],
+            ),
+            (
+                "large",
+                "local-artifacts/whisper_large".to_string(),
+                vec![
+                    "local-artifacts/whisper_large/config.json".to_string(),
+                    "local-artifacts/whisper_large/tokenizer.json".to_string(),
+                    "local-artifacts/whisper_large/model.safetensors".to_string(),
+                    "local-artifacts/whisper_large/reference/sample_16khz_mono.wav".to_string(),
+                    "local-artifacts/whisper_large/reference/expected_tokens.json".to_string(),
+                ],
+            ),
+        ]
+    );
+}
+
+#[test]
+fn classic_whisper_local_artifact_references_reuse_expected_token_schema() {
+    for bundle in CLASSIC_WHISPER_LOCAL_BUNDLES {
+        let (expected_token_ids, policy) = if bundle.artifact == "large" {
+            (
+                "[50258, 50259, 50359, 50363, 42, 50257]",
+                WhisperArtifactDecodePolicy::multilingual_english(),
+            )
+        } else {
+            (
+                "[50257, 50362, 42, 50256]",
+                WhisperArtifactDecodePolicy::english_only(),
+            )
+        };
+        let raw = format!(
+            r#"{{
+              "fixture_version": 1,
+              "name": "{}",
+              "source": "local {} converter output",
+              "audio": "reference/sample_16khz_mono.wav",
+              "task": "transcribe",
+              "language": "en",
+              "timestamps": false,
+              "expected_token_ids": {},
+              "expected_text": "hello"
+            }}"#,
+            bundle.reference_name, bundle.artifact, expected_token_ids,
+        );
+        let fixture = parse_expected_tokens(&raw);
+
+        validate_expected_tokens(&fixture);
+        validate_expected_tokens_for_policy(&fixture, policy);
+    }
 }
 
 #[test]
@@ -445,18 +623,87 @@ fn wav_sample_reader_decodes_ieee_float32_mono_values() {
 #[test]
 #[ignore = "requires local-artifacts/whisper_tiny_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json} - see docs/artifact-preparation.md"]
 fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
+    run_local_whisper_bundle_parity(WHISPER_TINY_EN_BUNDLE);
+}
+
+#[test]
+#[ignore = "requires local-artifacts/whisper_base_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json} - see docs/artifact-preparation.md"]
+fn local_whisper_base_en_artifact_contract_is_well_formed() {
+    run_local_whisper_bundle_parity(CLASSIC_WHISPER_LOCAL_BUNDLES[1]);
+}
+
+#[test]
+#[ignore = "requires local-artifacts/whisper_small_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json} - see docs/artifact-preparation.md"]
+fn local_whisper_small_en_artifact_contract_is_well_formed() {
+    run_local_whisper_bundle_parity(CLASSIC_WHISPER_LOCAL_BUNDLES[2]);
+}
+
+#[test]
+#[ignore = "requires local-artifacts/whisper_medium_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json} - see docs/artifact-preparation.md"]
+fn local_whisper_medium_en_artifact_contract_is_well_formed() {
+    run_local_whisper_bundle_parity(CLASSIC_WHISPER_LOCAL_BUNDLES[3]);
+}
+
+#[test]
+#[ignore = "requires local-artifacts/whisper_large/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json} - see docs/artifact-preparation.md"]
+fn local_whisper_large_artifact_contract_is_well_formed() {
+    run_local_whisper_bundle_parity(CLASSIC_WHISPER_LOCAL_BUNDLES[4]);
+}
+
+fn run_local_whisper_bundle_parity(bundle: WhisperLocalBundle) {
+    if !bundle.path(CONFIG_JSON).exists() {
+        eprintln!(
+            "skipping Whisper {} local parity: missing bundle at {}; prepare {} with {} or set {} to a directory containing {}; see docs/artifact-preparation.md",
+            bundle.artifact,
+            bundle.path(CONFIG_JSON).display(),
+            bundle.relative_dir(),
+            required_artifacts().join(", "),
+            LOCAL_ARTIFACT_ROOT_ENV,
+            bundle.dir_name,
+        );
+        return;
+    }
+
     for relative in required_artifacts() {
-        let path = repo_artifact_path(relative);
+        let path = bundle.path(relative);
         assert!(
             path.exists(),
-            "missing artifact at {} - expected {} under {}; see docs/artifact-preparation.md",
+            "{} bundle is present but missing artifact at {} - expected {} under {}; see docs/artifact-preparation.md",
+            bundle.artifact,
             path.display(),
             relative,
-            LOCAL_ARTIFACT_DIR,
+            bundle.relative_dir(),
         );
     }
 
-    let config_path = repo_artifact_path(CONFIG_JSON);
+    run_local_whisper_bundle_expected_tokens(
+        bundle,
+        EXPECTED_TOKENS_JSON,
+        WhisperTimestampMode::NoTimestamps,
+    );
+
+    let timestamped_path = bundle.path(TIMESTAMPED_EXPECTED_TOKENS_JSON);
+    if timestamped_path.exists() {
+        run_local_whisper_bundle_expected_tokens(
+            bundle,
+            TIMESTAMPED_EXPECTED_TOKENS_JSON,
+            WhisperTimestampMode::Timestamps,
+        );
+    } else {
+        eprintln!(
+            "skipping optional Whisper {} timestamped local parity: missing {}; see docs/artifact-preparation.md",
+            bundle.artifact,
+            timestamped_path.display(),
+        );
+    }
+}
+
+fn run_local_whisper_bundle_expected_tokens(
+    bundle: WhisperLocalBundle,
+    expected_tokens_json: &str,
+    mode: WhisperTimestampMode,
+) {
+    let config_path = bundle.path(CONFIG_JSON);
     let config_raw = std::fs::read_to_string(&config_path).unwrap_or_else(|err| {
         panic!(
             "failed to read config.json at {} - {err}",
@@ -469,11 +716,12 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
             config_path.display()
         )
     });
+    let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
 
-    let tokenizer_path = repo_artifact_path(TOKENIZER_JSON);
+    let tokenizer_path = bundle.path(TOKENIZER_JSON);
     assert_json_object(&tokenizer_path, "tokenizer.json");
 
-    let model_path = repo_artifact_path(MODEL_SAFETENSORS);
+    let model_path = bundle.path(MODEL_SAFETENSORS);
     let manifest = inspect_safetensors(&model_path).unwrap_or_else(|err| {
         panic!(
             "failed to inspect safetensors header at {} - {err:?}",
@@ -492,7 +740,7 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
         )
     });
 
-    let audio_path = repo_artifact_path(REFERENCE_AUDIO);
+    let audio_path = bundle.path(REFERENCE_AUDIO);
     let wav = read_wav_metadata(&audio_path);
     assert!(
         matches!(wav.audio_format, 1 | 3),
@@ -511,20 +759,41 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
         audio_path.display(),
     );
 
-    let expected_path = repo_artifact_path(EXPECTED_TOKENS_JSON);
+    let expected_path = bundle.path(expected_tokens_json);
     let expected = parse_expected_tokens_file(&expected_path);
     validate_expected_tokens(&expected);
-    let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
     validate_expected_tokens_for_policy(&expected, decode_policy);
+    assert_eq!(
+        expected.timestamps,
+        matches!(mode, WhisperTimestampMode::Timestamps),
+        "{} must declare timestamps={} for {}",
+        expected_path.display(),
+        matches!(mode, WhisperTimestampMode::Timestamps),
+        bundle.artifact,
+    );
 
     let expected_token_ids = expected_token_ids(&expected);
-    assert_startup_prompt(&expected_token_ids, decode_policy);
+    if matches!(mode, WhisperTimestampMode::NoTimestamps) {
+        assert_startup_prompt(&expected_token_ids, decode_policy);
+    }
     assert!(
         expected_token_ids.len() <= whisper_config.text_context_length,
-        "expected_tokens.json has {} tokens, but config text_context_length is {}",
+        "{} has {} tokens, but config text_context_length is {}",
+        expected_path.display(),
         expected_token_ids.len(),
         whisper_config.text_context_length,
     );
+    let expected_segments = if matches!(mode, WhisperTimestampMode::Timestamps) {
+        let segments = expected_timestamped_segments(&expected, decode_policy);
+        assert!(
+            !segments.is_empty(),
+            "timestamped reference at {} must include at least one expected segment",
+            expected_path.display(),
+        );
+        Some(segments)
+    } else {
+        None
+    };
 
     let loaded_tensors = load_required_whisper_tensors(&model_path, &whisper_config);
     let model = WhisperModel::new(whisper_config, loaded_tensors).unwrap_or_else(|err| {
@@ -560,12 +829,28 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
         &mel,
         expected_token_ids.len(),
         decode_policy,
-        WhisperTimestampMode::NoTimestamps,
+        mode,
     );
     assert_eq!(
-        generated, expected_token_ids,
-        "generated Whisper token IDs must exactly match reference/expected_tokens.json",
+        generated,
+        expected_token_ids,
+        "generated Whisper {} token IDs must exactly match {} for {}",
+        match mode {
+            WhisperTimestampMode::NoTimestamps => "no-timestamps",
+            WhisperTimestampMode::Timestamps => "timestamped",
+        },
+        expected_tokens_json,
+        bundle.artifact,
     );
+
+    if let Some(expected_segments) = expected_segments {
+        assert_eq!(
+            expected_timestamped_segments_for_tokens(&generated, &expected, decode_policy),
+            expected_segments,
+            "generated timestamped Whisper segments must exactly match expected_segments for {}",
+            bundle.artifact,
+        );
+    }
 }
 
 #[test]
@@ -587,7 +872,7 @@ fn local_whisper_tiny_en_timestamped_artifact_contract_is_well_formed() {
             "timestamped parity reference exists, but missing required base artifact at {} - expected {} under {}; see docs/artifact-preparation.md",
             path.display(),
             relative,
-            LOCAL_ARTIFACT_DIR,
+            WHISPER_TINY_EN_BUNDLE.relative_dir(),
         );
     }
 
