@@ -1,8 +1,13 @@
 //! Request lifecycle and generation runtime.
 
 mod sampling;
+mod whisper_streaming;
 
 pub use sampling::greedy_sample;
+pub use whisper_streaming::{
+    ChunkedTranscriptionRequest, TranscriptionChunk, TranscriptionChunkingConfig,
+    plan_transcription_chunks,
+};
 
 use ocelotl_core::{
     GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId,
