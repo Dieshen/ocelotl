@@ -610,7 +610,21 @@ fn gelu_inplace(x: &mut [f32]) {
 }
 
 fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
+    // OpenAI Whisper uses PyTorch's default GELU, which is the exact-erf
+    // formulation rather than the tanh approximation.
+    0.5 * x * (1.0 + erf_approx(x / std::f32::consts::SQRT_2))
+}
+
+fn erf_approx(x: f32) -> f32 {
+    let sign = if x.is_sign_negative() { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp());
+    sign * y
 }
 
 fn add_positional_embedding(
@@ -861,7 +875,13 @@ mod tests {
 
         let out = mlp_gelu(&x, 1, 2, 2, &fc1_w, &fc1_b, &fc2_w, &fc2_b).expect("mlp");
 
-        assert_close(&out, &[0.841192, 0.0], 1.0e-5);
+        assert_close(&out, &[0.841_344_7, 0.0], 1.0e-6);
+    }
+
+    #[test]
+    fn gelu_pins_exact_erf_variant_used_by_openai_whisper() {
+        assert_close(&[gelu(1.0)], &[0.841_344_7], 1.0e-6);
+        assert_close(&[gelu(-1.0)], &[-0.158_655_26], 1.0e-6);
     }
 
     #[test]
