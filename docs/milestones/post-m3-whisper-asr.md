@@ -100,6 +100,18 @@ Multilingual support is intentionally later than these English ASR milestones.
 It should not be used to expand the decode surface until timestamps, quality
 measurement, chunking, and baseline performance behavior are understood.
 
+W-ASR.11 through W-ASR.14 shipped the first pass of that list: timestamp policy,
+transcript-only WER scoring, benchmark harness shape, and size-contract audit.
+The next pass must convert those surfaces into opt-in local proofs:
+
+1. Timestamped local-artifact parity for the tiny.en bundle.
+2. A local WER corpus runner with manifest and report shape.
+3. A streaming/chunking runtime contract before any cache reuse.
+4. A dedicated Ocelotl timing command so benchmark numbers do not include the
+   Rust test harness.
+5. Exact-token local parity harnesses for every classic Whisper size whose
+   artifact bundle is present.
+
 ## TDD Plan
 
 Write tests before implementation for:

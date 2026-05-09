@@ -24,6 +24,10 @@ Phase split:
   compatibility audit. Multilingual remains deferred until after the English
   ASR path has timestamps, corpus quality checks, chunking, and baseline
   performance coverage.
+- Phase 7: W-ASR.15 timestamped local-artifact parity, W-ASR.16 local WER
+  corpus runner, W-ASR.17 streaming/chunked transcription contract, W-ASR.18
+  dedicated Ocelotl timing hook for benchmark runs, and W-ASR.19 all-size
+  local-artifact parity harnesses.
 
 ## W-ASR.1 Define The Whisper Boundary
 
@@ -232,3 +236,68 @@ Ocelotl can run real Whisper weights yet.
   size-specific assumption fails with a typed error before compute.
 - `Out of scope`: full output-token parity for every size; that comes after
   timestamps, WER, streaming/chunking, and baseline performance measurement.
+
+## W-ASR.15 Add Timestamped Local-Artifact Parity
+
+- `Crates`: `ocelotl-tokenizer`, `ocelotl-models`, `ocelotl-runtime` only if
+  runtime result types must carry timestamp segments.
+- `Test first`: extend the local-artifact reference schema with a timestamped
+  fixture shape that pins `timestamps: true`, expected token IDs containing
+  timestamp boundary tokens, and expected segment boundaries.
+- `Done when`: the default tests validate timestamped reference-schema shape
+  and segment parsing, and an ignored local-artifact test can run a timestamped
+  reference against the same `local-artifacts/whisper_tiny_en/` bundle without
+  weakening the W-ASR.10 no-timestamps exact-token proof.
+- `Out of scope`: multilingual prompts, streaming chunk stitching, and WER
+  scoring of timestamped segments.
+
+## W-ASR.16 Add Local WER Corpus Runner
+
+- `Crates`: `ocelotl-models` tests first; `ocelotl-runtime` if the runner uses
+  runtime transcription APIs rather than the model test harness.
+- `Test first`: add a committed corpus manifest fixture that names local WAV
+  paths, expected transcripts, optional expected token paths, and skip behavior
+  when corpus artifacts are absent.
+- `Done when`: an ignored local corpus test can load a manifest, run
+  deterministic Whisper transcription for every case present on disk, compute
+  per-sample and aggregate WER via `whisper::wer`, and emit a readable report
+  without making WER thresholds block CI.
+- `Out of scope`: downloading corpora, deciding a product-quality WER threshold,
+  or treating one tiny sample as a corpus-quality claim.
+
+## W-ASR.17 Add Streaming/Chunked Transcription Contract
+
+- `Crates`: `ocelotl-runtime` first; model code only if a default-on synthetic
+  streaming fixture needs it.
+- `Test first`: add chunk-planning tests for 16 kHz mono audio that pin window
+  size, overlap, last-partial-chunk behavior, and monotonic chunk time ranges.
+- `Done when`: runtime exposes Ocelotl-owned chunk metadata/request types and a
+  deterministic chunk planner. The contract must make it clear whether model
+  state is reused or each chunk is decoded independently.
+- `Out of scope`: KV/cache reuse, real-time microphone capture, diarization,
+  and final transcript stitching heuristics.
+
+## W-ASR.18 Add Dedicated Ocelotl Benchmark Timing Hook
+
+- `Crates`: likely root CLI or `tools/`; `ocelotl-runtime` only if timing needs
+  a public helper.
+- `Test first`: update the benchmark manifest/record tests so the Ocelotl side
+  names a dedicated transcription timing command rather than `cargo test`.
+- `Done when`: `tools/whisper-cpp-bench.ps1` can run whisper.cpp and an Ocelotl
+  timing command on the same local model/audio inputs, record wall-clock timing
+  and output summary for both, and skip cleanly when either side's local
+  prerequisites are missing.
+- `Out of scope`: optimizing Ocelotl to match whisper.cpp; this task only makes
+  the measurement meaningful enough to compare later.
+
+## W-ASR.19 Add All-Size Local-Artifact Parity Harnesses
+
+- `Crates`: `ocelotl-models`, `ocelotl-loader`, docs.
+- `Test first`: add default-on path/schema tests for classic Whisper
+  `tiny.en`, `base.en`, `small.en`, `medium.en`, and `large` local bundles.
+- `Done when`: ignored local-artifact parity tests can run exact token checks
+  for every size whose bundle exists, skip absent bundles with explicit
+  remediation, and report each size independently. The default tests must not
+  load large weights.
+- `Out of scope`: `large-v3`, `turbo`, multilingual quality claims, and making
+  every size mandatory for CI.
