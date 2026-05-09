@@ -29,10 +29,12 @@ use ocelotl_models::whisper::{
     parse_whisper_config_json, required_whisper_tensor_names, validate_whisper_tensors,
 };
 use ocelotl_tokenizer::{
-    WhisperDecodeMask, WhisperTokenMaskDecision, whisper_multilingual_english_transcribe_tokens,
+    WhisperDecodeMask, WhisperStartupTokens, WhisperTokenMaskDecision,
+    whisper_multilingual_english_transcribe_tokens,
 };
 use serde::Deserialize;
 
+const OPENAI_MULTILINGUAL_VOCAB_THRESHOLD: usize = 51_865;
 const LOCAL_ARTIFACT_DIR: &str = "local-artifacts/whisper_tiny_en";
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -77,6 +79,67 @@ struct WavLayout {
     data_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhisperArtifactTokenizerFamily {
+    Multilingual,
+    EnglishOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WhisperArtifactDecodePolicy {
+    family: WhisperArtifactTokenizerFamily,
+    tokens: WhisperStartupTokens,
+}
+
+impl WhisperArtifactDecodePolicy {
+    fn for_config(config: &WhisperConfig) -> Self {
+        if config.vocab_size >= OPENAI_MULTILINGUAL_VOCAB_THRESHOLD {
+            Self::multilingual_english()
+        } else {
+            Self::english_only()
+        }
+    }
+
+    fn multilingual_english() -> Self {
+        Self {
+            family: WhisperArtifactTokenizerFamily::Multilingual,
+            tokens: whisper_multilingual_english_transcribe_tokens(),
+        }
+    }
+
+    fn english_only() -> Self {
+        Self {
+            family: WhisperArtifactTokenizerFamily::EnglishOnly,
+            tokens: WhisperStartupTokens {
+                end_of_text: TokenId(50_256),
+                start_of_transcript: TokenId(50_257),
+                language: TokenId(50_258),
+                transcribe_task: TokenId(50_358),
+                no_timestamps: TokenId(50_362),
+                first_timestamp: TokenId(50_363),
+            },
+        }
+    }
+
+    fn startup_prompt(self) -> Vec<TokenId> {
+        match self.family {
+            WhisperArtifactTokenizerFamily::Multilingual => {
+                self.tokens.transcribe_no_timestamps_prompt()
+            }
+            WhisperArtifactTokenizerFamily::EnglishOnly => {
+                vec![self.tokens.start_of_transcript, self.tokens.no_timestamps]
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self.family {
+            WhisperArtifactTokenizerFamily::Multilingual => "multilingual English transcribe",
+            WhisperArtifactTokenizerFamily::EnglishOnly => "English-only transcribe",
+        }
+    }
+}
+
 fn repo_artifact_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -111,7 +174,7 @@ fn whisper_local_artifact_contract_lists_exact_required_paths() {
 }
 
 #[test]
-fn expected_tokens_schema_accepts_documented_shape() {
+fn expected_tokens_schema_accepts_multilingual_documented_shape() {
     let fixture = parse_expected_tokens(
         r#"{
           "fixture_version": 1,
@@ -127,6 +190,30 @@ fn expected_tokens_schema_accepts_documented_shape() {
     );
 
     validate_expected_tokens(&fixture);
+    validate_expected_tokens_for_policy(
+        &fixture,
+        WhisperArtifactDecodePolicy::multilingual_english(),
+    );
+}
+
+#[test]
+fn expected_tokens_schema_accepts_english_only_documented_shape() {
+    let fixture = parse_expected_tokens(
+        r#"{
+          "fixture_version": 1,
+          "name": "whisper_tiny_en_sample_16khz_mono",
+          "source": "local whisper_tiny_en converter output",
+          "audio": "reference/sample_16khz_mono.wav",
+          "task": "transcribe",
+          "language": "en",
+          "timestamps": false,
+          "expected_token_ids": [50257, 50362, 42, 50256],
+          "expected_text": "hello"
+        }"#,
+    );
+
+    validate_expected_tokens(&fixture);
+    validate_expected_tokens_for_policy(&fixture, WhisperArtifactDecodePolicy::english_only());
 }
 
 #[test]
@@ -150,7 +237,7 @@ fn expected_tokens_schema_rejects_empty_reference_sequence() {
 }
 
 #[test]
-fn expected_tokens_schema_rejects_sequence_without_whisper_startup_prompt() {
+fn expected_tokens_schema_rejects_sequence_without_artifact_startup_prompt() {
     let fixture = parse_expected_tokens(
         r#"{
           "fixture_version": 1,
@@ -164,8 +251,11 @@ fn expected_tokens_schema_rejects_sequence_without_whisper_startup_prompt() {
         }"#,
     );
 
-    let err = validate_expected_tokens_result(&fixture)
-        .expect_err("missing Whisper startup prompt must be rejected");
+    let err = validate_expected_tokens_for_policy_result(
+        &fixture,
+        WhisperArtifactDecodePolicy::english_only(),
+    )
+    .expect_err("missing artifact startup prompt must be rejected");
     assert!(err.contains("startup prompt"));
 }
 
@@ -293,9 +383,11 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
     let expected_path = repo_artifact_path(EXPECTED_TOKENS_JSON);
     let expected = parse_expected_tokens_file(&expected_path);
     validate_expected_tokens(&expected);
+    let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
+    validate_expected_tokens_for_policy(&expected, decode_policy);
 
     let expected_token_ids = expected_token_ids(&expected);
-    assert_startup_prompt(&expected_token_ids);
+    assert_startup_prompt(&expected_token_ids, decode_policy);
     assert!(
         expected_token_ids.len() <= whisper_config.text_context_length,
         "expected_tokens.json has {} tokens, but config text_context_length is {}",
@@ -332,7 +424,8 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
         )
     });
 
-    let generated = generate_tokens_to_expected_length(&model, &mel, expected_token_ids.len());
+    let generated =
+        generate_tokens_to_expected_length(&model, &mel, expected_token_ids.len(), decode_policy);
     assert_eq!(
         generated, expected_token_ids,
         "generated Whisper token IDs must exactly match reference/expected_tokens.json",
@@ -372,6 +465,14 @@ fn validate_expected_tokens(fixture: &ExpectedTokens) {
         .unwrap_or_else(|err| panic!("invalid expected_tokens.json contract - {err}"));
 }
 
+fn validate_expected_tokens_for_policy(
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) {
+    validate_expected_tokens_for_policy_result(fixture, policy)
+        .unwrap_or_else(|err| panic!("invalid expected_tokens.json startup contract - {err}"));
+}
+
 fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), String> {
     if fixture.fixture_version != 1 {
         return Err(format!(
@@ -409,10 +510,23 @@ fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), Strin
     if fixture.expected_token_ids.is_empty() {
         return Err("expected_token_ids must be non-empty".to_string());
     }
-    let startup_prompt = startup_prompt_ids();
+    if let Some(text) = &fixture.expected_text {
+        if text.trim().is_empty() {
+            return Err("expected_text must be non-empty when present".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_expected_tokens_for_policy_result(
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) -> Result<(), String> {
+    let startup_prompt = startup_prompt_ids(policy);
     if !fixture.expected_token_ids.starts_with(&startup_prompt) {
         return Err(format!(
-            "expected_token_ids must start with the Whisper English transcribe no-timestamps startup prompt {:?}",
+            "expected_token_ids must start with the {} no-timestamps startup prompt {:?}",
+            policy.label(),
             startup_prompt
         ));
     }
@@ -422,17 +536,12 @@ fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), Strin
                 .to_string(),
         );
     }
-    if let Some(text) = &fixture.expected_text {
-        if text.trim().is_empty() {
-            return Err("expected_text must be non-empty when present".to_string());
-        }
-    }
     Ok(())
 }
 
-fn startup_prompt_ids() -> Vec<u32> {
-    whisper_multilingual_english_transcribe_tokens()
-        .transcribe_no_timestamps_prompt()
+fn startup_prompt_ids(policy: WhisperArtifactDecodePolicy) -> Vec<u32> {
+    policy
+        .startup_prompt()
         .into_iter()
         .map(|token| token.0)
         .collect()
@@ -447,12 +556,12 @@ fn expected_token_ids(fixture: &ExpectedTokens) -> Vec<TokenId> {
         .collect()
 }
 
-fn assert_startup_prompt(expected_token_ids: &[TokenId]) {
-    let startup_prompt =
-        whisper_multilingual_english_transcribe_tokens().transcribe_no_timestamps_prompt();
+fn assert_startup_prompt(expected_token_ids: &[TokenId], policy: WhisperArtifactDecodePolicy) {
+    let startup_prompt = policy.startup_prompt();
     assert!(
         expected_token_ids.starts_with(&startup_prompt),
-        "expected_tokens.json must start with Whisper English transcribe no-timestamps prompt {:?}, got prefix {:?}",
+        "expected_tokens.json must start with {} no-timestamps prompt {:?}, got prefix {:?}",
+        policy.label(),
         startup_prompt,
         &expected_token_ids[..expected_token_ids.len().min(startup_prompt.len())],
     );
@@ -476,10 +585,10 @@ fn generate_tokens_to_expected_length(
     model: &WhisperModel,
     mel: &LogMelSpectrogram,
     expected_len: usize,
+    policy: WhisperArtifactDecodePolicy,
 ) -> Vec<TokenId> {
-    let startup_tokens = whisper_multilingual_english_transcribe_tokens();
-    let mut generated = startup_tokens.transcribe_no_timestamps_prompt();
-    let mask = WhisperDecodeMask::transcribe_without_timestamps(startup_tokens);
+    let mut generated = policy.startup_prompt();
+    let mask = WhisperDecodeMask::transcribe_without_timestamps(policy.tokens);
 
     while generated.len() < expected_len {
         let logits = model
@@ -492,7 +601,7 @@ fn generate_tokens_to_expected_length(
             });
         let next = masked_greedy_sample(&logits, mask);
         generated.push(next);
-        if next == startup_tokens.end_of_text {
+        if next == policy.tokens.end_of_text {
             break;
         }
     }

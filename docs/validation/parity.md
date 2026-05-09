@@ -134,21 +134,29 @@ local-artifact harness:
   `crates/models/tests/whisper_local_artifact_parity.rs` documents and checks
   `local-artifacts/whisper_tiny_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json}`.
   The default-on tests in that file validate the expected token-reference
-  schema, including the required Whisper English transcribe/no-timestamps
-  startup prompt. The ignored test validates the local bundle exists, parses
-  `config.json`, `tokenizer.json`, and `expected_tokens.json`, validates the
-  safetensors manifest, loads required tensor values, decodes PCM16 or IEEE
-  float32 WAV sample data, computes log-mel features, and compares exact
-  autoregressively generated token IDs against the reference sequence.
+  schema, including both supported no-timestamps startup variants. The ignored
+  test validates the local bundle exists, parses `config.json`,
+  `tokenizer.json`, and `expected_tokens.json`, derives the tokenizer/model
+  family from `vocab_size`, validates the safetensors manifest, loads required
+  tensor values, decodes PCM16 or IEEE float32 WAV sample data, computes log-mel
+  features, and compares exact autoregressively generated token IDs against the
+  reference sequence.
 
 ### Reference
 
 The opt-in Whisper reference is `reference/expected_tokens.json` inside the
 local bundle. It must name the sample audio path, use task `transcribe`,
 language `en`, `timestamps = false`, and carry an `expected_token_ids` sequence
-that starts with `[50258, 50259, 50359, 50363]` and includes at least one
-generated token after the startup prompt. Exact token equality is the parity
-contract for the opt-in local bundle.
+that starts with the no-timestamps startup prompt appropriate to the artifact's
+tokenizer/model family and includes at least one generated token after the
+startup prompt. Current supported variants are:
+
+| Artifact family | Condition | Startup prompt | EOT | First timestamp |
+| --- | --- | --- | --- | --- |
+| OpenAI English-only Whisper | `vocab_size < 51865` | `[50257, 50362]` | `50256` | `50363` |
+| OpenAI multilingual Whisper, English transcribe | `vocab_size >= 51865` | `[50258, 50259, 50359, 50363]` | `50257` | `50364` |
+
+Exact token equality is the parity contract for the opt-in local bundle.
 
 ### Current Limit
 
