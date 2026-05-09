@@ -476,6 +476,53 @@ mod tests {
     use super::*;
     use ocelotl_loader::TensorEntry;
 
+    #[derive(Debug, Clone, Copy)]
+    struct WhisperSizeCase {
+        name: &'static str,
+        state: usize,
+        heads: usize,
+        layers: usize,
+    }
+
+    const KNOWN_OPENAI_SIZE_CASES: &[WhisperSizeCase] = &[
+        WhisperSizeCase {
+            name: "tiny",
+            state: 384,
+            heads: 6,
+            layers: 4,
+        },
+        WhisperSizeCase {
+            name: "base",
+            state: 512,
+            heads: 8,
+            layers: 6,
+        },
+        WhisperSizeCase {
+            name: "small",
+            state: 768,
+            heads: 12,
+            layers: 12,
+        },
+        WhisperSizeCase {
+            name: "medium",
+            state: 1_024,
+            heads: 16,
+            layers: 24,
+        },
+        WhisperSizeCase {
+            name: "large",
+            state: 1_280,
+            heads: 20,
+            layers: 32,
+        },
+    ];
+
+    impl WhisperSizeCase {
+        fn ffn(self) -> usize {
+            self.state * 4
+        }
+    }
+
     fn tiny_config() -> WhisperConfig {
         WhisperConfig {
             vocab_size: 64,
@@ -490,6 +537,25 @@ mod tests {
             text_attention_heads: 3,
             text_layers: 2,
             text_ffn_size: 48,
+            dtype: DType::F32,
+            tie_word_embeddings: true,
+        }
+    }
+
+    fn openai_size_config(case: WhisperSizeCase) -> WhisperConfig {
+        WhisperConfig {
+            vocab_size: 51_865,
+            mel_bins: 80,
+            audio_context_length: 1_500,
+            audio_state_size: case.state,
+            audio_attention_heads: case.heads,
+            audio_layers: case.layers,
+            audio_ffn_size: case.ffn(),
+            text_context_length: 448,
+            text_state_size: case.state,
+            text_attention_heads: case.heads,
+            text_layers: case.layers,
+            text_ffn_size: case.ffn(),
             dtype: DType::F32,
             tie_word_embeddings: true,
         }
@@ -588,6 +654,91 @@ mod tests {
             "mlp.2.bias" => vec![state],
             "mlp_ln.weight" | "mlp_ln.bias" => vec![state],
             other => panic!("unknown block suffix {other}"),
+        }
+    }
+
+    #[test]
+    fn required_names_scale_with_known_openai_size_layers() {
+        for &case in KNOWN_OPENAI_SIZE_CASES {
+            let cfg = openai_size_config(case);
+            let names = required_whisper_tensor_names(&cfg);
+
+            assert_eq!(
+                names.len(),
+                7 + case.layers * 15 + 2 + case.layers * 24 + 2,
+                "{} required tensor count",
+                case.name
+            );
+            assert!(
+                names.contains(&format!(
+                    "encoder.blocks.{}.attn.query.weight",
+                    case.layers - 1
+                )),
+                "{} missing final encoder layer",
+                case.name
+            );
+            assert!(
+                names.contains(&format!(
+                    "decoder.blocks.{}.cross_attn.value.weight",
+                    case.layers - 1
+                )),
+                "{} missing final decoder cross-attention layer",
+                case.name
+            );
+            assert!(
+                !names.contains(&format!("encoder.blocks.{}.attn.query.weight", case.layers)),
+                "{} included a layer past the configured encoder depth",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_synthetic_manifests_for_non_tiny_openai_sizes() {
+        for &case in KNOWN_OPENAI_SIZE_CASES
+            .iter()
+            .filter(|case| case.name != "tiny")
+        {
+            let cfg = openai_size_config(case);
+            let names = required_whisper_tensor_names(&cfg);
+            let manifest = manifest_with(&names, |name| shape_of(name, &cfg));
+
+            validate_whisper_tensors(&manifest, &cfg, None).unwrap_or_else(|err| {
+                panic!(
+                    "{} synthetic manifest should validate without loading payloads: {err:?}",
+                    case.name
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn validate_rejects_tiny_state_tensor_shape_for_base_config_before_compute() {
+        let cfg = openai_size_config(WhisperSizeCase {
+            name: "base",
+            state: 512,
+            heads: 8,
+            layers: 6,
+        });
+        let bad = "encoder.conv1.weight".to_string();
+        let names = required_whisper_tensor_names(&cfg);
+        let manifest = manifest_with(&names, |name| {
+            if name == bad {
+                vec![384, cfg.mel_bins, CONV_KERNEL_WIDTH]
+            } else {
+                shape_of(name, &cfg)
+            }
+        });
+
+        let err = validate_whisper_tensors(&manifest, &cfg, None)
+            .expect_err("tiny-shaped tensor must be rejected for base config");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some(bad.as_str()));
+                assert!(invalid.message.contains("expected"));
+            }
+            other => panic!("expected InvalidModel, got {other:?}"),
         }
     }
 

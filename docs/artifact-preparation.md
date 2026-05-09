@@ -156,6 +156,29 @@ uses HF/Burn-style tensor names instead of the canonical `encoder.*` /
 `decoder.*` names, keep the manifest for a follow-up adapter task; alias support
 should be added from real manifest evidence, not guessed in advance.
 
+### Additional Whisper Size Directories
+
+W-ASR.14 audits config and tensor-contract compatibility across OpenAI Whisper
+size dimensions without loading large weights or claiming output-token parity
+for every size. If later local-artifact tasks need size-specific bundles, use
+one directory per upstream artifact name:
+
+| Upstream artifact | Local directory |
+| --- | --- |
+| `tiny.en` | `local-artifacts/whisper_tiny_en/` |
+| `base.en` | `local-artifacts/whisper_base_en/` |
+| `small.en` | `local-artifacts/whisper_small_en/` |
+| `medium.en` | `local-artifacts/whisper_medium_en/` |
+| `tiny` | `local-artifacts/whisper_tiny/` |
+| `base` | `local-artifacts/whisper_base/` |
+| `small` | `local-artifacts/whisper_small/` |
+| `medium` | `local-artifacts/whisper_medium/` |
+| `large` | `local-artifacts/whisper_large/` |
+
+The directory name only identifies the artifact family and size. It does not
+expand the current English ASR decode surface, and it does not make non-tiny
+parity part of the default test suite.
+
 ## 5. Keeping Artifacts Out Of Git
 
 `local-artifacts/` is listed in `.gitignore`. This is intentional and
