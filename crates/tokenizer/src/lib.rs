@@ -9,7 +9,9 @@ mod chat_template;
 mod whisper;
 pub use chat_template::{ChatMessage, ChatTemplate};
 pub use whisper::{
-    WhisperDecodeMask, WhisperStartupTokens, WhisperTokenMaskDecision, WhisperTokenRole,
+    WHISPER_TIMESTAMP_STEP_SECONDS, WhisperDecodeMask, WhisperStartupTokens, WhisperTimestampMode,
+    WhisperTimestampedSegment, WhisperTokenMaskDecision, WhisperTokenRole,
+    parse_whisper_timestamped_segments, whisper_english_transcribe_tokens,
     whisper_multilingual_english_transcribe_tokens,
 };
 
