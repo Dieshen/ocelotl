@@ -14,3 +14,6 @@ ocelotl-kernels.workspace = true
 ocelotl-loader.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+ocelotl-tokenizer.workspace = true

@@ -95,8 +95,8 @@ local-artifacts/
       expected_tokens.json
 ```
 
-The default workspace tests do not require this bundle. The W-ASR.5 opt-in
-harness checks it only when explicitly run:
+The default workspace tests do not require this bundle. The W-ASR.5/W-ASR.10
+opt-in harness checks it only when explicitly run:
 
 ```powershell
 cargo test -p ocelotl-models --test whisper_local_artifact_parity -- --ignored
@@ -114,7 +114,9 @@ The harness expects:
   channel, 16,000 Hz, a positive bits-per-sample value, and a non-empty `data`
   chunk.
 - `reference/expected_tokens.json`: the pinned reference token sequence for
-  the sample audio.
+  the sample audio. The sequence must start with the Whisper English
+  transcribe/no-timestamps startup prompt and include at least one generated
+  token after that prompt.
 
 `expected_tokens.json` uses this schema:
 
@@ -132,17 +134,19 @@ The harness expects:
 }
 ```
 
-`expected_token_ids` must be non-empty. `expected_text` is optional for W-ASR.5,
-but if present it must be non-empty. The current ignored harness validates the
-bundle, parses the real config, and checks `model.safetensors` against
-Ocelotl's canonical OpenAI-style Whisper tensor contract. It does not yet prove
-end-to-end real-model token parity because the real Whisper forward adapter is
-still future work. If your converted artifact uses HF/Burn-style tensor names
-instead of the canonical `encoder.*` / `decoder.*` names, keep the manifest for
-the next adapter task; alias support should be added from real manifest
-evidence, not guessed in advance. When that adapter exists, extend the ignored
-test to run the sample audio through Ocelotl and compare exact output tokens
-against `expected_token_ids`.
+`expected_token_ids` must be non-empty, must start with
+`[50258, 50259, 50359, 50363]`, and must include at least one generated token
+after that prompt. `expected_text` is optional for W-ASR.5/W-ASR.10, but if
+present it must be non-empty. The current ignored harness validates the bundle,
+parses the real config, checks `model.safetensors` against Ocelotl's canonical
+OpenAI-style Whisper tensor contract, loads every required tensor, preprocesses
+`sample_16khz_mono.wav` through Ocelotl's log-mel path, runs
+`WhisperModel::forward_next_token_logits` autoregressively with the
+Whisper no-timestamps decode mask, and compares exact generated token IDs
+against `expected_token_ids`. If your converted artifact uses HF/Burn-style
+tensor names instead of the canonical `encoder.*` / `decoder.*` names, keep the
+manifest for a follow-up adapter task; alias support should be added from real
+manifest evidence, not guessed in advance.
 
 ## 5. Keeping Artifacts Out Of Git
 
