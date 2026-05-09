@@ -1,8 +1,8 @@
 //! Real Whisper configuration contract.
 //!
 //! `WhisperTinyConfig` remains the W-ASR.4 synthetic fixture shape. This module
-//! owns the real Whisper tiny.en-shaped configuration that later adapter work
-//! can consume before any tensor values are loaded or model compute starts.
+//! owns the real Whisper model-family configuration that adapter work can
+//! consume before any tensor values are loaded or model compute starts.
 
 use ocelotl_core::{DType, InvalidModelError, OcelotlError, Result, UnsupportedError};
 use serde::Deserialize;
@@ -120,10 +120,11 @@ impl WhisperConfig {
 
 /// Parse a Hugging Face-style or Ocelotl/OpenAI-style Whisper `config.json`.
 ///
-/// The first real target is tiny.en. HF exposes names like `d_model` and
-/// `max_source_positions`; OpenAI checkpoints describe the same shape with
-/// `n_audio_state`, `n_text_ctx`, and related fields. This parser accepts both
-/// JSON shapes and returns one validated Ocelotl-owned `WhisperConfig`.
+/// The first real parity artifact is tiny.en, but the config contract is not
+/// tiny-only. HF exposes names like `d_model` and `max_source_positions`;
+/// OpenAI checkpoints describe the same shape with `n_audio_state`,
+/// `n_text_ctx`, and related fields. This parser accepts both JSON shapes and
+/// returns one validated Ocelotl-owned `WhisperConfig`.
 pub fn parse_whisper_config_json(raw: &str) -> Result<WhisperConfig> {
     let parsed: RawWhisperConfig = serde_json::from_str(raw).map_err(|source| {
         OcelotlError::from(InvalidModelError {
@@ -291,6 +292,168 @@ fn default_tie_word_embeddings() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    struct WhisperSizeCase {
+        name: &'static str,
+        state: usize,
+        heads: usize,
+        layers: usize,
+    }
+
+    const KNOWN_OPENAI_SIZE_CASES: &[WhisperSizeCase] = &[
+        WhisperSizeCase {
+            name: "tiny",
+            state: 384,
+            heads: 6,
+            layers: 4,
+        },
+        WhisperSizeCase {
+            name: "base",
+            state: 512,
+            heads: 8,
+            layers: 6,
+        },
+        WhisperSizeCase {
+            name: "small",
+            state: 768,
+            heads: 12,
+            layers: 12,
+        },
+        WhisperSizeCase {
+            name: "medium",
+            state: 1_024,
+            heads: 16,
+            layers: 24,
+        },
+        WhisperSizeCase {
+            name: "large",
+            state: 1_280,
+            heads: 20,
+            layers: 32,
+        },
+    ];
+
+    impl WhisperSizeCase {
+        fn ffn(self) -> usize {
+            self.state * 4
+        }
+
+        fn openai_style_json(self) -> String {
+            format!(
+                r#"{{
+                  "model_type": "whisper",
+                  "n_vocab": 51865,
+                  "n_mels": 80,
+                  "n_audio_ctx": 1500,
+                  "n_audio_state": {state},
+                  "n_audio_head": {heads},
+                  "n_audio_layer": {layers},
+                  "n_text_ctx": 448,
+                  "n_text_state": {state},
+                  "n_text_head": {heads},
+                  "n_text_layer": {layers},
+                  "torch_dtype": "float16"
+                }}"#,
+                state = self.state,
+                heads = self.heads,
+                layers = self.layers,
+            )
+        }
+
+        fn hf_style_json(self) -> String {
+            format!(
+                r#"{{
+                  "model_type": "whisper",
+                  "vocab_size": 51865,
+                  "num_mel_bins": 80,
+                  "d_model": {state},
+                  "encoder_layers": {layers},
+                  "encoder_attention_heads": {heads},
+                  "encoder_ffn_dim": {ffn},
+                  "decoder_layers": {layers},
+                  "decoder_attention_heads": {heads},
+                  "decoder_ffn_dim": {ffn},
+                  "max_source_positions": 1500,
+                  "max_target_positions": 448,
+                  "torch_dtype": "bfloat16",
+                  "tie_word_embeddings": true
+                }}"#,
+                state = self.state,
+                heads = self.heads,
+                layers = self.layers,
+                ffn = self.ffn(),
+            )
+        }
+    }
+
+    fn assert_known_size_config(cfg: &WhisperConfig, case: WhisperSizeCase, dtype: DType) {
+        assert_eq!(cfg.vocab_size, 51_865, "{}", case.name);
+        assert_eq!(cfg.mel_bins, 80, "{}", case.name);
+        assert_eq!(cfg.audio_context_length, 1_500, "{}", case.name);
+        assert_eq!(cfg.audio_state_size, case.state, "{}", case.name);
+        assert_eq!(cfg.audio_attention_heads, case.heads, "{}", case.name);
+        assert_eq!(cfg.audio_layers, case.layers, "{}", case.name);
+        assert_eq!(cfg.audio_ffn_size, case.ffn(), "{}", case.name);
+        assert_eq!(cfg.text_context_length, 448, "{}", case.name);
+        assert_eq!(cfg.text_state_size, case.state, "{}", case.name);
+        assert_eq!(cfg.text_attention_heads, case.heads, "{}", case.name);
+        assert_eq!(cfg.text_layers, case.layers, "{}", case.name);
+        assert_eq!(cfg.text_ffn_size, case.ffn(), "{}", case.name);
+        assert_eq!(cfg.dtype, dtype, "{}", case.name);
+        assert!(cfg.tie_word_embeddings, "{}", case.name);
+    }
+
+    #[test]
+    fn parses_known_openai_whisper_size_dimensions() {
+        for &case in KNOWN_OPENAI_SIZE_CASES {
+            let cfg = parse_whisper_config_json(&case.openai_style_json()).unwrap_or_else(|err| {
+                panic!("{} OpenAI-style config must parse: {err:?}", case.name)
+            });
+
+            assert_known_size_config(&cfg, case, DType::F16);
+        }
+    }
+
+    #[test]
+    fn parses_non_tiny_hf_whisper_size_dimensions() {
+        for &case in KNOWN_OPENAI_SIZE_CASES
+            .iter()
+            .filter(|case| case.name != "tiny")
+        {
+            let cfg = parse_whisper_config_json(&case.hf_style_json())
+                .unwrap_or_else(|err| panic!("{} HF-style config must parse: {err:?}", case.name));
+
+            assert_known_size_config(&cfg, case, DType::BF16);
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_audio_context_before_compute() {
+        let err = parse_whisper_config_json(
+            r#"{
+              "model_type": "whisper",
+              "n_vocab": 51865,
+              "n_mels": 80,
+              "n_audio_ctx": 3001,
+              "n_audio_state": 1280,
+              "n_audio_head": 20,
+              "n_audio_layer": 32,
+              "n_text_ctx": 448,
+              "n_text_state": 1280,
+              "n_text_head": 20,
+              "n_text_layer": 32
+            }"#,
+        )
+        .expect_err("unsupported audio context growth must fail before compute");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("audio_context_length"));
+            }
+            other => panic!("expected InvalidModel, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parses_hf_tiny_en_config_shape() {
