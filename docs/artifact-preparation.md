@@ -93,6 +93,7 @@ local-artifacts/
     reference/
       sample_16khz_mono.wav
       expected_tokens.json
+      expected_tokens_timestamped.json   # optional, W-ASR.15+
 ```
 
 The default workspace tests do not require this bundle. The W-ASR.5/W-ASR.10
@@ -117,8 +118,12 @@ The harness expects:
   the sample audio. The sequence must start with the no-timestamps startup
   prompt appropriate to the artifact's tokenizer/model family and include at
   least one generated token after that prompt.
+- `reference/expected_tokens_timestamped.json`: optional pinned timestamped
+  token sequence for the same sample audio. If present, it uses the same schema
+  with `timestamps: true`, timestamp boundary token IDs in
+  `expected_token_ids`, and deterministic `expected_segments` entries.
 
-`expected_tokens.json` uses this schema:
+`expected_tokens.json` uses this no-timestamps schema:
 
 ```json
 {
@@ -138,6 +143,35 @@ The harness expects:
 token after the startup prompt. `expected_text` is optional for W-ASR.5/W-ASR.10,
 but if present it must be non-empty.
 
+`expected_tokens_timestamped.json`, when present, uses the same base fields but
+sets `timestamps` to `true`, omits the no-timestamps prompt token, and includes
+`expected_segments`:
+
+```json
+{
+  "fixture_version": 1,
+  "name": "whisper_tiny_en_sample_16khz_mono_timestamped",
+  "source": "describe the timestamp reference command used to capture this",
+  "audio": "reference/sample_16khz_mono.wav",
+  "task": "transcribe",
+  "language": "en",
+  "timestamps": true,
+  "expected_token_ids": [50257, 50373, 42, 50388, 50256],
+  "expected_segments": [
+    {
+      "start_seconds": 0.2,
+      "end_seconds": 0.5,
+      "text_token_ids": [42]
+    }
+  ],
+  "expected_text": "optional transcript text"
+}
+```
+
+The timestamped harness parses `expected_token_ids` with
+`ocelotl-tokenizer`'s public timestamp segment policy and rejects
+`expected_segments` that do not exactly match the boundary tokens.
+
 Current supported startup variants are derived from `config.json`:
 
 | Artifact family | Condition | Required no-timestamps startup prompt | EOT | First timestamp |
@@ -145,16 +179,28 @@ Current supported startup variants are derived from `config.json`:
 | OpenAI English-only Whisper | `vocab_size < 51865` | `[50257, 50362]` | `50256` | `50363` |
 | OpenAI multilingual Whisper, English transcribe | `vocab_size >= 51865` | `[50258, 50259, 50359, 50363]` | `50257` | `50364` |
 
+For timestamped references, the same family detection applies, but
+`<|notimestamps|>` is omitted from the startup prompt:
+
+| Artifact family | Required timestamped startup prompt |
+| --- | --- |
+| OpenAI English-only Whisper | `[50257]` |
+| OpenAI multilingual Whisper, English transcribe | `[50258, 50259, 50359]` |
+
 The current ignored harness validates the bundle, parses the real config,
 checks `model.safetensors` against Ocelotl's canonical OpenAI-style Whisper
 tensor contract, loads every required tensor, preprocesses
 `sample_16khz_mono.wav` through Ocelotl's log-mel path, runs
 `WhisperModel::forward_next_token_logits` autoregressively with the
 family-appropriate Whisper no-timestamps decode mask, and compares exact
-generated token IDs against `expected_token_ids`. If your converted artifact
-uses HF/Burn-style tensor names instead of the canonical `encoder.*` /
-`decoder.*` names, keep the manifest for a follow-up adapter task; alias support
-should be added from real manifest evidence, not guessed in advance.
+generated token IDs against `expected_token_ids`. The W-ASR.15 timestamped
+ignored test is opt-in on top of that bundle: it returns early with a clear
+message when `reference/expected_tokens_timestamped.json` is absent, and when
+present runs with timestamp tokens enabled and compares both exact token IDs
+and parsed segment boundaries. If your converted artifact uses HF/Burn-style
+tensor names instead of the canonical `encoder.*` / `decoder.*` names, keep the
+manifest for a follow-up adapter task; alias support should be added from real
+manifest evidence, not guessed in advance.
 
 ### Additional Whisper Size Directories
 

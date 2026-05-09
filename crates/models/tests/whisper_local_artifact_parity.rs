@@ -29,7 +29,8 @@ use ocelotl_models::whisper::{
     parse_whisper_config_json, required_whisper_tensor_names, validate_whisper_tensors,
 };
 use ocelotl_tokenizer::{
-    WhisperDecodeMask, WhisperStartupTokens, WhisperTokenMaskDecision,
+    WhisperDecodeMask, WhisperStartupTokens, WhisperTimestampMode, WhisperTimestampedSegment,
+    WhisperTokenMaskDecision, parse_whisper_timestamped_segments,
     whisper_multilingual_english_transcribe_tokens,
 };
 use serde::Deserialize;
@@ -41,6 +42,7 @@ const TOKENIZER_JSON: &str = "tokenizer.json";
 const MODEL_SAFETENSORS: &str = "model.safetensors";
 const REFERENCE_AUDIO: &str = "reference/sample_16khz_mono.wav";
 const EXPECTED_TOKENS_JSON: &str = "reference/expected_tokens.json";
+const TIMESTAMPED_EXPECTED_TOKENS_JSON: &str = "reference/expected_tokens_timestamped.json";
 const EXPECTED_AUDIO_FIELD: &str = "reference/sample_16khz_mono.wav";
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +57,15 @@ struct ExpectedTokens {
     expected_token_ids: Vec<u32>,
     #[serde(default)]
     expected_text: Option<String>,
+    #[serde(default)]
+    expected_segments: Vec<ExpectedTimestampedSegment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedTimestampedSegment {
+    start_seconds: f32,
+    end_seconds: f32,
+    text_token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,13 +132,11 @@ impl WhisperArtifactDecodePolicy {
         }
     }
 
-    fn startup_prompt(self) -> Vec<TokenId> {
+    fn startup_prompt(self, mode: WhisperTimestampMode) -> Vec<TokenId> {
         match self.family {
-            WhisperArtifactTokenizerFamily::Multilingual => {
-                self.tokens.transcribe_no_timestamps_prompt()
-            }
+            WhisperArtifactTokenizerFamily::Multilingual => self.tokens.transcribe_prompt(mode),
             WhisperArtifactTokenizerFamily::EnglishOnly => {
-                vec![self.tokens.start_of_transcript, self.tokens.no_timestamps]
+                self.tokens.english_transcribe_prompt(mode)
             }
         }
     }
@@ -244,7 +253,7 @@ fn decode_policy_uses_english_only_prompt_below_openai_multilingual_threshold() 
 
     assert_eq!(policy.family, WhisperArtifactTokenizerFamily::EnglishOnly);
     assert_eq!(
-        policy.startup_prompt(),
+        policy.startup_prompt(WhisperTimestampMode::NoTimestamps),
         vec![TokenId(50_257), TokenId(50_362)]
     );
     assert_eq!(policy.tokens.end_of_text, TokenId(50_256));
@@ -260,7 +269,7 @@ fn decode_policy_uses_multilingual_prompt_at_openai_multilingual_threshold() {
 
     assert_eq!(policy.family, WhisperArtifactTokenizerFamily::Multilingual);
     assert_eq!(
-        policy.startup_prompt(),
+        policy.startup_prompt(WhisperTimestampMode::NoTimestamps),
         vec![
             TokenId(50_258),
             TokenId(50_259),
@@ -270,6 +279,72 @@ fn decode_policy_uses_multilingual_prompt_at_openai_multilingual_threshold() {
     );
     assert_eq!(policy.tokens.end_of_text, TokenId(50_257));
     assert_eq!(policy.tokens.first_timestamp, TokenId(50_364));
+}
+
+#[test]
+fn timestamped_expected_tokens_schema_accepts_segments_for_english_only() {
+    let fixture = parse_expected_tokens(
+        r#"{
+          "fixture_version": 1,
+          "name": "whisper_tiny_en_sample_16khz_mono_timestamped",
+          "source": "local whisper_tiny_en timestamp reference",
+          "audio": "reference/sample_16khz_mono.wav",
+          "task": "transcribe",
+          "language": "en",
+          "timestamps": true,
+          "expected_token_ids": [50257, 50373, 42, 43, 50388, 50256],
+          "expected_segments": [
+            {
+              "start_seconds": 0.20,
+              "end_seconds": 0.50,
+              "text_token_ids": [42, 43]
+            }
+          ],
+          "expected_text": "hello"
+        }"#,
+    );
+
+    let policy = WhisperArtifactDecodePolicy::english_only();
+
+    validate_expected_tokens(&fixture);
+    validate_expected_tokens_for_policy(&fixture, policy);
+    let segments = expected_timestamped_segments(&fixture, policy);
+
+    assert_eq!(segments.len(), 1);
+    assert_seconds(segments[0].start_seconds, 0.20);
+    assert_seconds(segments[0].end_seconds, 0.50);
+    assert_eq!(segments[0].text_tokens, vec![TokenId(42), TokenId(43)]);
+}
+
+#[test]
+fn timestamped_expected_tokens_schema_rejects_mismatched_segments() {
+    let fixture = parse_expected_tokens(
+        r#"{
+          "fixture_version": 1,
+          "name": "whisper_tiny_en_sample_16khz_mono_timestamped",
+          "source": "local whisper_tiny_en timestamp reference",
+          "audio": "reference/sample_16khz_mono.wav",
+          "task": "transcribe",
+          "language": "en",
+          "timestamps": true,
+          "expected_token_ids": [50257, 50373, 42, 50388, 50256],
+          "expected_segments": [
+            {
+              "start_seconds": 0.20,
+              "end_seconds": 0.52,
+              "text_token_ids": [42]
+            }
+          ]
+        }"#,
+    );
+
+    let err = validate_expected_tokens_for_policy_result(
+        &fixture,
+        WhisperArtifactDecodePolicy::english_only(),
+    )
+    .expect_err("mismatched timestamp segment boundary must be rejected");
+
+    assert!(err.contains("expected_segments"));
 }
 
 #[test]
@@ -480,11 +555,127 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
         )
     });
 
-    let generated =
-        generate_tokens_to_expected_length(&model, &mel, expected_token_ids.len(), decode_policy);
+    let generated = generate_tokens_to_expected_length(
+        &model,
+        &mel,
+        expected_token_ids.len(),
+        decode_policy,
+        WhisperTimestampMode::NoTimestamps,
+    );
     assert_eq!(
         generated, expected_token_ids,
         "generated Whisper token IDs must exactly match reference/expected_tokens.json",
+    );
+}
+
+#[test]
+#[ignore = "requires local-artifacts/whisper_tiny_en/reference/expected_tokens_timestamped.json plus the W-ASR.10 tiny.en bundle; see docs/artifact-preparation.md"]
+fn local_whisper_tiny_en_timestamped_artifact_contract_is_well_formed() {
+    let expected_path = repo_artifact_path(TIMESTAMPED_EXPECTED_TOKENS_JSON);
+    if !expected_path.exists() {
+        eprintln!(
+            "skipping timestamped Whisper local parity: missing optional reference at {}; see docs/artifact-preparation.md",
+            expected_path.display()
+        );
+        return;
+    }
+
+    for relative in required_artifacts() {
+        let path = repo_artifact_path(relative);
+        assert!(
+            path.exists(),
+            "timestamped parity reference exists, but missing required base artifact at {} - expected {} under {}; see docs/artifact-preparation.md",
+            path.display(),
+            relative,
+            LOCAL_ARTIFACT_DIR,
+        );
+    }
+
+    let config_path = repo_artifact_path(CONFIG_JSON);
+    let config_raw = std::fs::read_to_string(&config_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read config.json at {} - {err}",
+            config_path.display()
+        )
+    });
+    let whisper_config = parse_whisper_config_json(&config_raw).unwrap_or_else(|err| {
+        panic!(
+            "invalid Whisper config contract at {} - {err:?}",
+            config_path.display()
+        )
+    });
+    let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
+
+    let expected = parse_expected_tokens_file(&expected_path);
+    validate_expected_tokens(&expected);
+    validate_expected_tokens_for_policy(&expected, decode_policy);
+    let expected_token_ids = expected_token_ids(&expected);
+    let expected_segments = expected_timestamped_segments(&expected, decode_policy);
+    assert!(
+        !expected_segments.is_empty(),
+        "timestamped reference at {} must include at least one expected segment",
+        expected_path.display(),
+    );
+
+    let tokenizer_path = repo_artifact_path(TOKENIZER_JSON);
+    assert_json_object(&tokenizer_path, "tokenizer.json");
+
+    let model_path = repo_artifact_path(MODEL_SAFETENSORS);
+    let manifest = inspect_safetensors(&model_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to inspect safetensors header at {} - {err:?}",
+            model_path.display()
+        )
+    });
+    validate_whisper_tensors(&manifest, &whisper_config, Some(&model_path)).unwrap_or_else(|err| {
+        panic!(
+            "model.safetensors at {} does not match the Whisper tensor contract - {err:?}",
+            model_path.display()
+        )
+    });
+
+    let audio_path = repo_artifact_path(REFERENCE_AUDIO);
+    let wav_audio = read_wav_mono_samples(&audio_path);
+    assert_eq!(wav_audio.metadata.sample_rate_hz, 16_000);
+    assert_eq!(wav_audio.metadata.channels, 1);
+
+    let mel = log_mel_spectrogram(
+        &wav_audio.samples,
+        AudioMetadata {
+            sample_rate_hz: wav_audio.metadata.sample_rate_hz,
+            channels: wav_audio.metadata.channels,
+        },
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "failed to compute Whisper log-mel spectrogram for {} - {err:?}",
+            audio_path.display()
+        )
+    });
+
+    let loaded_tensors = load_required_whisper_tensors(&model_path, &whisper_config);
+    let model = WhisperModel::new(whisper_config, loaded_tensors).unwrap_or_else(|err| {
+        panic!(
+            "failed to construct WhisperModel from loaded tensors at {} - {err:?}",
+            model_path.display()
+        )
+    });
+
+    let generated = generate_tokens_to_expected_length(
+        &model,
+        &mel,
+        expected_token_ids.len(),
+        decode_policy,
+        WhisperTimestampMode::Timestamps,
+    );
+    assert_eq!(
+        generated, expected_token_ids,
+        "generated timestamped Whisper token IDs must exactly match reference/expected_tokens_timestamped.json",
+    );
+    assert_eq!(
+        expected_timestamped_segments_for_tokens(&generated, &expected, decode_policy),
+        expected_segments,
+        "generated timestamped Whisper segments must exactly match expected_segments",
     );
 }
 
@@ -560,9 +751,6 @@ fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), Strin
             fixture.language
         ));
     }
-    if fixture.timestamps {
-        return Err("timestamps must be false for the W-ASR.10 parity fixture".to_string());
-    }
     if fixture.expected_token_ids.is_empty() {
         return Err("expected_token_ids must be non-empty".to_string());
     }
@@ -571,6 +759,12 @@ fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), Strin
             return Err("expected_text must be non-empty when present".to_string());
         }
     }
+    if !fixture.timestamps && !fixture.expected_segments.is_empty() {
+        return Err("expected_segments must be empty when timestamps is false".to_string());
+    }
+    if fixture.timestamps && fixture.expected_segments.is_empty() {
+        return Err("expected_segments must be non-empty when timestamps is true".to_string());
+    }
     Ok(())
 }
 
@@ -578,10 +772,15 @@ fn validate_expected_tokens_for_policy_result(
     fixture: &ExpectedTokens,
     policy: WhisperArtifactDecodePolicy,
 ) -> Result<(), String> {
-    let startup_prompt = startup_prompt_ids(policy);
+    let mode = if fixture.timestamps {
+        WhisperTimestampMode::Timestamps
+    } else {
+        WhisperTimestampMode::NoTimestamps
+    };
+    let startup_prompt = startup_prompt_ids(policy, mode);
     if !fixture.expected_token_ids.starts_with(&startup_prompt) {
         return Err(format!(
-            "expected_token_ids must start with the {} no-timestamps startup prompt {:?}",
+            "expected_token_ids must start with the {} {mode:?} startup prompt {:?}",
             policy.label(),
             startup_prompt
         ));
@@ -592,12 +791,23 @@ fn validate_expected_tokens_for_policy_result(
                 .to_string(),
         );
     }
+    if fixture.timestamps {
+        validate_expected_timestamped_segments(fixture, policy)?;
+    } else if fixture
+        .expected_token_ids
+        .iter()
+        .any(|&token| token >= policy.tokens.first_timestamp.0)
+    {
+        return Err(
+            "no-timestamps expected_token_ids must not contain timestamp tokens".to_string(),
+        );
+    }
     Ok(())
 }
 
-fn startup_prompt_ids(policy: WhisperArtifactDecodePolicy) -> Vec<u32> {
+fn startup_prompt_ids(policy: WhisperArtifactDecodePolicy, mode: WhisperTimestampMode) -> Vec<u32> {
     policy
-        .startup_prompt()
+        .startup_prompt(mode)
         .into_iter()
         .map(|token| token.0)
         .collect()
@@ -613,7 +823,7 @@ fn expected_token_ids(fixture: &ExpectedTokens) -> Vec<TokenId> {
 }
 
 fn assert_startup_prompt(expected_token_ids: &[TokenId], policy: WhisperArtifactDecodePolicy) {
-    let startup_prompt = policy.startup_prompt();
+    let startup_prompt = policy.startup_prompt(WhisperTimestampMode::NoTimestamps);
     assert!(
         expected_token_ids.starts_with(&startup_prompt),
         "expected_tokens.json must start with {} no-timestamps prompt {:?}, got prefix {:?}",
@@ -621,6 +831,91 @@ fn assert_startup_prompt(expected_token_ids: &[TokenId], policy: WhisperArtifact
         startup_prompt,
         &expected_token_ids[..expected_token_ids.len().min(startup_prompt.len())],
     );
+}
+
+fn expected_timestamped_segments(
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) -> Vec<WhisperTimestampedSegment> {
+    validate_expected_timestamped_segments(fixture, policy)
+        .unwrap_or_else(|err| panic!("invalid timestamped expected_tokens contract - {err}"))
+}
+
+fn validate_expected_timestamped_segments(
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) -> Result<Vec<WhisperTimestampedSegment>, String> {
+    expected_timestamped_segments_for_token_ids(&expected_token_ids(fixture), fixture, policy)
+}
+
+fn expected_timestamped_segments_for_tokens(
+    token_ids: &[TokenId],
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) -> Vec<WhisperTimestampedSegment> {
+    expected_timestamped_segments_for_token_ids(token_ids, fixture, policy)
+        .unwrap_or_else(|err| panic!("invalid generated timestamped segments - {err}"))
+}
+
+fn expected_timestamped_segments_for_token_ids(
+    token_ids: &[TokenId],
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) -> Result<Vec<WhisperTimestampedSegment>, String> {
+    let startup_len = policy
+        .startup_prompt(WhisperTimestampMode::Timestamps)
+        .len();
+    let generated_suffix = token_ids.get(startup_len..).ok_or_else(|| {
+        "expected_token_ids are shorter than timestamp startup prompt".to_string()
+    })?;
+    let parsed = parse_whisper_timestamped_segments(policy.tokens, generated_suffix)
+        .map_err(|err| format!("failed to parse timestamped expected_token_ids - {err}"))?;
+
+    if parsed.len() != fixture.expected_segments.len() {
+        return Err(format!(
+            "expected_segments length must be {}, got {}",
+            parsed.len(),
+            fixture.expected_segments.len()
+        ));
+    }
+
+    for (idx, (actual, expected)) in parsed.iter().zip(&fixture.expected_segments).enumerate() {
+        assert_segment_matches(idx, actual, expected)?;
+    }
+
+    Ok(parsed)
+}
+
+fn assert_segment_matches(
+    idx: usize,
+    actual: &WhisperTimestampedSegment,
+    expected: &ExpectedTimestampedSegment,
+) -> Result<(), String> {
+    if (actual.start_seconds - expected.start_seconds).abs() > f32::EPSILON {
+        return Err(format!(
+            "expected_segments[{idx}].start_seconds must be {:.2}, got {:.2}",
+            actual.start_seconds, expected.start_seconds
+        ));
+    }
+    if (actual.end_seconds - expected.end_seconds).abs() > f32::EPSILON {
+        return Err(format!(
+            "expected_segments[{idx}].end_seconds must be {:.2}, got {:.2}",
+            actual.end_seconds, expected.end_seconds
+        ));
+    }
+    let expected_text_tokens: Vec<TokenId> = expected
+        .text_token_ids
+        .iter()
+        .copied()
+        .map(TokenId)
+        .collect();
+    if actual.text_tokens != expected_text_tokens {
+        return Err(format!(
+            "expected_segments[{idx}].text_token_ids must be {:?}, got {:?}",
+            actual.text_tokens, expected_text_tokens
+        ));
+    }
+    Ok(())
 }
 
 fn load_required_whisper_tensors(path: &Path, config: &WhisperConfig) -> Vec<LoadedTensor> {
@@ -642,9 +937,10 @@ fn generate_tokens_to_expected_length(
     mel: &LogMelSpectrogram,
     expected_len: usize,
     policy: WhisperArtifactDecodePolicy,
+    mode: WhisperTimestampMode,
 ) -> Vec<TokenId> {
-    let mut generated = policy.startup_prompt();
-    let mask = WhisperDecodeMask::transcribe_without_timestamps(policy.tokens);
+    let mut generated = policy.startup_prompt(mode);
+    let mask = WhisperDecodeMask::transcribe(policy.tokens, mode);
 
     while generated.len() < expected_len {
         let logits = model
@@ -887,4 +1183,11 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
             "index {idx}: expected {expected}, got {actual}, delta {delta}"
         );
     }
+}
+
+fn assert_seconds(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() <= f32::EPSILON,
+        "expected {expected:.2}s, got {actual:.2}s"
+    );
 }
