@@ -33,6 +33,9 @@ local-artifacts/
   whisper_cpp/
     whisper-cli.exe
     ggml-tiny.en.bin
+target/
+  release/
+    ocelotl.exe
 ```
 
 Prepare `local-artifacts/whisper_tiny_en/` as described in
@@ -48,6 +51,12 @@ for text output; see the official whisper.cpp
 Ocelotl keeps those paths local and ignored instead of adding download steps to
 default validation.
 
+Build the dedicated Ocelotl timing hook before running a real benchmark:
+
+```powershell
+cargo build --release
+```
+
 ## Manifest
 
 The default manifest fixture is:
@@ -61,20 +70,26 @@ It names:
 - `model_path`: the Ocelotl safetensors model path.
 - `audio_path`: the shared WAV input path.
 - `threads`: the thread count passed to whisper.cpp.
-- `ocelotl.command`: the current Ocelotl command shape.
+- `ocelotl.command`: the dedicated Ocelotl transcription timing hook.
+- `ocelotl.required_inputs`: the local Ocelotl artifact files checked before
+  invoking the hook.
 - `whisper_cpp.binary`: the whisper.cpp executable to check before running.
 - `whisper_cpp.command`: the exact whisper.cpp invocation.
 
-The current Ocelotl command is a bootstrap command that runs the ignored
-W-ASR.10 local-artifact parity harness in release mode:
+The Ocelotl side now runs a dedicated binary hook outside the Rust test harness:
 
 ```powershell
-cargo test -p ocelotl-models --release --test whisper_local_artifact_parity local_whisper_tiny_en_artifact_contract_is_well_formed -- --ignored --nocapture --exact
+target/release/ocelotl.exe bench-whisper-transcribe `
+  --config-path local-artifacts/whisper_tiny_en/config.json `
+  --model-path local-artifacts/whisper_tiny_en/model.safetensors `
+  --audio-path local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav `
+  --expected-tokens-path local-artifacts/whisper_tiny_en/reference/expected_tokens.json
 ```
 
-This includes Rust test harness overhead and is not a final throughput surface.
-When Ocelotl gets a dedicated transcription CLI or timing hook, update the
-manifest, fixture test, and this doc in the same patch.
+The hook loads the Ocelotl safetensors bundle, decodes the shared WAV input,
+runs the current no-timestamps transcription path to the expected token length,
+and prints a JSON summary. It is a timing hook for local comparison, not a
+throughput-optimized public transcription CLI.
 
 The whisper.cpp side of the example manifest runs:
 
@@ -117,6 +132,11 @@ The committed fixture
 shape so missing local whisper.cpp installs produce an actionable remediation
 instead of a vague command failure.
 
+If whisper.cpp is present but the Ocelotl release binary or Ocelotl local
+artifacts are missing, the runner also emits a skipped record with a
+`skip_reason` naming the missing path and the remediation. Missing local inputs
+are expected on machines that have not prepared `local-artifacts/`.
+
 ## Record Shape
 
 A completed benchmark record names both command lines, both model paths, the
@@ -127,8 +147,8 @@ compare transcripts here as a correctness gate.
 
 ## Current Limits
 
-- Ocelotl's side is still the ignored parity test command, not a production
-  transcription CLI.
+- Ocelotl's side is a narrow benchmark hook, not a production transcription
+  CLI.
 - The Ocelotl and whisper.cpp model files use different on-disk formats, so the
   manifest must name both paths even when they represent the same tiny.en model.
 - The harness records wall-clock command time only. It does not separate model

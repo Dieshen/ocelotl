@@ -49,7 +49,12 @@ categories = ["science", "api-bindings"]
 
 [dependencies]
 ocelotl-core.workspace = true
+ocelotl-loader.workspace = true
+ocelotl-models.workspace = true
 ocelotl-runtime.workspace = true
+ocelotl-tokenizer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "ocelotl"

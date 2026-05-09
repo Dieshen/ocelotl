@@ -23,6 +23,8 @@ struct BenchmarkCommand {
     command: Vec<String>,
     model_path: String,
     audio_path: String,
+    #[serde(default)]
+    required_inputs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,11 +85,48 @@ fn whisper_cpp_benchmark_manifest_names_commands_inputs_and_threads() {
         &manifest.model_path,
         &manifest.audio_path,
     );
+    assert_eq!(
+        manifest.ocelotl.command[0], "target/release/ocelotl.exe",
+        "Ocelotl benchmark command must name the dedicated timing hook binary, not cargo test"
+    );
+    assert!(
+        manifest
+            .ocelotl
+            .command
+            .iter()
+            .any(|arg| arg == "bench-whisper-transcribe"),
+        "Ocelotl benchmark command must use the dedicated transcription timing hook"
+    );
+    assert!(
+        !manifest
+            .ocelotl
+            .command
+            .windows(2)
+            .any(|args| args == ["cargo", "test"]),
+        "Ocelotl benchmark command must not time the Rust test harness"
+    );
+    assert!(
+        manifest
+            .ocelotl
+            .required_inputs
+            .iter()
+            .any(|path| path == "local-artifacts/whisper_tiny_en/config.json"),
+        "Ocelotl benchmark command must declare the local config artifact it needs"
+    );
+    assert!(
+        manifest
+            .ocelotl
+            .required_inputs
+            .iter()
+            .any(|path| path == "local-artifacts/whisper_tiny_en/reference/expected_tokens.json"),
+        "Ocelotl benchmark command must declare the local expected-token artifact it needs"
+    );
     assert_command_shape(
         &BenchmarkCommand {
             command: manifest.whisper_cpp.command.clone(),
             model_path: manifest.whisper_cpp.model_path.clone(),
             audio_path: manifest.whisper_cpp.audio_path.clone(),
+            required_inputs: Vec::new(),
         },
         "local-artifacts/whisper_cpp/ggml-tiny.en.bin",
         &manifest.audio_path,
