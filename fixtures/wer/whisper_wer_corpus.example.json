@@ -1,0 +1,25 @@
+{
+  "fixture_version": 1,
+  "name": "whisper_tiny_en_local_wer_corpus",
+  "description": "Opt-in local WER corpus manifest for Whisper tiny.en. Default tests validate this schema only; ignored tests skip when local artifacts are absent.",
+  "model_dir": "local-artifacts/whisper_tiny_en",
+  "config_path": "local-artifacts/whisper_tiny_en/config.json",
+  "tokenizer_path": "local-artifacts/whisper_tiny_en/tokenizer.json",
+  "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
+  "skip_when_missing": true,
+  "max_new_tokens": 64,
+  "cases": [
+    {
+      "id": "sample_16khz_mono",
+      "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
+      "expected_transcript": "hello",
+      "expected_token_path": "local-artifacts/whisper_tiny_en/reference/expected_tokens.json"
+    },
+    {
+      "id": "optional_second_sample",
+      "audio_path": "local-artifacts/whisper_tiny_en/corpus/optional_second_sample.wav",
+      "expected_transcript": "the quick brown fox",
+      "skip_when_missing": true
+    }
+  ]
+}
