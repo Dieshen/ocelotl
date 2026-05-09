@@ -48,6 +48,19 @@ function Get-CommandArray {
     return @($items | ForEach-Object { [string]$_ })
 }
 
+function Get-RequiredInputArray {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Target
+    )
+
+    if ($null -eq $Target.PSObject.Properties["required_inputs"]) {
+        return @()
+    }
+
+    return @($Target.required_inputs | ForEach-Object { [string]$_ })
+}
+
 function New-OutputSummary {
     param([AllowNull()][string]$Stdout)
 
@@ -217,6 +230,7 @@ if ([int]$manifest.threads -lt 1) {
 
 $ocelotlCommand = Get-CommandArray -Target $manifest.ocelotl -Label "ocelotl"
 $whisperCppCommand = Get-CommandArray -Target $manifest.whisper_cpp -Label "whisper.cpp"
+$ocelotlRequiredInputs = Get-RequiredInputArray -Target $manifest.ocelotl
 $threads = [int]$manifest.threads
 
 $plannedOcelotl = New-RunRecord `
@@ -265,11 +279,30 @@ if (-not (Test-Path -LiteralPath $whisperCppBinaryPath -PathType Leaf)) {
     exit 0
 }
 
+$ocelotlBinaryPath = Resolve-RepoPath -Root $repoRoot -Path ([string]$ocelotlCommand[0])
+if (-not (Test-Path -LiteralPath $ocelotlBinaryPath -PathType Leaf)) {
+    $skipReason = "missing Ocelotl benchmark hook at $($ocelotlCommand[0]); build it with cargo build --release, then rerun this benchmark; see docs/benchmarks/whisper-cpp.md"
+    $skippedOcelotl = New-RunRecord `
+        -Command $ocelotlCommand `
+        -ModelPath ([string]$manifest.ocelotl.model_path) `
+        -AudioPath ([string]$manifest.ocelotl.audio_path) `
+        -Threads $threads `
+        -Status "skipped" `
+        -WallTimeMs $null `
+        -ExitCode $null `
+        -Stdout $null `
+        -SkipReason $skipReason
+    $record = New-Record -Manifest $manifest -Status "skipped" -Ocelotl $skippedOcelotl -WhisperCpp $plannedWhisperCpp
+    Write-Record -Record $record -OutputPath $OutputPath
+    exit 0
+}
+
 $requiredInputs = @(
     [string]$manifest.ocelotl.model_path,
     [string]$manifest.ocelotl.audio_path,
     [string]$manifest.whisper_cpp.model_path
 )
+$requiredInputs += $ocelotlRequiredInputs
 foreach ($inputPath in $requiredInputs) {
     $resolved = Resolve-RepoPath -Root $repoRoot -Path $inputPath
     if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
