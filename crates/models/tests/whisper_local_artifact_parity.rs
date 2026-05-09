@@ -1,8 +1,8 @@
-//! W-ASR.5 opt-in local-artifact harness for Whisper tiny.en.
+//! W-ASR.10 opt-in local-artifact harness for Whisper tiny.en.
 //!
 //! The default-on tests in this file validate the harness schema without
-//! touching local artifacts. The ignored test checks the first local bundle
-//! contract:
+//! touching local artifacts. The ignored test checks the local bundle contract
+//! and, when the bundle is present, runs exact output-token parity:
 //!
 //! ```text
 //! local-artifacts/whisper_tiny_en/
@@ -21,10 +21,20 @@
 
 use std::path::{Path, PathBuf};
 
-use ocelotl_loader::inspect_safetensors;
-use ocelotl_models::whisper::{parse_whisper_config_json, validate_whisper_tensors};
+use ocelotl_core::{DType, TokenId};
+use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensor_f32};
+use ocelotl_models::whisper::{
+    WhisperConfig, WhisperModel,
+    audio::{AudioMetadata, LogMelSpectrogram, log_mel_spectrogram},
+    parse_whisper_config_json, required_whisper_tensor_names, validate_whisper_tensors,
+};
+use ocelotl_tokenizer::{
+    WhisperDecodeMask, WhisperStartupTokens, WhisperTokenMaskDecision,
+    whisper_multilingual_english_transcribe_tokens,
+};
 use serde::Deserialize;
 
+const OPENAI_MULTILINGUAL_VOCAB_THRESHOLD: usize = 51_865;
 const LOCAL_ARTIFACT_DIR: &str = "local-artifacts/whisper_tiny_en";
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -53,7 +63,81 @@ struct WavMetadata {
     channels: u16,
     sample_rate_hz: u32,
     bits_per_sample: u16,
-    data_bytes: u32,
+    data_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WavAudio {
+    metadata: WavMetadata,
+    samples: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WavLayout {
+    metadata: WavMetadata,
+    data_offset: usize,
+    data_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhisperArtifactTokenizerFamily {
+    Multilingual,
+    EnglishOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WhisperArtifactDecodePolicy {
+    family: WhisperArtifactTokenizerFamily,
+    tokens: WhisperStartupTokens,
+}
+
+impl WhisperArtifactDecodePolicy {
+    fn for_config(config: &WhisperConfig) -> Self {
+        if config.vocab_size >= OPENAI_MULTILINGUAL_VOCAB_THRESHOLD {
+            Self::multilingual_english()
+        } else {
+            Self::english_only()
+        }
+    }
+
+    fn multilingual_english() -> Self {
+        Self {
+            family: WhisperArtifactTokenizerFamily::Multilingual,
+            tokens: whisper_multilingual_english_transcribe_tokens(),
+        }
+    }
+
+    fn english_only() -> Self {
+        Self {
+            family: WhisperArtifactTokenizerFamily::EnglishOnly,
+            tokens: WhisperStartupTokens {
+                end_of_text: TokenId(50_256),
+                start_of_transcript: TokenId(50_257),
+                language: TokenId(50_258),
+                transcribe_task: TokenId(50_358),
+                no_timestamps: TokenId(50_362),
+                first_timestamp: TokenId(50_363),
+            },
+        }
+    }
+
+    fn startup_prompt(self) -> Vec<TokenId> {
+        match self.family {
+            WhisperArtifactTokenizerFamily::Multilingual => {
+                self.tokens.transcribe_no_timestamps_prompt()
+            }
+            WhisperArtifactTokenizerFamily::EnglishOnly => {
+                vec![self.tokens.start_of_transcript, self.tokens.no_timestamps]
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self.family {
+            WhisperArtifactTokenizerFamily::Multilingual => "multilingual English transcribe",
+            WhisperArtifactTokenizerFamily::EnglishOnly => "English-only transcribe",
+        }
+    }
 }
 
 fn repo_artifact_path(relative: &str) -> PathBuf {
@@ -74,6 +158,25 @@ fn required_artifacts() -> [&'static str; 5] {
     ]
 }
 
+fn tiny_whisper_config() -> WhisperConfig {
+    WhisperConfig {
+        vocab_size: OPENAI_MULTILINGUAL_VOCAB_THRESHOLD - 1,
+        mel_bins: 80,
+        audio_context_length: 1500,
+        audio_state_size: 384,
+        audio_attention_heads: 6,
+        audio_layers: 4,
+        audio_ffn_size: 1536,
+        text_context_length: 448,
+        text_state_size: 384,
+        text_attention_heads: 6,
+        text_layers: 4,
+        text_ffn_size: 1536,
+        dtype: DType::F32,
+        tie_word_embeddings: true,
+    }
+}
+
 #[test]
 fn whisper_local_artifact_contract_lists_exact_required_paths() {
     assert_eq!(LOCAL_ARTIFACT_DIR, "local-artifacts/whisper_tiny_en");
@@ -90,7 +193,7 @@ fn whisper_local_artifact_contract_lists_exact_required_paths() {
 }
 
 #[test]
-fn expected_tokens_schema_accepts_documented_shape() {
+fn expected_tokens_schema_accepts_multilingual_documented_shape() {
     let fixture = parse_expected_tokens(
         r#"{
           "fixture_version": 1,
@@ -106,6 +209,67 @@ fn expected_tokens_schema_accepts_documented_shape() {
     );
 
     validate_expected_tokens(&fixture);
+    validate_expected_tokens_for_policy(
+        &fixture,
+        WhisperArtifactDecodePolicy::multilingual_english(),
+    );
+}
+
+#[test]
+fn expected_tokens_schema_accepts_english_only_documented_shape() {
+    let fixture = parse_expected_tokens(
+        r#"{
+          "fixture_version": 1,
+          "name": "whisper_tiny_en_sample_16khz_mono",
+          "source": "local whisper_tiny_en converter output",
+          "audio": "reference/sample_16khz_mono.wav",
+          "task": "transcribe",
+          "language": "en",
+          "timestamps": false,
+          "expected_token_ids": [50257, 50362, 42, 50256],
+          "expected_text": "hello"
+        }"#,
+    );
+
+    validate_expected_tokens(&fixture);
+    validate_expected_tokens_for_policy(&fixture, WhisperArtifactDecodePolicy::english_only());
+}
+
+#[test]
+fn decode_policy_uses_english_only_prompt_below_openai_multilingual_threshold() {
+    let mut config = tiny_whisper_config();
+    config.vocab_size = OPENAI_MULTILINGUAL_VOCAB_THRESHOLD - 1;
+
+    let policy = WhisperArtifactDecodePolicy::for_config(&config);
+
+    assert_eq!(policy.family, WhisperArtifactTokenizerFamily::EnglishOnly);
+    assert_eq!(
+        policy.startup_prompt(),
+        vec![TokenId(50_257), TokenId(50_362)]
+    );
+    assert_eq!(policy.tokens.end_of_text, TokenId(50_256));
+    assert_eq!(policy.tokens.first_timestamp, TokenId(50_363));
+}
+
+#[test]
+fn decode_policy_uses_multilingual_prompt_at_openai_multilingual_threshold() {
+    let mut config = tiny_whisper_config();
+    config.vocab_size = OPENAI_MULTILINGUAL_VOCAB_THRESHOLD;
+
+    let policy = WhisperArtifactDecodePolicy::for_config(&config);
+
+    assert_eq!(policy.family, WhisperArtifactTokenizerFamily::Multilingual);
+    assert_eq!(
+        policy.startup_prompt(),
+        vec![
+            TokenId(50_258),
+            TokenId(50_259),
+            TokenId(50_359),
+            TokenId(50_363),
+        ]
+    );
+    assert_eq!(policy.tokens.end_of_text, TokenId(50_257));
+    assert_eq!(policy.tokens.first_timestamp, TokenId(50_364));
 }
 
 #[test]
@@ -126,6 +290,81 @@ fn expected_tokens_schema_rejects_empty_reference_sequence() {
     let err = validate_expected_tokens_result(&fixture)
         .expect_err("empty expected_token_ids must be rejected");
     assert!(err.contains("expected_token_ids"));
+}
+
+#[test]
+fn expected_tokens_schema_rejects_sequence_without_artifact_startup_prompt() {
+    let fixture = parse_expected_tokens(
+        r#"{
+          "fixture_version": 1,
+          "name": "whisper_tiny_en_sample_16khz_mono",
+          "source": "local whisper_tiny_en converter output",
+          "audio": "reference/sample_16khz_mono.wav",
+          "task": "transcribe",
+          "language": "en",
+          "timestamps": false,
+          "expected_token_ids": [42, 50257]
+        }"#,
+    );
+
+    let err = validate_expected_tokens_for_policy_result(
+        &fixture,
+        WhisperArtifactDecodePolicy::english_only(),
+    )
+    .expect_err("missing artifact startup prompt must be rejected");
+    assert!(err.contains("startup prompt"));
+}
+
+#[test]
+fn wav_sample_reader_decodes_pcm16_mono_values() {
+    let bytes = build_test_wav(
+        1,
+        16,
+        &[-32768_i16, 0, 32767]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+
+    let wav = parse_wav_mono_samples(&bytes).expect("PCM16 mono WAV should decode");
+
+    assert_eq!(
+        wav.metadata,
+        WavMetadata {
+            audio_format: 1,
+            channels: 1,
+            sample_rate_hz: 16_000,
+            bits_per_sample: 16,
+            data_bytes: 6,
+        }
+    );
+    assert_close(&wav.samples, &[-1.0, 0.0, 32767.0 / 32768.0], 1.0e-7);
+}
+
+#[test]
+fn wav_sample_reader_decodes_ieee_float32_mono_values() {
+    let bytes = build_test_wav(
+        3,
+        32,
+        &[-0.25_f32, 0.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+
+    let wav = parse_wav_mono_samples(&bytes).expect("IEEE float32 mono WAV should decode");
+
+    assert_eq!(
+        wav.metadata,
+        WavMetadata {
+            audio_format: 3,
+            channels: 1,
+            sample_rate_hz: 16_000,
+            bits_per_sample: 32,
+            data_bytes: 8,
+        }
+    );
+    assert_eq!(wav.samples, vec![-0.25, 0.5]);
 }
 
 #[test]
@@ -200,6 +439,53 @@ fn local_whisper_tiny_en_artifact_contract_is_well_formed() {
     let expected_path = repo_artifact_path(EXPECTED_TOKENS_JSON);
     let expected = parse_expected_tokens_file(&expected_path);
     validate_expected_tokens(&expected);
+    let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
+    validate_expected_tokens_for_policy(&expected, decode_policy);
+
+    let expected_token_ids = expected_token_ids(&expected);
+    assert_startup_prompt(&expected_token_ids, decode_policy);
+    assert!(
+        expected_token_ids.len() <= whisper_config.text_context_length,
+        "expected_tokens.json has {} tokens, but config text_context_length is {}",
+        expected_token_ids.len(),
+        whisper_config.text_context_length,
+    );
+
+    let loaded_tensors = load_required_whisper_tensors(&model_path, &whisper_config);
+    let model = WhisperModel::new(whisper_config, loaded_tensors).unwrap_or_else(|err| {
+        panic!(
+            "failed to construct WhisperModel from loaded tensors at {} - {err:?}",
+            model_path.display()
+        )
+    });
+
+    let wav_audio = read_wav_mono_samples(&audio_path);
+    assert_eq!(wav_audio.metadata, wav);
+    assert!(
+        !wav_audio.samples.is_empty(),
+        "reference audio at {} must decode to at least one sample",
+        audio_path.display(),
+    );
+    let mel = log_mel_spectrogram(
+        &wav_audio.samples,
+        AudioMetadata {
+            sample_rate_hz: wav.sample_rate_hz,
+            channels: wav.channels,
+        },
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "failed to compute Whisper log-mel spectrogram for {} - {err:?}",
+            audio_path.display()
+        )
+    });
+
+    let generated =
+        generate_tokens_to_expected_length(&model, &mel, expected_token_ids.len(), decode_policy);
+    assert_eq!(
+        generated, expected_token_ids,
+        "generated Whisper token IDs must exactly match reference/expected_tokens.json",
+    );
 }
 
 fn assert_json_object(path: &Path, label: &str) {
@@ -235,6 +521,14 @@ fn validate_expected_tokens(fixture: &ExpectedTokens) {
         .unwrap_or_else(|err| panic!("invalid expected_tokens.json contract - {err}"));
 }
 
+fn validate_expected_tokens_for_policy(
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) {
+    validate_expected_tokens_for_policy_result(fixture, policy)
+        .unwrap_or_else(|err| panic!("invalid expected_tokens.json startup contract - {err}"));
+}
+
 fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), String> {
     if fixture.fixture_version != 1 {
         return Err(format!(
@@ -267,7 +561,7 @@ fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), Strin
         ));
     }
     if fixture.timestamps {
-        return Err("timestamps must be false for the first W-ASR.5 fixture".to_string());
+        return Err("timestamps must be false for the W-ASR.10 parity fixture".to_string());
     }
     if fixture.expected_token_ids.is_empty() {
         return Err("expected_token_ids must be non-empty".to_string());
@@ -280,6 +574,115 @@ fn validate_expected_tokens_result(fixture: &ExpectedTokens) -> Result<(), Strin
     Ok(())
 }
 
+fn validate_expected_tokens_for_policy_result(
+    fixture: &ExpectedTokens,
+    policy: WhisperArtifactDecodePolicy,
+) -> Result<(), String> {
+    let startup_prompt = startup_prompt_ids(policy);
+    if !fixture.expected_token_ids.starts_with(&startup_prompt) {
+        return Err(format!(
+            "expected_token_ids must start with the {} no-timestamps startup prompt {:?}",
+            policy.label(),
+            startup_prompt
+        ));
+    }
+    if fixture.expected_token_ids.len() == startup_prompt.len() {
+        return Err(
+            "expected_token_ids must include at least one generated token after the startup prompt"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn startup_prompt_ids(policy: WhisperArtifactDecodePolicy) -> Vec<u32> {
+    policy
+        .startup_prompt()
+        .into_iter()
+        .map(|token| token.0)
+        .collect()
+}
+
+fn expected_token_ids(fixture: &ExpectedTokens) -> Vec<TokenId> {
+    fixture
+        .expected_token_ids
+        .iter()
+        .copied()
+        .map(TokenId)
+        .collect()
+}
+
+fn assert_startup_prompt(expected_token_ids: &[TokenId], policy: WhisperArtifactDecodePolicy) {
+    let startup_prompt = policy.startup_prompt();
+    assert!(
+        expected_token_ids.starts_with(&startup_prompt),
+        "expected_tokens.json must start with {} no-timestamps prompt {:?}, got prefix {:?}",
+        policy.label(),
+        startup_prompt,
+        &expected_token_ids[..expected_token_ids.len().min(startup_prompt.len())],
+    );
+}
+
+fn load_required_whisper_tensors(path: &Path, config: &WhisperConfig) -> Vec<LoadedTensor> {
+    required_whisper_tensor_names(config)
+        .into_iter()
+        .map(|name| {
+            load_safetensors_tensor_f32(path, &name).unwrap_or_else(|err| {
+                panic!(
+                    "failed to load required Whisper tensor {name:?} from {} - {err:?}",
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
+
+fn generate_tokens_to_expected_length(
+    model: &WhisperModel,
+    mel: &LogMelSpectrogram,
+    expected_len: usize,
+    policy: WhisperArtifactDecodePolicy,
+) -> Vec<TokenId> {
+    let mut generated = policy.startup_prompt();
+    let mask = WhisperDecodeMask::transcribe_without_timestamps(policy.tokens);
+
+    while generated.len() < expected_len {
+        let logits = model
+            .forward_next_token_logits(&mel.values, mel.frames, &generated)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Whisper forward_next_token_logits failed at generated length {} - {err:?}",
+                    generated.len()
+                )
+            });
+        let next = masked_greedy_sample(&logits, mask);
+        generated.push(next);
+        if next == policy.tokens.end_of_text {
+            break;
+        }
+    }
+
+    generated
+}
+
+fn masked_greedy_sample(logits: &[f32], mask: WhisperDecodeMask) -> TokenId {
+    assert!(!logits.is_empty(), "cannot sample from empty logits");
+
+    let mut best = None;
+    for (idx, &logit) in logits.iter().enumerate() {
+        let token = TokenId(u32::try_from(idx).expect("vocab index must fit in u32"));
+        if mask.mask_token(token) == WhisperTokenMaskDecision::Suppress {
+            continue;
+        }
+        if best.is_none_or(|(_, best_logit)| logit > best_logit) {
+            best = Some((idx, logit));
+        }
+    }
+
+    let (idx, _) = best.expect("Whisper decode mask suppressed every logit");
+    TokenId(u32::try_from(idx).expect("vocab index must fit in u32"))
+}
+
 fn read_wav_metadata(path: &Path) -> WavMetadata {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|err| panic!("failed to read WAV at {} - {err}", path.display()));
@@ -288,6 +691,58 @@ fn read_wav_metadata(path: &Path) -> WavMetadata {
 }
 
 fn parse_wav_metadata(bytes: &[u8]) -> Result<WavMetadata, String> {
+    parse_wav_layout(bytes).map(|layout| layout.metadata)
+}
+
+fn read_wav_mono_samples(path: &Path) -> WavAudio {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|err| panic!("failed to read WAV at {} - {err}", path.display()));
+    parse_wav_mono_samples(&bytes)
+        .unwrap_or_else(|err| panic!("unsupported WAV sample data at {} - {err}", path.display()))
+}
+
+fn parse_wav_mono_samples(bytes: &[u8]) -> Result<WavAudio, String> {
+    let layout = parse_wav_layout(bytes)?;
+    if layout.metadata.channels != 1 {
+        return Err(format!(
+            "only mono WAV data is supported, got {} channels",
+            layout.metadata.channels
+        ));
+    }
+
+    let data = bytes
+        .get(layout.data_offset..layout.data_offset + layout.data_bytes)
+        .ok_or_else(|| "data chunk extends beyond file length".to_string())?;
+    let samples = match (
+        layout.metadata.audio_format,
+        layout.metadata.bits_per_sample,
+    ) {
+        (1, 16) => decode_pcm16_samples(data)?,
+        (1, bits) => {
+            return Err(format!(
+                "unsupported PCM WAV bits_per_sample {bits}; supported PCM format is 16-bit"
+            ));
+        }
+        (3, 32) => decode_float32_samples(data)?,
+        (3, bits) => {
+            return Err(format!(
+                "unsupported IEEE float WAV bits_per_sample {bits}; supported float format is 32-bit"
+            ));
+        }
+        (format, bits) => {
+            return Err(format!(
+                "unsupported WAV audio_format {format} with bits_per_sample {bits}; supported formats are PCM16 and IEEE float32"
+            ));
+        }
+    };
+
+    Ok(WavAudio {
+        metadata: layout.metadata,
+        samples,
+    })
+}
+
+fn parse_wav_layout(bytes: &[u8]) -> Result<WavLayout, String> {
     if bytes.len() < 12 {
         return Err("file is shorter than a RIFF/WAVE header".to_string());
     }
@@ -297,7 +752,7 @@ fn parse_wav_metadata(bytes: &[u8]) -> Result<WavMetadata, String> {
 
     let mut offset = 12usize;
     let mut fmt = None;
-    let mut data_bytes = None;
+    let mut data = None;
 
     while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
         let chunk_id = &bytes[offset..offset + 4];
@@ -323,25 +778,59 @@ fn parse_wav_metadata(bytes: &[u8]) -> Result<WavMetadata, String> {
                 ));
             }
             b"data" => {
-                data_bytes = Some(chunk_size as u32);
+                data = Some((chunk_start, chunk_size));
             }
             _ => {}
         }
 
-        offset = chunk_end + (chunk_size % 2);
+        offset = chunk_end
+            .checked_add(chunk_size % 2)
+            .ok_or_else(|| "chunk padding overflows usize".to_string())?;
     }
 
     let (audio_format, channels, sample_rate_hz, bits_per_sample) =
         fmt.ok_or_else(|| "missing fmt chunk".to_string())?;
-    let data_bytes = data_bytes.ok_or_else(|| "missing data chunk".to_string())?;
+    let (data_offset, data_bytes) = data.ok_or_else(|| "missing data chunk".to_string())?;
 
-    Ok(WavMetadata {
-        audio_format,
-        channels,
-        sample_rate_hz,
-        bits_per_sample,
+    Ok(WavLayout {
+        metadata: WavMetadata {
+            audio_format,
+            channels,
+            sample_rate_hz,
+            bits_per_sample,
+            data_bytes,
+        },
+        data_offset,
         data_bytes,
     })
+}
+
+fn decode_pcm16_samples(data: &[u8]) -> Result<Vec<f32>, String> {
+    let chunks = data.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return Err(format!(
+            "PCM16 data chunk has {} bytes, which is not divisible by 2",
+            data.len()
+        ));
+    }
+
+    Ok(chunks
+        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0)
+        .collect())
+}
+
+fn decode_float32_samples(data: &[u8]) -> Result<Vec<f32>, String> {
+    let chunks = data.chunks_exact(4);
+    if !chunks.remainder().is_empty() {
+        return Err(format!(
+            "IEEE float32 data chunk has {} bytes, which is not divisible by 4",
+            data.len()
+        ));
+    }
+
+    Ok(chunks
+        .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
+        .collect())
 }
 
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, String> {
@@ -362,4 +851,40 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, String> {
         .get(offset..end)
         .ok_or_else(|| "unexpected EOF while reading u32".to_string())?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn build_test_wav(audio_format: u16, bits_per_sample: u16, payload: &[u8]) -> Vec<u8> {
+    let channels = 1_u16;
+    let sample_rate = 16_000_u32;
+    let block_align = channels * (bits_per_sample / 8);
+    let byte_rate = sample_rate * u32::from(block_align);
+    let riff_size = 4 + (8 + 16) + (8 + payload.len() as u32);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&audio_format.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+    assert_eq!(actual.len(), expected.len());
+    for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        let delta = (actual - expected).abs();
+        assert!(
+            delta <= tolerance,
+            "index {idx}: expected {expected}, got {actual}, delta {delta}"
+        );
+    }
 }

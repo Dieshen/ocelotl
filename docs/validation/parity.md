@@ -134,31 +134,41 @@ local-artifact harness:
   `crates/models/tests/whisper_local_artifact_parity.rs` documents and checks
   `local-artifacts/whisper_tiny_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json}`.
   The default-on tests in that file validate the expected token-reference
-  schema. The ignored test validates the local bundle exists, parses
-  `config.json`, `tokenizer.json`, and `expected_tokens.json`, inspects the
-  safetensors header without reading tensor payloads, and checks the reference
-  WAV metadata is 16 kHz mono.
+  schema, including both supported no-timestamps startup variants. The ignored
+  test validates the local bundle exists, parses `config.json`,
+  `tokenizer.json`, and `expected_tokens.json`, derives the tokenizer/model
+  family from `vocab_size`, validates the safetensors manifest, loads required
+  tensor values, decodes PCM16 or IEEE float32 WAV sample data, computes log-mel
+  features, and compares exact autoregressively generated token IDs against the
+  reference sequence.
 
 ### Reference
 
 The opt-in Whisper reference is `reference/expected_tokens.json` inside the
 local bundle. It must name the sample audio path, use task `transcribe`,
-language `en`, `timestamps = false`, and carry a non-empty
-`expected_token_ids` sequence. Exact token equality is the intended parity
-contract once Ocelotl has a converted Whisper tiny.en weight loader/model
-adapter.
+language `en`, `timestamps = false`, and carry an `expected_token_ids` sequence
+that starts with the no-timestamps startup prompt appropriate to the artifact's
+tokenizer/model family and includes at least one generated token after the
+startup prompt. Current supported variants are:
+
+| Artifact family | Condition | Startup prompt | EOT | First timestamp |
+| --- | --- | --- | --- | --- |
+| OpenAI English-only Whisper | `vocab_size < 51865` | `[50257, 50362]` | `50256` | `50363` |
+| OpenAI multilingual Whisper, English transcribe | `vocab_size >= 51865` | `[50258, 50259, 50359, 50363]` | `50257` | `50364` |
+
+Exact token equality is the parity contract for the opt-in local bundle.
 
 ### Current Limit
 
 W-ASR.5 proves the local-artifact contract and reference shape. W-ASR.7 adds
-generic safetensors tensor-value loading, and W-ASR.8 adds a real Whisper
-config/tensor-manifest contract plus wires the ignored harness through
-`parse_whisper_config_json` and `validate_whisper_tensors`.
+generic safetensors tensor-value loading, W-ASR.8 adds a real Whisper
+config/tensor-manifest contract, W-ASR.9 adds the real CPU adapter, and W-ASR.10
+extends the ignored harness from "bundle is well-formed" to "output tokens equal
+expected tokens".
 
-The current contract still does not run real Whisper model inference or compare
-produced tokens. W-ASR.8 uses OpenAI Whisper state-dict names as the canonical
-Ocelotl tensor contract; aliases for HF/Burn-converted safetensors names should
-be added only after the local `model.safetensors` manifest proves the needed
-alternate names. Extending the ignored test from "bundle is well-formed" to
-"output tokens equal expected tokens" is the follow-up that closes real
-local-artifact parity.
+The current branch does not include `local-artifacts/whisper_tiny_en`, so the
+exact local parity proof is still artifact-blocked until a contributor provides
+that bundle and runs the ignored test. The tensor contract uses OpenAI Whisper
+state-dict names as the canonical Ocelotl contract; aliases for HF/Burn-converted
+safetensors names should be added only after a local `model.safetensors`
+manifest proves the needed alternate names.
