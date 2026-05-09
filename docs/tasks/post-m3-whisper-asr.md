@@ -213,6 +213,13 @@ Ocelotl can run real Whisper weights yet.
   captured.
 - `Out of scope`: optimization work, GPU comparison, and treating whisper.cpp
   output as the canonical correctness oracle.
+- `Status note`: W-ASR.13 now has default-on manifest/record contract tests in
+  `crates/models/tests/whisper_cpp_benchmark.rs`, schema fixtures under
+  `fixtures/benchmarks/`, an opt-in local runner at
+  `tools/whisper-cpp-bench.ps1`, and the local workflow documented in
+  `docs/benchmarks/whisper-cpp.md`. The current Ocelotl command is the ignored
+  W-ASR.10 local-artifact parity harness, so captured wall-clock numbers are a
+  baseline shape only until a dedicated transcription CLI or timing hook exists.
 
 ## W-ASR.14 Audit Whisper Model-Size Compatibility
 

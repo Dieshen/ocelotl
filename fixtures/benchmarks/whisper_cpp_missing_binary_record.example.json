@@ -1,0 +1,58 @@
+{
+  "fixture_version": 1,
+  "manifest_name": "whisper_tiny_en_sample_16khz_mono",
+  "status": "skipped",
+  "ocelotl": {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "ocelotl-models",
+      "--release",
+      "--test",
+      "whisper_local_artifact_parity",
+      "local_whisper_tiny_en_artifact_contract_is_well_formed",
+      "--",
+      "--ignored",
+      "--nocapture",
+      "--exact"
+    ],
+    "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
+    "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
+    "threads": 4,
+    "status": "planned",
+    "wall_time_ms": null,
+    "exit_code": null,
+    "output": {
+      "token_count": null,
+      "text": null,
+      "stdout_excerpt": null
+    },
+    "skip_reason": null
+  },
+  "whisper_cpp": {
+    "command": [
+      "local-artifacts/whisper_cpp/whisper-cli.exe",
+      "-m",
+      "local-artifacts/whisper_cpp/ggml-tiny.en.bin",
+      "-f",
+      "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
+      "-t",
+      "4",
+      "-otxt",
+      "-nt"
+    ],
+    "model_path": "local-artifacts/whisper_cpp/ggml-tiny.en.bin",
+    "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
+    "threads": 4,
+    "status": "skipped",
+    "wall_time_ms": null,
+    "exit_code": null,
+    "output": {
+      "token_count": null,
+      "text": null,
+      "stdout_excerpt": null
+    },
+    "skip_reason": "missing whisper.cpp binary at local-artifacts/whisper_cpp/whisper-cli.exe; build whisper.cpp, copy whisper-cli.exe there, or edit the manifest binary path; see docs/benchmarks/whisper-cpp.md"
+  }
+}
