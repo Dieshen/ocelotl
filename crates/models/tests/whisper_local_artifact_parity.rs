@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ocelotl_core::TokenId;
+use ocelotl_core::{DType, TokenId};
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensor_f32};
 use ocelotl_models::whisper::{
     WhisperConfig, WhisperModel,
@@ -158,6 +158,25 @@ fn required_artifacts() -> [&'static str; 5] {
     ]
 }
 
+fn tiny_whisper_config() -> WhisperConfig {
+    WhisperConfig {
+        vocab_size: OPENAI_MULTILINGUAL_VOCAB_THRESHOLD - 1,
+        mel_bins: 80,
+        audio_context_length: 1500,
+        audio_state_size: 384,
+        audio_attention_heads: 6,
+        audio_layers: 4,
+        audio_ffn_size: 1536,
+        text_context_length: 448,
+        text_state_size: 384,
+        text_attention_heads: 6,
+        text_layers: 4,
+        text_ffn_size: 1536,
+        dtype: DType::F32,
+        tie_word_embeddings: true,
+    }
+}
+
 #[test]
 fn whisper_local_artifact_contract_lists_exact_required_paths() {
     assert_eq!(LOCAL_ARTIFACT_DIR, "local-artifacts/whisper_tiny_en");
@@ -214,6 +233,43 @@ fn expected_tokens_schema_accepts_english_only_documented_shape() {
 
     validate_expected_tokens(&fixture);
     validate_expected_tokens_for_policy(&fixture, WhisperArtifactDecodePolicy::english_only());
+}
+
+#[test]
+fn decode_policy_uses_english_only_prompt_below_openai_multilingual_threshold() {
+    let mut config = tiny_whisper_config();
+    config.vocab_size = OPENAI_MULTILINGUAL_VOCAB_THRESHOLD - 1;
+
+    let policy = WhisperArtifactDecodePolicy::for_config(&config);
+
+    assert_eq!(policy.family, WhisperArtifactTokenizerFamily::EnglishOnly);
+    assert_eq!(
+        policy.startup_prompt(),
+        vec![TokenId(50_257), TokenId(50_362)]
+    );
+    assert_eq!(policy.tokens.end_of_text, TokenId(50_256));
+    assert_eq!(policy.tokens.first_timestamp, TokenId(50_363));
+}
+
+#[test]
+fn decode_policy_uses_multilingual_prompt_at_openai_multilingual_threshold() {
+    let mut config = tiny_whisper_config();
+    config.vocab_size = OPENAI_MULTILINGUAL_VOCAB_THRESHOLD;
+
+    let policy = WhisperArtifactDecodePolicy::for_config(&config);
+
+    assert_eq!(policy.family, WhisperArtifactTokenizerFamily::Multilingual);
+    assert_eq!(
+        policy.startup_prompt(),
+        vec![
+            TokenId(50_258),
+            TokenId(50_259),
+            TokenId(50_359),
+            TokenId(50_363),
+        ]
+    );
+    assert_eq!(policy.tokens.end_of_text, TokenId(50_257));
+    assert_eq!(policy.tokens.first_timestamp, TokenId(50_364));
 }
 
 #[test]
