@@ -1,0 +1,41 @@
+{
+  "fixture_version": 1,
+  "name": "whisper_tiny_en_sample_16khz_mono",
+  "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
+  "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
+  "threads": 4,
+  "ocelotl": {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "ocelotl-models",
+      "--release",
+      "--test",
+      "whisper_local_artifact_parity",
+      "local_whisper_tiny_en_artifact_contract_is_well_formed",
+      "--",
+      "--ignored",
+      "--nocapture",
+      "--exact"
+    ],
+    "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
+    "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav"
+  },
+  "whisper_cpp": {
+    "binary": "local-artifacts/whisper_cpp/whisper-cli.exe",
+    "command": [
+      "local-artifacts/whisper_cpp/whisper-cli.exe",
+      "-m",
+      "local-artifacts/whisper_cpp/ggml-tiny.en.bin",
+      "-f",
+      "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
+      "-t",
+      "4",
+      "-otxt",
+      "-nt"
+    ],
+    "model_path": "local-artifacts/whisper_cpp/ggml-tiny.en.bin",
+    "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav"
+  }
+}

@@ -35,6 +35,7 @@ Keep separate baselines for:
 - First GPU path.
 - Optimized GPU path.
 - Quantized path.
+- External performance baselines such as whisper.cpp.
 
 Do not compare unrelated models or quantization formats as if they were the same
 benchmark.
@@ -43,3 +44,11 @@ benchmark.
 
 After M3, measure CPU prefill and decode separately. After M4, compare GPU and
 CPU for the same fixture and report both speed and parity results.
+
+## Whisper ASR Baseline
+
+For W-ASR.13, whisper.cpp is a performance baseline only, not the canonical
+correctness oracle. The harness contract lives in
+`docs/benchmarks/whisper-cpp.md`, with default-on schema tests in
+`crates/models/tests/whisper_cpp_benchmark.rs` and example JSON fixtures under
+`fixtures/benchmarks/`.

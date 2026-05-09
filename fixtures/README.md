@@ -10,6 +10,8 @@ Default tests must run offline. Large model weights should not be committed.
 - `metadata/`: normalized model metadata and malformed metadata cases.
 - `tokenizer/`: exact token ID and chat-template fixtures.
 - `logits/`: reference logits or token outputs for small deterministic cases.
+- `benchmarks/`: benchmark manifest and record schema examples. These validate
+  harness shape only; real benchmark outputs stay under ignored local artifacts.
 
 ## First Target
 
