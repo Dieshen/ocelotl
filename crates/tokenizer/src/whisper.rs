@@ -4,6 +4,11 @@
 //! `tokenizer.json`, execute decoding, or expose foreign tokenizer types.
 
 use crate::TokenId;
+use ocelotl_core::{OcelotlError, Result, TokenizerError};
+
+/// Whisper timestamp tokens advance in fixed 20 ms steps from
+/// `first_timestamp`.
+pub const WHISPER_TIMESTAMP_STEP_SECONDS: f32 = 0.02;
 
 /// Ocelotl-owned names for the Whisper startup and decode-control tokens used
 /// by the first ASR transcription slice.
@@ -54,6 +59,49 @@ impl WhisperStartupTokens {
             self.no_timestamps,
         ]
     }
+
+    /// Construct the English-only Whisper transcription prompt.
+    ///
+    /// English-only Whisper does not include language or task tokens in the
+    /// startup sequence. Timestamp-enabled transcription omits
+    /// `<|notimestamps|>` so the model can emit timestamp boundary tokens.
+    pub fn english_transcribe_prompt(self, mode: WhisperTimestampMode) -> Vec<TokenId> {
+        match mode {
+            WhisperTimestampMode::NoTimestamps => {
+                vec![self.start_of_transcript, self.no_timestamps]
+            }
+            WhisperTimestampMode::Timestamps => vec![self.start_of_transcript],
+        }
+    }
+
+    /// Convert a Whisper timestamp token into seconds from the start of the
+    /// current audio window.
+    ///
+    /// The OpenAI Whisper timestamp contract uses 0.02 seconds per token offset
+    /// from `first_timestamp`: `first_timestamp` is 0.00s,
+    /// `first_timestamp + 1` is 0.02s, and so on.
+    pub fn timestamp_seconds(self, token: TokenId) -> Option<f32> {
+        token
+            .0
+            .checked_sub(self.first_timestamp.0)
+            .map(|offset| offset as f32 * WHISPER_TIMESTAMP_STEP_SECONDS)
+    }
+}
+
+/// Known OpenAI English-only Whisper special-token IDs for transcription.
+///
+/// The English-only startup prompt is `<|startoftranscript|>` plus optionally
+/// `<|notimestamps|>`. The task/control token IDs are still recorded so decode
+/// masks can suppress known Whisper control specials through the whole decode.
+pub fn whisper_english_transcribe_tokens() -> WhisperStartupTokens {
+    WhisperStartupTokens {
+        end_of_text: TokenId(50_256),
+        start_of_transcript: TokenId(50_257),
+        language: TokenId(50_258),
+        transcribe_task: TokenId(50_358),
+        no_timestamps: TokenId(50_362),
+        first_timestamp: TokenId(50_363),
+    }
 }
 
 /// Known multilingual Whisper special-token IDs for English transcription.
@@ -81,6 +129,13 @@ pub enum WhisperTokenMaskDecision {
     Suppress,
 }
 
+/// Timestamp behavior for Whisper transcription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhisperTimestampMode {
+    NoTimestamps,
+    Timestamps,
+}
+
 /// Decode-time Whisper token suppression policy.
 ///
 /// Non-timestamp prompt special tokens are suppressed for every decode step, not
@@ -93,13 +148,23 @@ pub struct WhisperDecodeMask {
 }
 
 impl WhisperDecodeMask {
+    /// Build a transcription decode mask for the selected timestamp mode.
+    pub fn transcribe(tokens: WhisperStartupTokens, mode: WhisperTimestampMode) -> Self {
+        Self {
+            tokens,
+            suppress_timestamps: mode == WhisperTimestampMode::NoTimestamps,
+        }
+    }
+
     /// Build the decode mask for transcription with `<|notimestamps|>` in the
     /// prompt.
     pub fn transcribe_without_timestamps(tokens: WhisperStartupTokens) -> Self {
-        Self {
-            tokens,
-            suppress_timestamps: true,
-        }
+        Self::transcribe(tokens, WhisperTimestampMode::NoTimestamps)
+    }
+
+    /// Build the decode mask for transcription with timestamp tokens enabled.
+    pub fn transcribe_with_timestamps(tokens: WhisperStartupTokens) -> Self {
+        Self::transcribe(tokens, WhisperTimestampMode::Timestamps)
     }
 
     /// Return whether a candidate next token should be available to sampling.
@@ -124,4 +189,77 @@ impl WhisperDecodeMask {
                 || t == self.tokens.no_timestamps
         )
     }
+}
+
+/// A timestamp-bounded run of text tokens from a Whisper decode sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhisperTimestampedSegment {
+    pub start_seconds: f32,
+    pub end_seconds: f32,
+    pub text_tokens: Vec<TokenId>,
+}
+
+/// Parse timestamp-token boundaries into deterministic token-level segments.
+///
+/// The input is expected to be the generated token stream after the startup
+/// prompt. Each segment starts at a timestamp token, collects ordinary text
+/// tokens, and ends at the next timestamp token. Consecutive timestamp tokens
+/// are treated as boundary updates with no empty segment emitted.
+pub fn parse_whisper_timestamped_segments(
+    tokens: WhisperStartupTokens,
+    sequence: &[TokenId],
+) -> Result<Vec<WhisperTimestampedSegment>> {
+    let mut segments = Vec::new();
+    let mut active_start = None;
+    let mut text_tokens = Vec::new();
+
+    for &token in sequence {
+        if token == tokens.end_of_text {
+            break;
+        }
+
+        if tokens.timestamp_seconds(token).is_some() {
+            if let Some(start_token) = active_start {
+                if !text_tokens.is_empty() {
+                    let start_seconds = tokens
+                        .timestamp_seconds(start_token)
+                        .expect("active start is always a timestamp token");
+                    let end_seconds = tokens
+                        .timestamp_seconds(token)
+                        .expect("current token is known to be a timestamp token");
+                    segments.push(WhisperTimestampedSegment {
+                        start_seconds,
+                        end_seconds,
+                        text_tokens: std::mem::take(&mut text_tokens),
+                    });
+                }
+            }
+            active_start = Some(token);
+            continue;
+        }
+
+        if active_start.is_none() {
+            return Err(tokenizer_policy_error(format!(
+                "timestamped Whisper segment text token {:?} appeared before a start timestamp",
+                token
+            )));
+        }
+
+        text_tokens.push(token);
+    }
+
+    if !text_tokens.is_empty() {
+        return Err(tokenizer_policy_error(
+            "timestamped Whisper segment has text without an end timestamp".to_string(),
+        ));
+    }
+
+    Ok(segments)
+}
+
+fn tokenizer_policy_error(message: String) -> OcelotlError {
+    OcelotlError::Tokenizer(TokenizerError {
+        message,
+        source: None,
+    })
 }
