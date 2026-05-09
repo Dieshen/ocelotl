@@ -133,14 +133,19 @@ local-artifact harness:
 - **Whisper tiny.en local bundle, opt-in**:
   `crates/models/tests/whisper_local_artifact_parity.rs` documents and checks
   `local-artifacts/whisper_tiny_en/{config.json,tokenizer.json,model.safetensors,reference/sample_16khz_mono.wav,reference/expected_tokens.json}`.
+  W-ASR.15 adds optional timestamped parity through
+  `reference/expected_tokens_timestamped.json`.
   The default-on tests in that file validate the expected token-reference
-  schema, including both supported no-timestamps startup variants. The ignored
-  test validates the local bundle exists, parses `config.json`,
-  `tokenizer.json`, and `expected_tokens.json`, derives the tokenizer/model
-  family from `vocab_size`, validates the safetensors manifest, loads required
-  tensor values, decodes PCM16 or IEEE float32 WAV sample data, computes log-mel
-  features, and compares exact autoregressively generated token IDs against the
-  reference sequence.
+  schema, including supported no-timestamps and timestamped startup variants.
+  The ignored no-timestamps test validates the local bundle exists, parses
+  `config.json`, `tokenizer.json`, and `expected_tokens.json`, derives the
+  tokenizer/model family from `vocab_size`, validates the safetensors manifest,
+  loads required tensor values, decodes PCM16 or IEEE float32 WAV sample data,
+  computes log-mel features, and compares exact autoregressively generated
+  token IDs against the reference sequence. The ignored timestamped test skips
+  clearly when `expected_tokens_timestamped.json` is absent; when present, it
+  runs the same local bundle with timestamp tokens enabled and compares exact
+  token IDs plus parsed segment boundaries.
 
 ### Reference
 
@@ -149,14 +154,27 @@ local bundle. It must name the sample audio path, use task `transcribe`,
 language `en`, `timestamps = false`, and carry an `expected_token_ids` sequence
 that starts with the no-timestamps startup prompt appropriate to the artifact's
 tokenizer/model family and includes at least one generated token after the
-startup prompt. Current supported variants are:
+startup prompt. W-ASR.15 also recognizes an optional
+`reference/expected_tokens_timestamped.json` file with `timestamps = true`,
+timestamp boundary token IDs in `expected_token_ids`, and `expected_segments`
+that must exactly match the public tokenizer timestamp-segment parser. Current
+supported variants are:
 
 | Artifact family | Condition | Startup prompt | EOT | First timestamp |
 | --- | --- | --- | --- | --- |
 | OpenAI English-only Whisper | `vocab_size < 51865` | `[50257, 50362]` | `50256` | `50363` |
 | OpenAI multilingual Whisper, English transcribe | `vocab_size >= 51865` | `[50258, 50259, 50359, 50363]` | `50257` | `50364` |
 
+Timestamped references omit `<|notimestamps|>` from the startup prompt:
+
+| Artifact family | Timestamped startup prompt |
+| --- | --- |
+| OpenAI English-only Whisper | `[50257]` |
+| OpenAI multilingual Whisper, English transcribe | `[50258, 50259, 50359]` |
+
 Exact token equality is the parity contract for the opt-in local bundle.
+Timestamped parity additionally requires exact segment-boundary equality after
+parsing the generated suffix.
 
 ### Current Limit
 
@@ -164,7 +182,8 @@ W-ASR.5 proves the local-artifact contract and reference shape. W-ASR.7 adds
 generic safetensors tensor-value loading, W-ASR.8 adds a real Whisper
 config/tensor-manifest contract, W-ASR.9 adds the real CPU adapter, and W-ASR.10
 extends the ignored harness from "bundle is well-formed" to "output tokens equal
-expected tokens".
+expected tokens". W-ASR.15 keeps that proof intact and layers timestamped
+schema/default tests plus an optional timestamped ignored proof on top.
 
 The current branch does not include `local-artifacts/whisper_tiny_en`, so the
 exact local parity proof is still artifact-blocked until a contributor provides

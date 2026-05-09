@@ -52,12 +52,24 @@ impl WhisperStartupTokens {
     ///
     /// `<|startoftranscript|>`, language, `<|transcribe|>`, `<|notimestamps|>`.
     pub fn transcribe_no_timestamps_prompt(self) -> Vec<TokenId> {
-        vec![
+        self.transcribe_prompt(WhisperTimestampMode::NoTimestamps)
+    }
+
+    /// Construct the multilingual Whisper transcription prompt for the selected
+    /// timestamp mode.
+    ///
+    /// Timestamp-enabled transcription omits `<|notimestamps|>` so the model
+    /// can emit timestamp boundary tokens.
+    pub fn transcribe_prompt(self, mode: WhisperTimestampMode) -> Vec<TokenId> {
+        let mut prompt = vec![
             self.start_of_transcript,
             self.language,
             self.transcribe_task,
-            self.no_timestamps,
-        ]
+        ];
+        if mode == WhisperTimestampMode::NoTimestamps {
+            prompt.push(self.no_timestamps);
+        }
+        prompt
     }
 
     /// Construct the English-only Whisper transcription prompt.

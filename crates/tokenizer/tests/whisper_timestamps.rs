@@ -3,6 +3,7 @@
 use ocelotl_tokenizer::{
     TokenId, WhisperDecodeMask, WhisperTimestampMode, WhisperTokenMaskDecision, WhisperTokenRole,
     parse_whisper_timestamped_segments, whisper_english_transcribe_tokens,
+    whisper_multilingual_english_transcribe_tokens,
 };
 
 #[test]
@@ -23,6 +24,37 @@ fn english_timestamp_enabled_startup_prompt_omits_no_timestamps_token() {
         timestamp_prompt,
         vec![tokens.role_token(WhisperTokenRole::StartOfTranscript)],
         "timestamp-enabled English transcription omits <|notimestamps|>"
+    );
+    assert!(
+        !timestamp_prompt.contains(&tokens.role_token(WhisperTokenRole::NoTimestamps)),
+        "<|notimestamps|> must not be present when timestamps are enabled"
+    );
+}
+
+#[test]
+fn multilingual_timestamp_enabled_startup_prompt_omits_no_timestamps_token() {
+    let tokens = whisper_multilingual_english_transcribe_tokens();
+
+    assert_eq!(
+        tokens.transcribe_prompt(WhisperTimestampMode::NoTimestamps),
+        vec![
+            tokens.role_token(WhisperTokenRole::StartOfTranscript),
+            tokens.role_token(WhisperTokenRole::Language),
+            tokens.role_token(WhisperTokenRole::TranscribeTask),
+            tokens.role_token(WhisperTokenRole::NoTimestamps),
+        ],
+        "multilingual no-timestamps transcription includes SOT, language, task, then <|notimestamps|>"
+    );
+
+    let timestamp_prompt = tokens.transcribe_prompt(WhisperTimestampMode::Timestamps);
+    assert_eq!(
+        timestamp_prompt,
+        vec![
+            tokens.role_token(WhisperTokenRole::StartOfTranscript),
+            tokens.role_token(WhisperTokenRole::Language),
+            tokens.role_token(WhisperTokenRole::TranscribeTask),
+        ],
+        "timestamp-enabled multilingual transcription omits <|notimestamps|>"
     );
     assert!(
         !timestamp_prompt.contains(&tokens.role_token(WhisperTokenRole::NoTimestamps)),
