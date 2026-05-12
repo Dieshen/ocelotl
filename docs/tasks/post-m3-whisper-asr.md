@@ -491,3 +491,20 @@ Ocelotl can run real Whisper weights yet.
   precompute. This shows encoder forward is the next CPU bottleneck.
 - `Out of scope`: optimizing encoder attention/linear kernels, changing public
   runtime APIs, decoder changes, and making optimized CPU mode the default.
+
+## W-ASR.31 Improve Whisper Attention Context Accumulation Locality
+
+- `Crates`: `ocelotl-models` Whisper real adapter and benchmark docs.
+- `Test first`: rely on the existing Whisper real-attention tests and exact
+  local tiny.en token parity as the behavior fence; the implementation change
+  is a loop-order optimization inside an already pinned attention primitive.
+- `Done when`: attention context accumulation walks V rows contiguously without
+  changing generated tokens, focused model tests pass, exact local tiny.en token
+  parity still passes, and benchmark docs record the scalar impact.
+- `Status note`: landed on 2026-05-12. Scalar release proof passed exact token
+  parity. Total hook wall time improved from `2,817 ms` to `2,559 ms`;
+  resident audio-to-tokens improved from `2,753 ms` to `2,496 ms`; encoder
+  timing improved from `2,153 ms` to `1,896 ms`. This moves Ocelotl to `~4.5x`
+  whisper.cpp wall time.
+- `Out of scope`: weight packing, SIMD/GPU, changing default CPU mode, or
+  altering the public runtime API.

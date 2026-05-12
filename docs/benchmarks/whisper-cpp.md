@@ -412,3 +412,26 @@ small total-time difference is run-to-run noise. The useful result is the split:
 about 90% of `audio_encode` is now known to be encoder forward, so the next CPU
 optimization should target the encoder transformer path rather than
 cross-attention K/V setup.
+
+## W-ASR.31 Whisper Attention Context Accumulation Locality
+
+Whisper attention now accumulates each V row contiguously into the context row
+instead of walking V with a strided per-output-dimension loop. The per-dimension
+sum order stays key-position order, so token parity is unchanged, but the hot
+context accumulation loop is friendlier to CPU caches.
+
+Fresh scalar release run on the same tiny.en fixture:
+
+| Metric | W-ASR.30 scalar | W-ASR.31 scalar | Change |
+| ------ | --------------- | --------------- | ------ |
+| Total hook wall time | `2,817 ms` | `2,559 ms` | ~9% faster |
+| Resident audio to tokens | `2,753 ms` | `2,496 ms` | ~9% faster |
+| Audio encode total | `2,387 ms` | `2,132 ms` | ~11% faster |
+| Encoder | `2,153 ms` | `1,896 ms` | ~12% faster |
+| Cross-attention K/V precompute | `234 ms` | `235 ms` | noise |
+| Decode total | `320 ms` | `317 ms` | noise |
+| Log-mel | `46 ms` | `47 ms` | noise |
+
+Against the W-ASR.24 whisper.cpp wall-time baseline (`564 ms`), scalar Ocelotl
+is now about `4.5x` slower (`2,559 / 564`). The remaining dominant bottleneck
+is still encoder forward.

@@ -1015,13 +1015,15 @@ fn attention_from_projected(
                 *score = acc * scale;
             }
             softmax(&mut scores[..visible]);
+            let context_base = qi * state + head * head_dim;
             for dim in 0..head_dim {
-                let mut acc = 0.0_f32;
-                for (ki, &p) in scores.iter().enumerate().take(visible) {
-                    let v_base = ki * state + head * head_dim;
-                    acc += p * v[v_base + dim];
+                context[context_base + dim] = 0.0;
+            }
+            for (ki, &p) in scores.iter().enumerate().take(visible) {
+                let v_base = ki * state + head * head_dim;
+                for dim in 0..head_dim {
+                    context[context_base + dim] += p * v[v_base + dim];
                 }
-                context[qi * state + head * head_dim + dim] = acc;
             }
         }
     }
