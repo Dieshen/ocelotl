@@ -490,20 +490,39 @@ fn generate_tokens(
     let mut generated = policy.startup_prompt();
     let prompt_len = generated.len();
     let mask = policy.decode_mask();
+    let encoded_audio = model
+        .encode_audio_features(&mel.values, mel.frames)
+        .unwrap_or_else(|err| {
+            panic!(
+                "Whisper encode_audio_features failed before WER decode at generated length {} - {err:?}",
+                generated.len()
+            )
+        });
+    let mut decoder_state = model
+        .prepare_decoder_state_from_audio(&encoded_audio, &generated)
+        .unwrap_or_else(|err| {
+            panic!(
+                "Whisper prepare_decoder_state_from_audio failed at generated length {} - {err:?}",
+                generated.len()
+            )
+        });
 
     while generated.len() - prompt_len < max_new_tokens {
-        let logits = model
-            .forward_next_token_logits(&mel.values, mel.frames, &generated)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "Whisper forward_next_token_logits failed at generated length {} - {err:?}",
-                    generated.len()
-                )
-            });
-        let next = masked_greedy_sample(&logits, mask);
+        let logits = decoder_state.next_token_logits();
+        let next = masked_greedy_sample(logits, mask);
         generated.push(next);
         if next == policy.tokens.end_of_text {
             break;
+        }
+        if generated.len() - prompt_len < max_new_tokens {
+            model
+                .append_decoder_token_from_audio(&encoded_audio, &mut decoder_state, next)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "Whisper append_decoder_token_from_audio failed at generated length {} - {err:?}",
+                        generated.len()
+                    )
+                });
         }
     }
 

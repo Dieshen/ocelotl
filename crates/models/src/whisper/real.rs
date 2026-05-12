@@ -111,6 +111,19 @@ struct WhisperCrossAttentionCache {
     value: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhisperDecoderState {
+    tokens: Vec<TokenId>,
+    self_attention: Vec<WhisperSelfAttentionCache>,
+    next_token_logits: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WhisperSelfAttentionCache {
+    key: Vec<f32>,
+    value: Vec<f32>,
+}
+
 impl WhisperEncodedAudio {
     pub fn frames(&self) -> usize {
         self.frames
@@ -122,6 +135,16 @@ impl WhisperEncodedAudio {
 
     pub fn values(&self) -> &[f32] {
         &self.values
+    }
+}
+
+impl WhisperDecoderState {
+    pub fn tokens(&self) -> &[TokenId] {
+        &self.tokens
+    }
+
+    pub fn next_token_logits(&self) -> &[f32] {
+        &self.next_token_logits
     }
 }
 
@@ -203,29 +226,46 @@ impl WhisperModel {
         audio: &WhisperEncodedAudio,
         decoder_tokens: &[TokenId],
     ) -> Result<Vec<f32>> {
+        self.prepare_decoder_state_from_audio(audio, decoder_tokens)
+            .map(|state| state.next_token_logits)
+    }
+
+    pub fn prepare_decoder_state_from_audio(
+        &self,
+        audio: &WhisperEncodedAudio,
+        decoder_tokens: &[TokenId],
+    ) -> Result<WhisperDecoderState> {
         validate_encoded_audio(&self.config, audio)?;
         validate_decoder_tokens(&self.config, decoder_tokens)?;
 
-        let decoded = self.decode_tokens(decoder_tokens, audio)?;
-        let state = self.config.text_state_size;
-        let last_start = (decoder_tokens.len() - 1) * state;
-        let last = &decoded[last_start..last_start + state];
+        let (decoded, self_attention) =
+            self.decode_tokens_with_self_attention_cache(decoder_tokens, audio)?;
+        let state_size = self.config.text_state_size;
+        let last_start = (decoder_tokens.len() - 1) * state_size;
+        let last = &decoded[last_start..last_start + state_size];
+        let next_token_logits = self.project_decoder_logits(last)?;
 
-        let projection = if self.config.tie_word_embeddings {
-            self.weights.get("decoder.token_embedding.weight")
-        } else {
-            self.weights.get("decoder.proj_out.weight")
-        };
+        Ok(WhisperDecoderState {
+            tokens: decoder_tokens.to_vec(),
+            self_attention,
+            next_token_logits,
+        })
+    }
 
-        linear(
-            &self.kernels,
-            last,
-            1,
-            state,
-            projection,
-            self.config.vocab_size,
-            None,
-        )
+    pub fn append_decoder_token_from_audio<'a>(
+        &self,
+        audio: &WhisperEncodedAudio,
+        state: &'a mut WhisperDecoderState,
+        token: TokenId,
+    ) -> Result<&'a [f32]> {
+        validate_encoded_audio(&self.config, audio)?;
+        validate_decoder_state_for_append(&self.config, state)?;
+        validate_decoder_token(&self.config, token, state.tokens.len())?;
+
+        let next_token_logits = self.decode_appended_token(audio, state, token)?;
+        state.tokens.push(token);
+        state.next_token_logits = next_token_logits;
+        Ok(state.next_token_logits())
     }
 
     fn encode_audio(&self, log_mel: &[f32], mel_frames: usize) -> Result<Vec<f32>> {
@@ -337,15 +377,16 @@ impl WhisperModel {
         )
     }
 
-    fn decode_tokens(
+    fn decode_tokens_with_self_attention_cache(
         &self,
         decoder_tokens: &[TokenId],
         audio: &WhisperEncodedAudio,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<(Vec<f32>, Vec<WhisperSelfAttentionCache>)> {
         let seq = decoder_tokens.len();
         let text_state = self.config.text_state_size;
         let audio_seq = audio.frames();
         let mut x = vec![0.0_f32; seq * text_state];
+        let mut self_attention = Vec::with_capacity(self.config.text_layers);
         let token_embedding = self.weights.get("decoder.token_embedding.weight");
         let positional_embedding = self.weights.get("decoder.positional_embedding");
 
@@ -368,22 +409,47 @@ impl WhisperModel {
                 self.weights.get(&format!("{prefix}.attn_ln.bias")),
                 LAYER_NORM_EPS,
             )?;
-            let self_attn = attention(
+            let q = linear(
                 &self.kernels,
                 &attn_ln,
                 seq,
                 text_state,
-                self.config.text_attention_heads,
                 self.weights.get(&format!("{prefix}.attn.query.weight")),
-                self.weights.get(&format!("{prefix}.attn.query.bias")),
+                text_state,
+                Some(self.weights.get(&format!("{prefix}.attn.query.bias"))),
+            )?;
+            let key = linear(
+                &self.kernels,
+                &attn_ln,
+                seq,
+                text_state,
                 self.weights.get(&format!("{prefix}.attn.key.weight")),
+                text_state,
+                None,
+            )?;
+            let value = linear(
+                &self.kernels,
+                &attn_ln,
+                seq,
+                text_state,
                 self.weights.get(&format!("{prefix}.attn.value.weight")),
-                self.weights.get(&format!("{prefix}.attn.value.bias")),
+                text_state,
+                Some(self.weights.get(&format!("{prefix}.attn.value.bias"))),
+            )?;
+            let self_attn = attention_from_projected(
+                &self.kernels,
+                &q,
+                seq,
+                &key,
+                &value,
+                seq,
+                text_state,
+                self.config.text_attention_heads,
                 self.weights.get(&format!("{prefix}.attn.out.weight")),
                 self.weights.get(&format!("{prefix}.attn.out.bias")),
-                None,
                 true,
             )?;
+            self_attention.push(WhisperSelfAttentionCache { key, value });
             add_inplace(&mut x, &self_attn);
 
             let cross_ln = layer_norm(
@@ -435,13 +501,172 @@ impl WhisperModel {
             add_inplace(&mut x, &mlp);
         }
 
-        layer_norm(
+        let decoded = layer_norm(
             &x,
             seq,
             text_state,
             self.weights.get("decoder.ln.weight"),
             self.weights.get("decoder.ln.bias"),
             LAYER_NORM_EPS,
+        )?;
+        Ok((decoded, self_attention))
+    }
+
+    fn decode_appended_token(
+        &self,
+        audio: &WhisperEncodedAudio,
+        state: &mut WhisperDecoderState,
+        token: TokenId,
+    ) -> Result<Vec<f32>> {
+        let text_state = self.config.text_state_size;
+        let pos = state.tokens.len();
+        let token_embedding = self.weights.get("decoder.token_embedding.weight");
+        let positional_embedding = self.weights.get("decoder.positional_embedding");
+        let token_start = token.0 as usize * text_state;
+        let row_start = pos * text_state;
+        let mut x = vec![0.0_f32; text_state];
+        for dim in 0..text_state {
+            x[dim] = token_embedding[token_start + dim] + positional_embedding[row_start + dim];
+        }
+
+        let mut next_self_attention = Vec::with_capacity(self.config.text_layers);
+        for layer in 0..self.config.text_layers {
+            let prefix = format!("decoder.blocks.{layer}");
+            let attn_ln = layer_norm(
+                &x,
+                1,
+                text_state,
+                self.weights.get(&format!("{prefix}.attn_ln.weight")),
+                self.weights.get(&format!("{prefix}.attn_ln.bias")),
+                LAYER_NORM_EPS,
+            )?;
+            let q = linear(
+                &self.kernels,
+                &attn_ln,
+                1,
+                text_state,
+                self.weights.get(&format!("{prefix}.attn.query.weight")),
+                text_state,
+                Some(self.weights.get(&format!("{prefix}.attn.query.bias"))),
+            )?;
+            let key = linear(
+                &self.kernels,
+                &attn_ln,
+                1,
+                text_state,
+                self.weights.get(&format!("{prefix}.attn.key.weight")),
+                text_state,
+                None,
+            )?;
+            let value = linear(
+                &self.kernels,
+                &attn_ln,
+                1,
+                text_state,
+                self.weights.get(&format!("{prefix}.attn.value.weight")),
+                text_state,
+                Some(self.weights.get(&format!("{prefix}.attn.value.bias"))),
+            )?;
+            let cache = &state.self_attention[layer];
+            let self_attn = attention_incremental_from_projected(
+                &self.kernels,
+                &q,
+                &key,
+                &value,
+                &cache.key,
+                &cache.value,
+                state.tokens.len(),
+                text_state,
+                self.config.text_attention_heads,
+                self.weights.get(&format!("{prefix}.attn.out.weight")),
+                self.weights.get(&format!("{prefix}.attn.out.bias")),
+            )?;
+            next_self_attention.push(WhisperSelfAttentionCache { key, value });
+            add_inplace(&mut x, &self_attn);
+
+            let cross_ln = layer_norm(
+                &x,
+                1,
+                text_state,
+                self.weights.get(&format!("{prefix}.cross_attn_ln.weight")),
+                self.weights.get(&format!("{prefix}.cross_attn_ln.bias")),
+                LAYER_NORM_EPS,
+            )?;
+            let cross_cache = &audio.cross_attention[layer];
+            let cross_attn = attention_with_precomputed_kv(
+                &self.kernels,
+                &cross_ln,
+                1,
+                text_state,
+                self.config.text_attention_heads,
+                self.weights
+                    .get(&format!("{prefix}.cross_attn.query.weight")),
+                self.weights.get(&format!("{prefix}.cross_attn.query.bias")),
+                &cross_cache.key,
+                &cross_cache.value,
+                audio.frames(),
+                self.weights.get(&format!("{prefix}.cross_attn.out.weight")),
+                self.weights.get(&format!("{prefix}.cross_attn.out.bias")),
+                false,
+            )?;
+            add_inplace(&mut x, &cross_attn);
+
+            let mlp_ln = layer_norm(
+                &x,
+                1,
+                text_state,
+                self.weights.get(&format!("{prefix}.mlp_ln.weight")),
+                self.weights.get(&format!("{prefix}.mlp_ln.bias")),
+                LAYER_NORM_EPS,
+            )?;
+            let mlp = mlp_gelu(
+                &self.kernels,
+                &mlp_ln,
+                1,
+                text_state,
+                self.config.text_ffn_size,
+                self.weights.get(&format!("{prefix}.mlp.0.weight")),
+                self.weights.get(&format!("{prefix}.mlp.0.bias")),
+                self.weights.get(&format!("{prefix}.mlp.2.weight")),
+                self.weights.get(&format!("{prefix}.mlp.2.bias")),
+            )?;
+            add_inplace(&mut x, &mlp);
+        }
+
+        let decoded = layer_norm(
+            &x,
+            1,
+            text_state,
+            self.weights.get("decoder.ln.weight"),
+            self.weights.get("decoder.ln.bias"),
+            LAYER_NORM_EPS,
+        )?;
+        let logits = self.project_decoder_logits(&decoded)?;
+
+        for (cache, next) in state.self_attention.iter_mut().zip(next_self_attention) {
+            cache.key.extend_from_slice(&next.key);
+            cache.value.extend_from_slice(&next.value);
+        }
+
+        Ok(logits)
+    }
+
+    fn project_decoder_logits(&self, last: &[f32]) -> Result<Vec<f32>> {
+        let state = self.config.text_state_size;
+        let projection = if self.config.tie_word_embeddings {
+            self.weights.get("decoder.token_embedding.weight")
+        } else {
+            self.weights.get("decoder.proj_out.weight")
+        };
+
+        linear(
+            &self.kernels,
+            last,
+            1,
+            state,
+            projection,
+            self.config.vocab_size,
+            None,
         )
     }
 
@@ -774,6 +999,101 @@ fn attention_from_projected(
     linear(kernels, &context, q_seq, state, out_w, state, Some(out_b))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn attention_incremental_from_projected(
+    kernels: &CpuKernelBackend,
+    q: &[f32],
+    new_k: &[f32],
+    new_v: &[f32],
+    past_k: &[f32],
+    past_v: &[f32],
+    past_seq: usize,
+    state: usize,
+    heads: usize,
+    out_w: &[f32],
+    out_b: &[f32],
+) -> Result<Vec<f32>> {
+    if heads == 0 {
+        return Err(invalid_model("attention.heads", "must be > 0"));
+    }
+    if state % heads != 0 {
+        return Err(invalid_model(
+            "attention.state",
+            &format!("state {state} must be divisible by heads {heads}"),
+        ));
+    }
+    if q.len() != state {
+        return Err(invalid_request(
+            "attention.q",
+            &format!("expected length {state}, got {}", q.len()),
+        ));
+    }
+    if new_k.len() != state {
+        return Err(invalid_request(
+            "attention.new_key",
+            &format!("expected length {state}, got {}", new_k.len()),
+        ));
+    }
+    if new_v.len() != state {
+        return Err(invalid_request(
+            "attention.new_value",
+            &format!("expected length {state}, got {}", new_v.len()),
+        ));
+    }
+    let past_expected = checked_len_product("attention.past", &[past_seq, state])?;
+    if past_k.len() != past_expected {
+        return Err(invalid_request(
+            "attention.past_key",
+            &format!("expected length {past_expected}, got {}", past_k.len()),
+        ));
+    }
+    if past_v.len() != past_expected {
+        return Err(invalid_request(
+            "attention.past_value",
+            &format!("expected length {past_expected}, got {}", past_v.len()),
+        ));
+    }
+
+    let head_dim = state / heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let visible = past_seq
+        .checked_add(1)
+        .ok_or_else(|| invalid_request("attention.past", "past sequence length overflows usize"))?;
+    let mut scores = vec![0.0_f32; visible];
+    let mut context = vec![0.0_f32; state];
+
+    for head in 0..heads {
+        let q_base = head * head_dim;
+        for (ki, score) in scores.iter_mut().enumerate() {
+            let mut acc = 0.0_f32;
+            for dim in 0..head_dim {
+                let key_value = if ki < past_seq {
+                    past_k[ki * state + head * head_dim + dim]
+                } else {
+                    new_k[head * head_dim + dim]
+                };
+                acc += q[q_base + dim] * key_value;
+            }
+            *score = acc * scale;
+        }
+        softmax(&mut scores);
+        for dim in 0..head_dim {
+            let mut acc = 0.0_f32;
+            for (ki, &p) in scores.iter().enumerate() {
+                let value = if ki < past_seq {
+                    past_v[ki * state + head * head_dim + dim]
+                } else {
+                    new_v[head * head_dim + dim]
+                };
+                acc += p * value;
+            }
+            context[head * head_dim + dim] = acc;
+        }
+    }
+
+    linear(kernels, &context, 1, state, out_w, state, Some(out_b))
+}
+
 fn linear(
     kernels: &CpuKernelBackend,
     x: &[f32],
@@ -999,6 +1319,83 @@ fn validate_decoder_tokens(config: &WhisperConfig, decoder_tokens: &[TokenId]) -
     Ok(())
 }
 
+fn validate_decoder_token(config: &WhisperConfig, token: TokenId, position: usize) -> Result<()> {
+    if token.0 as usize >= config.vocab_size {
+        return Err(invalid_request(
+            "decoder_tokens",
+            &format!(
+                "token id {} at position {} is out of range for vocab_size {}",
+                token.0, position, config.vocab_size
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decoder_state_for_append(
+    config: &WhisperConfig,
+    state: &WhisperDecoderState,
+) -> Result<()> {
+    if state.tokens.is_empty() {
+        return Err(invalid_request("decoder_state.tokens", "must be non-empty"));
+    }
+    if state.tokens.len() >= config.text_context_length {
+        return Err(invalid_request(
+            "decoder_context_length",
+            &format!(
+                "decoder token length {} cannot accept another token because text_context_length is {}",
+                state.tokens.len(),
+                config.text_context_length
+            ),
+        ));
+    }
+    if state.self_attention.len() != config.text_layers {
+        return Err(invalid_request(
+            "decoder_state.self_attention",
+            &format!(
+                "expected {} decoder-layer self-attention caches, got {}",
+                config.text_layers,
+                state.self_attention.len()
+            ),
+        ));
+    }
+    let expected_cache = checked_len_product(
+        "decoder_state.self_attention",
+        &[state.tokens.len(), config.text_state_size],
+    )?;
+    for (layer, cache) in state.self_attention.iter().enumerate() {
+        if cache.key.len() != expected_cache {
+            return Err(invalid_request(
+                "decoder_state.self_attention.key",
+                &format!(
+                    "layer {layer} expected length {expected_cache}, got {}",
+                    cache.key.len()
+                ),
+            ));
+        }
+        if cache.value.len() != expected_cache {
+            return Err(invalid_request(
+                "decoder_state.self_attention.value",
+                &format!(
+                    "layer {layer} expected length {expected_cache}, got {}",
+                    cache.value.len()
+                ),
+            ));
+        }
+    }
+    if state.next_token_logits.len() != config.vocab_size {
+        return Err(invalid_request(
+            "decoder_state.next_token_logits",
+            &format!(
+                "expected length {}, got {}",
+                config.vocab_size,
+                state.next_token_logits.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn expected_shape(name: &str, config: &WhisperConfig) -> Result<Vec<usize>> {
     if name == "encoder.conv1.weight" {
         return Ok(vec![
@@ -1206,6 +1603,35 @@ mod tests {
     }
 
     #[test]
+    fn incremental_self_attention_matches_full_causal_last_row() {
+        let x = [1.0_f32, 2.0, 7.0];
+        let identity = [1.0_f32];
+        let zero = [0.0_f32];
+        let kernels = CpuKernelBackend::default();
+        let full = attention(
+            &kernels, &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None,
+            true,
+        )
+        .expect("full causal self attention");
+        let incremental = attention_incremental_from_projected(
+            &kernels,
+            &[0.0],
+            &[0.0],
+            &[7.0],
+            &[0.0, 0.0],
+            &[1.0, 2.0],
+            2,
+            1,
+            1,
+            &identity,
+            &zero,
+        )
+        .expect("incremental self attention");
+
+        assert_close(&incremental, &full[2..3], 0.0);
+    }
+
+    #[test]
     fn decoder_cross_attention_does_not_apply_causal_mask() {
         let text = [1.0_f32, 1.0];
         let audio = [1.0_f32, 2.0, 7.0];
@@ -1330,6 +1756,71 @@ mod tests {
         .expect("precomputed cross attention");
 
         assert_close(&precomputed, &projected, 0.0);
+    }
+
+    #[test]
+    fn decoder_state_append_matches_full_context_logits() {
+        let cfg = tiny_config();
+        let model = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("model");
+        let mel = vec![0.0_f32; 4 * cfg.mel_bins];
+        let audio = model.encode_audio_features(&mel, 4).expect("encoded audio");
+        let prompt = [TokenId(0)];
+        let appended = TokenId(2);
+
+        let full_prompt = model
+            .forward_next_token_logits_from_audio(&audio, &prompt)
+            .expect("full prompt logits");
+        let mut state = model
+            .prepare_decoder_state_from_audio(&audio, &prompt)
+            .expect("decoder state");
+        assert_eq!(state.tokens(), &prompt);
+        assert_eq!(state.self_attention.len(), cfg.text_layers);
+        for cache in &state.self_attention {
+            assert_eq!(cache.key.len(), prompt.len() * cfg.text_state_size);
+            assert_eq!(cache.value.len(), prompt.len() * cfg.text_state_size);
+        }
+        assert_close(state.next_token_logits(), &full_prompt, 0.0);
+
+        let full_appended = model
+            .forward_next_token_logits_from_audio(&audio, &[prompt[0], appended])
+            .expect("full appended logits");
+        let incremental_appended = model
+            .append_decoder_token_from_audio(&audio, &mut state, appended)
+            .expect("incremental appended logits")
+            .to_vec();
+
+        assert_eq!(state.tokens(), &[prompt[0], appended]);
+        for cache in &state.self_attention {
+            assert_eq!(cache.key.len(), state.tokens().len() * cfg.text_state_size);
+            assert_eq!(
+                cache.value.len(),
+                state.tokens().len() * cfg.text_state_size
+            );
+        }
+        assert_close(&incremental_appended, &full_appended, 1.0e-5);
+        assert_close(state.next_token_logits(), &full_appended, 1.0e-5);
+    }
+
+    #[test]
+    fn decoder_state_append_rejects_context_overflow_before_compute() {
+        let cfg = tiny_config();
+        let model = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("model");
+        let mel = vec![0.0_f32; 4 * cfg.mel_bins];
+        let audio = model.encode_audio_features(&mel, 4).expect("encoded audio");
+        let mut state = model
+            .prepare_decoder_state_from_audio(&audio, &[TokenId(0), TokenId(1), TokenId(2)])
+            .expect("full decoder state");
+
+        let err = model
+            .append_decoder_token_from_audio(&audio, &mut state, TokenId(3))
+            .expect_err("context overflow must fail");
+
+        match err {
+            ocelotl_core::OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "decoder_context_length");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     #[test]

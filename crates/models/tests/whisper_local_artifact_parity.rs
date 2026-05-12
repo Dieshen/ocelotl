@@ -1234,20 +1234,31 @@ fn generate_tokens_to_expected_length(
                 generated.len()
             )
         });
+    let mut decoder_state = model
+        .prepare_decoder_state_from_audio(&encoded_audio, &generated)
+        .unwrap_or_else(|err| {
+            panic!(
+                "Whisper prepare_decoder_state_from_audio failed at generated length {} - {err:?}",
+                generated.len()
+            )
+        });
 
     while generated.len() < expected_len {
-        let logits = model
-            .forward_next_token_logits_from_audio(&encoded_audio, &generated)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "Whisper forward_next_token_logits_from_audio failed at generated length {} - {err:?}",
-                    generated.len()
-                )
-            });
-        let next = masked_greedy_sample(&logits, mask);
+        let logits = decoder_state.next_token_logits();
+        let next = masked_greedy_sample(logits, mask);
         generated.push(next);
         if next == policy.tokens.end_of_text {
             break;
+        }
+        if generated.len() < expected_len {
+            model
+                .append_decoder_token_from_audio(&encoded_audio, &mut decoder_state, next)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "Whisper append_decoder_token_from_audio failed at generated length {} - {err:?}",
+                        generated.len()
+                    )
+                });
         }
     }
 

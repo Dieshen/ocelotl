@@ -419,23 +419,35 @@ fn generate_tokens_to_expected_length(
 ) -> Result<Vec<TokenId>, String> {
     let mut generated = policy.startup_prompt();
     let mask = WhisperDecodeMask::transcribe_without_timestamps(policy.tokens);
+    let mut decoder_state = model
+        .prepare_decoder_state_from_audio(encoded_audio, &generated)
+        .map_err(|err| {
+            format!(
+                "Whisper prepare_decoder_state_from_audio failed at generated length {} - {err:?}",
+                generated.len()
+            )
+        })?;
 
     while generated.len() < expected_len {
         let token_started = Instant::now();
-        let logits = model
-            .forward_next_token_logits_from_audio(encoded_audio, &generated)
-            .map_err(|err| {
-                format!(
-                    "Whisper forward_next_token_logits_from_audio failed at generated length {} - {err:?}",
-                    generated.len()
-                )
-            })?;
-        let next = masked_greedy_sample(&logits, mask)?;
-        decode_token_ms.push(token_started.elapsed().as_millis());
+        let logits = decoder_state.next_token_logits();
+        let next = masked_greedy_sample(logits, mask)?;
         generated.push(next);
         if next == policy.tokens.end_of_text {
+            decode_token_ms.push(token_started.elapsed().as_millis());
             break;
         }
+        if generated.len() < expected_len {
+            model
+                .append_decoder_token_from_audio(encoded_audio, &mut decoder_state, next)
+                .map_err(|err| {
+                    format!(
+                        "Whisper append_decoder_token_from_audio failed at generated length {} - {err:?}",
+                        generated.len()
+                    )
+                })?;
+        }
+        decode_token_ms.push(token_started.elapsed().as_millis());
     }
 
     Ok(generated)

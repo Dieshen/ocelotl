@@ -418,3 +418,22 @@ Ocelotl can run real Whisper weights yet.
   scalar and stays opt-in.
 - `Out of scope`: decoder self-attention KV reuse, one-token incremental
   decoder execution, FFT log-mel, and Whisper-specific weight packing.
+
+## W-ASR.27 Cache Whisper Decoder Self-Attention K/V
+
+- `Crates`: `ocelotl-models`, `ocelotl-runtime`, root CLI benchmark hook,
+  local proof helpers, and benchmark docs.
+- `Test first`: add regressions proving incremental self-attention matches the
+  full causal last-row result and that appending a decoder token produces logits
+  matching the full-context path.
+- `Done when`: real Whisper decode owns a `WhisperDecoderState` with per-layer
+  self-attention K/V caches, runtime transcription and benchmark loops append
+  generated tokens through that state, exact local tiny.en token parity still
+  passes, and benchmark docs record the before/after CPU impact.
+- `Status note`: landed on 2026-05-12. Scalar release proof passed exact token
+  parity. Total hook wall time improved from `8,582 ms` to `7,409 ms`;
+  resident audio-to-tokens improved from `4,635 ms` to `3,506 ms`; decode total
+  improved from `1,519 ms` to `319 ms`. Optimized mode remains slower than
+  scalar and stays opt-in.
+- `Out of scope`: encoder/audio-stage optimization, FFT log-mel,
+  Whisper-specific weight packing, and making optimized CPU mode the default.

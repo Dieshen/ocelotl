@@ -278,3 +278,45 @@ Current scalar hot spots after W-ASR.26:
 The next CPU speed task should target decoder self-attention KV reuse /
 one-token incremental decode. After that, the obvious remaining CPU work is
 FFT-based log-mel and Whisper-specific projection weight packing.
+
+## W-ASR.27 Decoder Self-Attention K/V Cache
+
+The decoder now prepares a `WhisperDecoderState` for the startup prompt and
+then appends generated tokens one at a time. Each decoder layer keeps
+self-attention key/value projections for the current prefix, so generation no
+longer reruns the full decoder prefix for every new token. The older stateless
+`forward_next_token_logits_from_audio` API remains available and delegates
+through the same state preparation path; runtime transcription, local parity
+helpers, WER corpus helpers, and the benchmark hook use the cache-aware loop.
+
+Fresh scalar release run on the same tiny.en fixture:
+
+| Metric | W-ASR.26 scalar | W-ASR.27 scalar | Change |
+| ------ | --------------- | --------------- | ------ |
+| Total hook wall time | `8,582 ms` | `7,409 ms` | ~14% faster |
+| Resident audio to tokens | `4,635 ms` | `3,506 ms` | ~24% faster |
+| Resident mel to tokens | `3,884 ms` | `2,729 ms` | ~30% faster |
+| Decode total | `1,519 ms` | `319 ms` | ~79% faster |
+
+Optimized mode still passes exact token parity but remains slower than scalar
+for Whisper: `8,849 ms` total, `5,023 ms` resident audio-to-tokens, and
+`1,591 ms` decode total. Scalar remains the correct Whisper default.
+
+Current scalar hot spots after W-ASR.27:
+
+- `tensor_load_model`: `3,901 ms` startup cost.
+- `audio_encode`: `2,410 ms`, including encoder forward and one-time
+  cross-attention K/V precompute.
+- `log_mel`: `777 ms`.
+- `decode_total`: `319 ms`.
+
+Against the W-ASR.24 whisper.cpp wall-time baseline (`564 ms`), the scalar
+Ocelotl hook is now about `13.1x` slower by total wall time. It is materially
+closer, but still fails the documented `<=10x` first CPU competitiveness gate.
+The loaded-model resident audio-to-tokens view is about `6.2x` that baseline,
+which is useful product signal but not a replacement for the wall-time gate.
+
+The next CPU task should break down `audio_encode` internally before more broad
+optimization. Likely follow-ups are encoder/projection weight packing and
+FFT-based log-mel; decoder work is no longer the dominant resident bottleneck
+for tiny.en.

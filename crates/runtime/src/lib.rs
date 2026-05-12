@@ -311,8 +311,9 @@ pub fn prepare_whisper_transcription(
 ///
 /// This is the W-ASR.22 runtime path: callers can hold
 /// `WhisperTranscriptionState` and avoid recomputing the encoder for each
-/// generated token. Decoder self-attention KV reuse is deliberately not part of
-/// this API; that remains a future cache task.
+/// generated token. W-ASR.27 also keeps a decoder state inside this loop so
+/// decoder self-attention K/V grows one token at a time instead of recomputing
+/// the full decoder prefix for every generated token.
 pub fn decode_whisper_transcription(
     model: &WhisperModel,
     state: &WhisperTranscriptionState,
@@ -320,17 +321,24 @@ pub fn decode_whisper_transcription(
 ) -> Result<WhisperTranscriptionResponse> {
     validate_whisper_decode_request(model, request)?;
 
-    let mut context = request.decoder_prompt_tokens.clone();
+    let mut decoder_state = model
+        .prepare_decoder_state_from_audio(state.encoded_audio(), &request.decoder_prompt_tokens)?;
     let mut tokens = Vec::with_capacity(request.max_new_tokens);
     let mut logits = Vec::new();
 
     for _ in 0..request.max_new_tokens {
-        logits = model.forward_next_token_logits_from_audio(state.encoded_audio(), &context)?;
+        logits = decoder_state.next_token_logits().to_vec();
         let next = masked_greedy_sample(&logits, request.decode_mask)?;
         tokens.push(next);
-        context.push(next);
         if next == request.stop_token {
             break;
+        }
+        if tokens.len() < request.max_new_tokens {
+            model.append_decoder_token_from_audio(
+                state.encoded_audio(),
+                &mut decoder_state,
+                next,
+            )?;
         }
     }
 
