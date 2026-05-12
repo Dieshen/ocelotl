@@ -301,3 +301,64 @@ Ocelotl can run real Whisper weights yet.
   load large weights.
 - `Out of scope`: `large-v3`, `turbo`, multilingual quality claims, and making
   every size mandatory for CI.
+
+## W-ASR.20 Add Stage-Level Whisper CPU Timing
+
+- `Crates`: root CLI first; `ocelotl-models` only if timing requires an API
+  seam that is already part of the production shape.
+- `Test first`: add a default-on test that pins the Ocelotl benchmark output
+  schema includes `timings_ms` for config parsing, manifest validation,
+  expected-token read, tensor load/model construction, WAV read, log-mel,
+  audio encode, decode total, and per-generated-token decode timing.
+- `Done when`: `ocelotl bench-whisper-transcribe` emits stage-level timing
+  fields in its JSON output, the whisper.cpp benchmark record preserves those
+  fields inside the Ocelotl stdout excerpt, and local benchmark runs can identify
+  whether model load, encoder, or decoder work dominates.
+- `Out of scope`: making the CPU backend faster; this task adds measurement and
+  the minimum production-shaped API seam needed to measure encoder reuse.
+
+## W-ASR.21 Add Whisper Encoded-Audio Session State
+
+- `Crates`: `ocelotl-models`, then `ocelotl-runtime` once the model API is
+  proven.
+- `Test first`: prove that logits computed from cached encoded audio exactly
+  match the legacy `forward_next_token_logits(log_mel, tokens)` wrapper on a
+  synthetic Whisper fixture, and that malformed encoded-audio shapes fail before
+  compute.
+- `Done when`: Whisper exposes an Ocelotl-owned encoded-audio/session type,
+  public runtime transcription can hold that state while decoding, and the
+  legacy no-cache wrapper remains available for reference parity.
+- `Out of scope`: KV cache reuse for decoder self-attention; this task only
+  separates invariant audio encoder output from token decode.
+
+## W-ASR.22 Reuse Encoder Output During Decode
+
+- `Crates`: root CLI benchmark hook, `ocelotl-runtime`, and any tests that run
+  autoregressive local-artifact parity.
+- `Test first`: add or update a local/synthetic decode test proving a
+  cached-audio decode loop returns the same token IDs as the legacy loop.
+- `Done when`: the benchmark hook and runtime transcription path encode audio
+  once per audio chunk and reuse the encoded audio for every generated token.
+  Stage timings should show encoder time paid once, not once per token.
+- `Out of scope`: optimizing decoder kernels or introducing decoder KV cache.
+
+## W-ASR.23 Add Optimized CPU Kernel Selection
+
+- `Crates`: `ocelotl-kernels`, then model callers.
+- `Test first`: add backend-selection tests that prove the default scalar path
+  remains available and an optimized CPU path can be selected without changing
+  public model outputs.
+- `Done when`: CPU kernel selection is explicit and Ocelotl can route hot
+  matmul/attention work to a faster CPU implementation while preserving scalar
+  fallback for correctness and portability.
+- `Out of scope`: GPU/CubeCL and quantization-specific kernels.
+
+## W-ASR.24 Refresh whisper.cpp Baseline and Set CPU Gates
+
+- `Crates`: docs, benchmark fixtures, and local tooling.
+- `Test first`: update benchmark record-shape tests if the record starts
+  carrying parsed stage timing fields rather than only stdout excerpts.
+- `Done when`: a fresh local tiny.en whisper.cpp comparison is captured after
+  W-ASR.20-W-ASR.23, the performance delta is documented, and follow-up CPU
+  gates are stated as measurable targets rather than generic optimization work.
+- `Out of scope`: claiming parity across all Whisper sizes or across GPU.

@@ -4,8 +4,8 @@ use std::time::Instant;
 use ocelotl_core::TokenId;
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensor_f32};
 use ocelotl_models::whisper::{
-    WhisperConfig, WhisperModel,
-    audio::{AudioMetadata, LogMelSpectrogram, log_mel_spectrogram},
+    WhisperConfig, WhisperEncodedAudio, WhisperModel,
+    audio::{AudioMetadata, log_mel_spectrogram},
     parse_whisper_config_json, required_whisper_tensor_names, validate_whisper_tensors,
 };
 use ocelotl_tokenizer::{
@@ -27,6 +27,20 @@ struct BenchWhisperArgs {
 #[derive(Debug, Deserialize)]
 struct ExpectedTokens {
     expected_token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BenchWhisperTimings {
+    total_ms: u128,
+    config_parse_ms: u128,
+    manifest_validate_ms: u128,
+    expected_tokens_read_ms: u128,
+    tensor_load_model_ms: u128,
+    wav_read_ms: u128,
+    log_mel_ms: u128,
+    audio_encode_ms: u128,
+    decode_total_ms: u128,
+    decode_token_ms: Vec<u128>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +192,7 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
     ensure_file(&args.audio_path, "audio")?;
     ensure_file(&args.expected_tokens_path, "expected tokens")?;
 
+    let config_started = Instant::now();
     let config_raw = std::fs::read_to_string(&args.config_path).map_err(|err| {
         format!(
             "failed to read config at {} - {err}",
@@ -190,7 +205,9 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
             args.config_path.display()
         )
     })?;
+    let config_parse_ms = config_started.elapsed().as_millis();
 
+    let manifest_started = Instant::now();
     let manifest = inspect_safetensors(&args.model_path).map_err(|err| {
         format!(
             "failed to inspect model at {} - {err:?}",
@@ -205,7 +222,9 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
             )
         },
     )?;
+    let manifest_validate_ms = manifest_started.elapsed().as_millis();
 
+    let expected_started = Instant::now();
     let expected_tokens = read_expected_tokens(&args.expected_tokens_path)?;
     if expected_tokens.is_empty() {
         return Err("expected token sequence must be non-empty".to_string());
@@ -217,14 +236,21 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
             whisper_config.text_context_length
         ));
     }
+    let expected_tokens_read_ms = expected_started.elapsed().as_millis();
 
+    let tensor_started = Instant::now();
     let model = WhisperModel::new(
         whisper_config.clone(),
         load_required_whisper_tensors(&args.model_path, &whisper_config)?,
     )
     .map_err(|err| format!("failed to construct Whisper model - {err:?}"))?;
+    let tensor_load_model_ms = tensor_started.elapsed().as_millis();
 
+    let wav_started = Instant::now();
     let wav = read_wav_mono_samples(&args.audio_path)?;
+    let wav_read_ms = wav_started.elapsed().as_millis();
+
+    let log_mel_started = Instant::now();
     let mel = log_mel_spectrogram(
         &wav.samples,
         AudioMetadata {
@@ -233,21 +259,41 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
         },
     )
     .map_err(|err| format!("failed to compute Whisper log-mel spectrogram - {err:?}"))?;
+    let log_mel_ms = log_mel_started.elapsed().as_millis();
 
     let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
-    let generated =
-        generate_tokens_to_expected_length(&model, &mel, expected_tokens.len(), decode_policy)?;
+    let audio_encode_started = Instant::now();
+    let encoded_audio = model
+        .encode_audio_features(&mel.values, mel.frames)
+        .map_err(|err| format!("failed to encode Whisper audio features - {err:?}"))?;
+    let audio_encode_ms = audio_encode_started.elapsed().as_millis();
+
+    let decode_started = Instant::now();
+    let mut decode_token_ms = Vec::new();
+    let generated = generate_tokens_to_expected_length(
+        &model,
+        &encoded_audio,
+        expected_tokens.len(),
+        decode_policy,
+        &mut decode_token_ms,
+    )?;
+    let decode_total_ms = decode_started.elapsed().as_millis();
     let elapsed_ms = started.elapsed().as_millis();
 
     let matches_expected = generated == expected_tokens;
-    let token_ids: Vec<u32> = generated.iter().map(|token| token.0).collect();
-    let output = serde_json::json!({
-        "status": if matches_expected { "completed" } else { "mismatch" },
-        "elapsed_ms": elapsed_ms,
-        "token_count": generated.len(),
-        "tokens": token_ids,
-        "matches_expected": matches_expected
-    });
+    let timings = BenchWhisperTimings {
+        total_ms: elapsed_ms,
+        config_parse_ms,
+        manifest_validate_ms,
+        expected_tokens_read_ms,
+        tensor_load_model_ms,
+        wav_read_ms,
+        log_mel_ms,
+        audio_encode_ms,
+        decode_total_ms,
+        decode_token_ms,
+    };
+    let output = bench_whisper_output(matches_expected, &generated, &timings);
     println!("{output}");
 
     if matches_expected {
@@ -255,6 +301,33 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
     } else {
         Err("generated tokens did not match expected token fixture".to_string())
     }
+}
+
+fn bench_whisper_output(
+    matches_expected: bool,
+    generated: &[TokenId],
+    timings: &BenchWhisperTimings,
+) -> serde_json::Value {
+    let token_ids: Vec<u32> = generated.iter().map(|token| token.0).collect();
+    serde_json::json!({
+        "status": if matches_expected { "completed" } else { "mismatch" },
+        "elapsed_ms": timings.total_ms,
+        "token_count": generated.len(),
+        "tokens": token_ids,
+        "matches_expected": matches_expected,
+        "timings_ms": {
+            "total": timings.total_ms,
+            "config_parse": timings.config_parse_ms,
+            "manifest_validate": timings.manifest_validate_ms,
+            "expected_tokens_read": timings.expected_tokens_read_ms,
+            "tensor_load_model": timings.tensor_load_model_ms,
+            "wav_read": timings.wav_read_ms,
+            "log_mel": timings.log_mel_ms,
+            "audio_encode": timings.audio_encode_ms,
+            "decode_total": timings.decode_total_ms,
+            "decode_token": timings.decode_token_ms,
+        }
+    })
 }
 
 fn ensure_file(path: &Path, label: &str) -> Result<(), String> {
@@ -306,23 +379,26 @@ fn load_required_whisper_tensors(
 
 fn generate_tokens_to_expected_length(
     model: &WhisperModel,
-    mel: &LogMelSpectrogram,
+    encoded_audio: &WhisperEncodedAudio,
     expected_len: usize,
     policy: WhisperArtifactDecodePolicy,
+    decode_token_ms: &mut Vec<u128>,
 ) -> Result<Vec<TokenId>, String> {
     let mut generated = policy.startup_prompt();
     let mask = WhisperDecodeMask::transcribe_without_timestamps(policy.tokens);
 
     while generated.len() < expected_len {
+        let token_started = Instant::now();
         let logits = model
-            .forward_next_token_logits(&mel.values, mel.frames, &generated)
+            .forward_next_token_logits_from_audio(encoded_audio, &generated)
             .map_err(|err| {
                 format!(
-                    "Whisper forward_next_token_logits failed at generated length {} - {err:?}",
+                    "Whisper forward_next_token_logits_from_audio failed at generated length {} - {err:?}",
                     generated.len()
                 )
             })?;
         let next = masked_greedy_sample(&logits, mask)?;
+        decode_token_ms.push(token_started.elapsed().as_millis());
         generated.push(next);
         if next == policy.tokens.end_of_text {
             break;
@@ -509,4 +585,44 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, String> {
         .get(offset..end)
         .ok_or_else(|| "unexpected EOF while reading u32".to_string())?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_whisper_output_reports_stage_timings() {
+        let timings = BenchWhisperTimings {
+            total_ms: 100,
+            config_parse_ms: 1,
+            manifest_validate_ms: 2,
+            expected_tokens_read_ms: 3,
+            tensor_load_model_ms: 4,
+            wav_read_ms: 5,
+            log_mel_ms: 6,
+            audio_encode_ms: 7,
+            decode_total_ms: 8,
+            decode_token_ms: vec![9, 10],
+        };
+
+        let output = bench_whisper_output(true, &[TokenId(50257), TokenId(50362)], &timings);
+
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["elapsed_ms"], 100);
+        assert_eq!(output["token_count"], 2);
+        assert_eq!(output["timings_ms"]["total"], 100);
+        assert_eq!(output["timings_ms"]["config_parse"], 1);
+        assert_eq!(output["timings_ms"]["manifest_validate"], 2);
+        assert_eq!(output["timings_ms"]["expected_tokens_read"], 3);
+        assert_eq!(output["timings_ms"]["tensor_load_model"], 4);
+        assert_eq!(output["timings_ms"]["wav_read"], 5);
+        assert_eq!(output["timings_ms"]["log_mel"], 6);
+        assert_eq!(output["timings_ms"]["audio_encode"], 7);
+        assert_eq!(output["timings_ms"]["decode_total"], 8);
+        assert_eq!(
+            output["timings_ms"]["decode_token"],
+            serde_json::json!([9, 10])
+        );
+    }
 }

@@ -87,9 +87,10 @@ target/release/ocelotl.exe bench-whisper-transcribe `
 ```
 
 The hook loads the Ocelotl safetensors bundle, decodes the shared WAV input,
-runs the current no-timestamps transcription path to the expected token length,
-and prints a JSON summary. It is a timing hook for local comparison, not a
-throughput-optimized public transcription CLI.
+encodes audio once, runs the current no-timestamps transcription path to the
+expected token length using the encoded-audio state, and prints a JSON summary.
+It is a timing hook for local comparison, not a throughput-optimized public
+transcription CLI.
 
 The whisper.cpp side of the example manifest runs:
 
@@ -141,9 +142,21 @@ are expected on machines that have not prepared `local-artifacts/`.
 
 A completed benchmark record names both command lines, both model paths, the
 shared audio path, thread count, exit code, wall-clock time in milliseconds, and
-an output summary. The output summary is intentionally loose at W-ASR.13: it may
-carry token count, text, or a stdout excerpt depending on the target. Do not
-compare transcripts here as a correctness gate.
+an output summary. The Ocelotl stdout JSON includes `timings_ms` with:
+
+- `config_parse`
+- `manifest_validate`
+- `expected_tokens_read`
+- `tensor_load_model`
+- `wav_read`
+- `log_mel`
+- `audio_encode`
+- `decode_total`
+- `decode_token`
+
+The output summary is intentionally loose at W-ASR.13/W-ASR.20: it may carry
+token count, text, or a stdout excerpt depending on the target. Do not compare
+transcripts here as a correctness gate.
 
 ## Current Limits
 
@@ -151,7 +164,9 @@ compare transcripts here as a correctness gate.
   CLI.
 - The Ocelotl and whisper.cpp model files use different on-disk formats, so the
   manifest must name both paths even when they represent the same tiny.en model.
-- The harness records wall-clock command time only. It does not separate model
-  load, preprocessing, encoder, decoder, or text decode timings yet.
-- No performance parity claim exists until real local records are captured and
-  reviewed.
+- The runner records wall-clock command time for both sides. Only the Ocelotl
+  side currently emits stage-level timings.
+- No CPU performance parity claim exists yet. The 2026-05-12 tiny.en local run
+  after encoded-audio reuse measured Ocelotl at 14,248 ms and whisper.cpp at
+  483 ms (about 29.5x slower). Before encoder reuse, the same local comparison
+  measured about 65,591 ms versus 550 ms (about 119.3x slower).

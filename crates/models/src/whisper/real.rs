@@ -96,6 +96,27 @@ pub struct WhisperModel {
     weights: WhisperWeights,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhisperEncodedAudio {
+    frames: usize,
+    state_size: usize,
+    values: Vec<f32>,
+}
+
+impl WhisperEncodedAudio {
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+
+    pub fn state_size(&self) -> usize {
+        self.state_size
+    }
+
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+}
+
 impl WhisperModel {
     pub fn new(config: WhisperConfig, tensors: Vec<LoadedTensor>) -> Result<Self> {
         let config = config.validate()?;
@@ -115,8 +136,52 @@ impl WhisperModel {
     ) -> Result<Vec<f32>> {
         validate_forward_request(&self.config, log_mel, mel_frames, decoder_tokens)?;
 
-        let audio = self.encode_audio(log_mel, mel_frames)?;
-        let decoded = self.decode_tokens(decoder_tokens, &audio)?;
+        let audio = self.encode_audio_features(log_mel, mel_frames)?;
+        self.forward_next_token_logits_from_audio(&audio, decoder_tokens)
+    }
+
+    pub fn encode_audio_features(
+        &self,
+        log_mel: &[f32],
+        mel_frames: usize,
+    ) -> Result<WhisperEncodedAudio> {
+        validate_audio_request(&self.config, log_mel, mel_frames)?;
+
+        let values = self.encode_audio(log_mel, mel_frames)?;
+        let state_size = self.config.audio_state_size;
+        if values.len() % state_size != 0 {
+            return Err(invalid_model(
+                "encoded_audio",
+                &format!(
+                    "encoded audio length {} is not divisible by audio_state_size {state_size}",
+                    values.len()
+                ),
+            ));
+        }
+        let frames = values.len() / state_size;
+        if frames == 0 {
+            return Err(invalid_model(
+                "encoded_audio",
+                "encoder produced zero audio frames",
+            ));
+        }
+
+        Ok(WhisperEncodedAudio {
+            frames,
+            state_size,
+            values,
+        })
+    }
+
+    pub fn forward_next_token_logits_from_audio(
+        &self,
+        audio: &WhisperEncodedAudio,
+        decoder_tokens: &[TokenId],
+    ) -> Result<Vec<f32>> {
+        validate_encoded_audio(&self.config, audio)?;
+        validate_decoder_tokens(&self.config, decoder_tokens)?;
+
+        let decoded = self.decode_tokens(decoder_tokens, audio.values())?;
         let state = self.config.text_state_size;
         let last_start = (decoder_tokens.len() - 1) * state;
         let last = &decoded[last_start..last_start + state];
@@ -672,6 +737,15 @@ fn validate_forward_request(
     mel_frames: usize,
     decoder_tokens: &[TokenId],
 ) -> Result<()> {
+    validate_audio_request(config, log_mel, mel_frames)?;
+    validate_decoder_tokens(config, decoder_tokens)
+}
+
+fn validate_audio_request(
+    config: &WhisperConfig,
+    log_mel: &[f32],
+    mel_frames: usize,
+) -> Result<()> {
     if mel_frames == 0 {
         return Err(invalid_request("mel_frames", "must be > 0"));
     }
@@ -682,6 +756,33 @@ fn validate_forward_request(
             &format!("expected length {mel_len}, got {}", log_mel.len()),
         ));
     }
+    Ok(())
+}
+
+fn validate_encoded_audio(config: &WhisperConfig, audio: &WhisperEncodedAudio) -> Result<()> {
+    if audio.frames == 0 {
+        return Err(invalid_request("encoded_audio.frames", "must be > 0"));
+    }
+    if audio.state_size != config.audio_state_size {
+        return Err(invalid_request(
+            "encoded_audio.state_size",
+            &format!(
+                "expected audio_state_size {}, got {}",
+                config.audio_state_size, audio.state_size
+            ),
+        ));
+    }
+    let expected = checked_len_product("encoded_audio", &[audio.frames, audio.state_size])?;
+    if audio.values.len() != expected {
+        return Err(invalid_request(
+            "encoded_audio.values",
+            &format!("expected length {expected}, got {}", audio.values.len()),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decoder_tokens(config: &WhisperConfig, decoder_tokens: &[TokenId]) -> Result<()> {
     if decoder_tokens.is_empty() {
         return Err(invalid_request("decoder_tokens", "must be non-empty"));
     }
@@ -973,6 +1074,49 @@ mod tests {
                 assert!(invalid.message.contains("expected"));
             }
             other => panic!("expected InvalidModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_audio_logits_match_legacy_forward_path() {
+        let cfg = tiny_config();
+        let model = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("model");
+        let mel = vec![0.0_f32; 4 * cfg.mel_bins];
+        let tokens = [TokenId(0), TokenId(2)];
+
+        let legacy = model
+            .forward_next_token_logits(&mel, 4, &tokens)
+            .expect("legacy forward");
+        let audio = model.encode_audio_features(&mel, 4).expect("encoded audio");
+        let cached = model
+            .forward_next_token_logits_from_audio(&audio, &tokens)
+            .expect("cached forward");
+
+        assert_eq!(audio.frames(), 2);
+        assert_eq!(audio.state_size(), cfg.audio_state_size);
+        assert_eq!(audio.values().len(), audio.frames() * audio.state_size());
+        assert_close(&cached, &legacy, 0.0);
+    }
+
+    #[test]
+    fn cached_audio_forward_rejects_wrong_state_size_before_compute() {
+        let cfg = tiny_config();
+        let model = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("model");
+        let audio = WhisperEncodedAudio {
+            frames: 1,
+            state_size: cfg.audio_state_size + 1,
+            values: vec![0.0; cfg.audio_state_size + 1],
+        };
+
+        let err = model
+            .forward_next_token_logits_from_audio(&audio, &[TokenId(0)])
+            .expect_err("wrong encoded audio shape must fail");
+
+        match err {
+            ocelotl_core::OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "encoded_audio.state_size");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
         }
     }
 
