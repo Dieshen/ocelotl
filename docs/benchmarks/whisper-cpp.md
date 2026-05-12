@@ -354,3 +354,35 @@ resident scalar hot spots are now:
 The next task should target resident audio processing, starting with an
 internal timing split for `audio_encode` so encoder forward and cross-attention
 K/V precompute are measured separately before optimizing either path.
+
+## W-ASR.29 Precomputed STFT Fourier Basis
+
+`log_mel_spectrogram` now precomputes the fixed 400-point STFT Fourier basis
+once with `OnceLock` and reuses it across frames. This keeps the same reference
+DFT math but removes repeated `sin`/`cos` calls from the per-frame hot loop.
+
+Fresh scalar release run on the same tiny.en fixture:
+
+| Metric | W-ASR.28 scalar | W-ASR.29 scalar | Change |
+| ------ | --------------- | --------------- | ------ |
+| Total hook wall time | `3,620 ms` | `2,859 ms` | ~21% faster |
+| Resident audio to tokens | `3,557 ms` | `2,795 ms` | ~21% faster |
+| Log-mel | `758 ms` | `45 ms` | ~94% faster |
+| Audio encode | `2,455 ms` | `2,402 ms` | noise |
+| Decode total | `344 ms` | `348 ms` | noise |
+
+Optimized mode remains parity-clean but slower for Whisper: `4,489 ms` total,
+`4,427 ms` resident audio-to-tokens, `2,746 ms` audio encode, and `1,636 ms`
+decode total.
+
+Against the W-ASR.24 whisper.cpp wall-time baseline (`564 ms`), scalar Ocelotl
+is now about `5.1x` slower (`2,859 / 564`). That is closer but still does not
+clear the `<=3x` competitive claim gate. The remaining scalar hot spots are now:
+
+- `audio_encode`: `2,402 ms`.
+- `decode_total`: `348 ms`.
+- `tensor_load_model`: `60 ms`.
+- `log_mel`: `45 ms`.
+
+The next CPU task should split `audio_encode` into encoder forward vs
+cross-attention K/V precompute and then optimize the dominant half.

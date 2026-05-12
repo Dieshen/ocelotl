@@ -1,6 +1,6 @@
 //! Whisper audio preprocessing boundary.
 
-use std::f32::consts::PI;
+use std::{f32::consts::PI, sync::OnceLock};
 
 use ocelotl_core::{OcelotlError, Result, UnsupportedError};
 
@@ -11,6 +11,14 @@ pub const WHISPER_MEL_BINS: usize = 80;
 
 const WHISPER_POWER_FLOOR: f32 = 1e-10;
 const SLANEY_LOG_STEP: f32 = 1.856_298 / 27.0;
+
+static FOURIER_BASIS: OnceLock<Vec<FourierBin>> = OnceLock::new();
+
+#[derive(Debug)]
+struct FourierBin {
+    cos: [f32; WHISPER_FFT_SIZE],
+    sin: [f32; WHISPER_FFT_SIZE],
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioMetadata {
@@ -123,22 +131,41 @@ fn power_spectrum(
     window: &[f32; WHISPER_FFT_SIZE],
 ) -> [f32; WHISPER_FFT_SIZE / 2 + 1] {
     let mut power = [0.0; WHISPER_FFT_SIZE / 2 + 1];
+    let basis = fourier_basis();
 
     for (freq_bin, bin_power) in power.iter_mut().enumerate() {
         let mut real = 0.0_f32;
         let mut imag = 0.0_f32;
+        let fourier = &basis[freq_bin];
 
         for (n, &window_value) in window.iter().enumerate() {
             let sample = audio.get(frame_start + n).copied().unwrap_or(0.0) * window_value;
-            let angle = -2.0 * PI * (freq_bin as f32) * (n as f32) / (WHISPER_FFT_SIZE as f32);
-            real += sample * angle.cos();
-            imag += sample * angle.sin();
+            real += sample * fourier.cos[n];
+            imag += sample * fourier.sin[n];
         }
 
         *bin_power = real.mul_add(real, imag * imag);
     }
 
     power
+}
+
+fn fourier_basis() -> &'static [FourierBin] {
+    FOURIER_BASIS.get_or_init(|| {
+        (0..=WHISPER_FFT_SIZE / 2)
+            .map(|freq_bin| {
+                let mut cos = [0.0_f32; WHISPER_FFT_SIZE];
+                let mut sin = [0.0_f32; WHISPER_FFT_SIZE];
+                for n in 0..WHISPER_FFT_SIZE {
+                    let angle =
+                        -2.0 * PI * (freq_bin as f32) * (n as f32) / (WHISPER_FFT_SIZE as f32);
+                    cos[n] = angle.cos();
+                    sin[n] = angle.sin();
+                }
+                FourierBin { cos, sin }
+            })
+            .collect()
+    })
 }
 
 fn mel_filterbank() -> Vec<[f32; WHISPER_FFT_SIZE / 2 + 1]> {
@@ -296,6 +323,17 @@ mod tests {
             0.50140697,
         ];
         assert_close(&spectrogram.values[..expected.len()], &expected, 1e-5);
+    }
+
+    #[test]
+    fn fourier_basis_matches_direct_trig_formula() {
+        for (freq_bin, n) in [(0, 0), (1, 7), (37, 113), (WHISPER_FFT_SIZE / 2, 399)] {
+            let angle = -2.0 * PI * (freq_bin as f32) * (n as f32) / (WHISPER_FFT_SIZE as f32);
+            let fourier = &fourier_basis()[freq_bin];
+
+            assert_eq!(fourier.cos[n], angle.cos());
+            assert_eq!(fourier.sin[n], angle.sin());
+        }
     }
 
     #[test]

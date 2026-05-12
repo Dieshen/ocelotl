@@ -457,3 +457,20 @@ Ocelotl can run real Whisper weights yet.
   competitive claim gate.
 - `Out of scope`: resident audio encode, FFT log-mel, decoder changes, and
   making optimized CPU mode the default.
+
+## W-ASR.29 Precompute STFT Fourier Basis
+
+- `Crates`: `ocelotl-models` Whisper audio preprocessing and benchmark docs.
+- `Test first`: keep the pinned tiny waveform log-mel regression and add a
+  small proof that the cached Fourier basis matches the direct trig formula.
+- `Done when`: `log_mel_spectrogram` reuses fixed STFT Fourier terms instead
+  of calling `sin`/`cos` inside the per-frame hot loop, exact local tiny.en
+  token parity still passes, and benchmark docs record the log-mel impact.
+- `Status note`: landed on 2026-05-12. Scalar release proof passed exact token
+  parity. Total hook wall time improved from `3,620 ms` to `2,859 ms`;
+  resident audio-to-tokens improved from `3,557 ms` to `2,795 ms`; log-mel
+  improved from `758 ms` to `45 ms`. This moves the tiny.en comparison to
+  `~5.1x` whisper.cpp wall time, still short of the `<=3x` competitive claim
+  gate.
+- `Out of scope`: encoder forward optimization, cross-attention K/V precompute
+  optimization, decoder changes, and making optimized CPU mode the default.
