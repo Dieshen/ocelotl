@@ -328,6 +328,11 @@ Ocelotl can run real Whisper weights yet.
 - `Done when`: Whisper exposes an Ocelotl-owned encoded-audio/session type,
   public runtime transcription can hold that state while decoding, and the
   legacy no-cache wrapper remains available for reference parity.
+- `Status note`: landed on 2026-05-12. `WhisperEncodedAudio` is the model-level
+  encoded-audio state, and `WhisperTranscriptionState` is the runtime-held state
+  produced by `prepare_whisper_transcription`. Decode controls live separately in
+  `WhisperDecodeRequest` so a prepared state can be reused without passing audio
+  samples back into the decode call.
 - `Out of scope`: KV cache reuse for decoder self-attention; this task only
   separates invariant audio encoder output from token decode.
 
@@ -340,6 +345,10 @@ Ocelotl can run real Whisper weights yet.
 - `Done when`: the benchmark hook and runtime transcription path encode audio
   once per audio chunk and reuse the encoded audio for every generated token.
   Stage timings should show encoder time paid once, not once per token.
+- `Status note`: landed on 2026-05-12. The runtime path now decodes from
+  `WhisperTranscriptionState`, and the ignored local-artifact parity loop encodes
+  audio once before the token loop. The exact tiny.en ignored proof passed
+  locally in the debug test harness (`122.92s`).
 - `Out of scope`: optimizing decoder kernels or introducing decoder KV cache.
 
 ## W-ASR.23 Add Optimized CPU Kernel Selection

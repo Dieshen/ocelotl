@@ -167,6 +167,6 @@ transcripts here as a correctness gate.
 - The runner records wall-clock command time for both sides. Only the Ocelotl
   side currently emits stage-level timings.
 - No CPU performance parity claim exists yet. The 2026-05-12 tiny.en local run
-  after encoded-audio reuse measured Ocelotl at 14,248 ms and whisper.cpp at
-  483 ms (about 29.5x slower). Before encoder reuse, the same local comparison
+  after encoded-audio reuse measured Ocelotl at 14,190 ms and whisper.cpp at
+  482 ms (about 29.4x slower). Before encoder reuse, the same local comparison
   measured about 65,591 ms versus 550 ms (about 119.3x slower).

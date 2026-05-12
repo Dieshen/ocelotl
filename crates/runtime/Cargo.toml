@@ -12,4 +12,8 @@ readme = "../../README.md"
 ocelotl-core.workspace = true
 ocelotl-kernels.workspace = true
 ocelotl-models.workspace = true
+ocelotl-tokenizer.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+ocelotl-loader.workspace = true

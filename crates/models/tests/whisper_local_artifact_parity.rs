@@ -1226,13 +1226,21 @@ fn generate_tokens_to_expected_length(
 ) -> Vec<TokenId> {
     let mut generated = policy.startup_prompt(mode);
     let mask = WhisperDecodeMask::transcribe(policy.tokens, mode);
+    let encoded_audio = model
+        .encode_audio_features(&mel.values, mel.frames)
+        .unwrap_or_else(|err| {
+            panic!(
+                "Whisper encode_audio_features failed before decode at generated length {} - {err:?}",
+                generated.len()
+            )
+        });
 
     while generated.len() < expected_len {
         let logits = model
-            .forward_next_token_logits(&mel.values, mel.frames, &generated)
+            .forward_next_token_logits_from_audio(&encoded_audio, &generated)
             .unwrap_or_else(|err| {
                 panic!(
-                    "Whisper forward_next_token_logits failed at generated length {} - {err:?}",
+                    "Whisper forward_next_token_logits_from_audio failed at generated length {} - {err:?}",
                     generated.len()
                 )
             });

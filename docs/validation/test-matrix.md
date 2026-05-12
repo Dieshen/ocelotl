@@ -150,6 +150,9 @@ criteria to the tests and docs that prove the current post-M3 Whisper track.
 | 17 | Streaming/chunked transcription has an Ocelotl-owned deterministic chunk-planning contract before cache/state reuse. | `crates/runtime/tests/whisper_streaming.rs::{chunk_planner_pins_window_overlap_and_last_partial_chunk,chunk_planner_keeps_chunk_ranges_monotonic_in_samples_and_seconds,chunk_planner_rejects_zero_window,chunk_planner_rejects_overlap_equal_to_window,chunk_planner_rejects_unsupported_audio_metadata}` cover the public runtime types exported from `ocelotl_runtime::{ChunkedTranscriptionRequest,TranscriptionChunkingConfig,TranscriptionChunk,plan_transcription_chunks}`. | green (planning contract only) |
 | 18 | The whisper.cpp benchmark harness times a dedicated Ocelotl transcription hook instead of the Rust test harness. | `crates/models/tests/whisper_cpp_benchmark.rs::whisper_cpp_benchmark_manifest_names_commands_inputs_and_threads` now asserts the Ocelotl command is `target/release/ocelotl.exe bench-whisper-transcribe ...`, not `cargo test`. `tools/whisper-cpp-bench.ps1 -DryRun` validates planned command records without local artifacts, and `src/main.rs` implements the narrow `bench-whisper-transcribe` hook for local runs. | green (timing hook; local numbers opt-in) |
 | 19 | Classic Whisper size local-artifact parity harnesses exist for `tiny.en`, `base.en`, `small.en`, `medium.en`, and `large`, with independent skips and no large-weight loading in default tests. | `crates/models/tests/whisper_local_artifact_parity.rs::{classic_whisper_local_artifact_contract_lists_all_size_paths,classic_whisper_local_artifact_references_reuse_expected_token_schema}` prove all-size paths/schema by default. Ignored tests `local_whisper_{tiny_en,base_en,small_en,medium_en,large}_artifact_contract_is_well_formed` run each present bundle independently and skip absent bundles with remediation. The senior run on 2026-05-09 verified `tiny.en` through `OCELOTL_LOCAL_ARTIFACTS_DIR`; other size bundles were absent. | green (harness; per-size output parity opt-in) |
+| 20 | The Ocelotl Whisper benchmark hook emits stage-level CPU timings. | `src/main.rs::tests::bench_whisper_output_reports_stage_timings` pins the `timings_ms` JSON schema for config parse, manifest validation, expected-token read, tensor load/model construction, WAV read, log-mel, audio encode, decode total, and per-token decode timing. `docs/benchmarks/whisper-cpp.md` records the 2026-05-12 tiny.en local comparison after encoded-audio reuse. | green (timing schema; local numbers opt-in) |
+| 21 | Runtime can hold an Ocelotl-owned encoded-audio state for real Whisper transcription. | `crates/runtime/tests/whisper_real_transcription.rs::real_whisper_transcription_reuses_encoded_audio_and_matches_legacy_loop` prepares `WhisperTranscriptionState` once with `prepare_whisper_transcription`, verifies the encoded-audio state shape, and decodes from that state through `decode_whisper_transcription` using a separate `WhisperDecodeRequest`. `ocelotl_models::whisper::real::tests::{cached_audio_logits_match_legacy_forward_path,cached_audio_forward_rejects_wrong_state_size_before_compute}` pins the lower-level model seam. | green |
+| 22 | Real Whisper decode loops can reuse encoder output without changing token parity. | `crates/runtime/tests/whisper_real_transcription.rs::real_whisper_transcription_reuses_encoded_audio_and_matches_legacy_loop` compares the runtime cached-audio decode loop against the legacy loop that recomputes `forward_next_token_logits(log_mel, tokens)`. The ignored local parity harness now calls `encode_audio_features` once per audio input and `forward_next_token_logits_from_audio` for each generated token; the 2026-05-12 senior run verified `local_whisper_tiny_en_artifact_contract_is_well_formed` passed locally (`122.92s` debug harness). | green (tiny.en local proof opt-in) |
 
 ### Note - W-ASR.10 real parity limit
 
@@ -163,11 +166,13 @@ senior run on 2026-05-09 verified the opt-in proof with:
 cargo test -p ocelotl-models --release --test whisper_local_artifact_parity -- --ignored --nocapture
 ```
 
-### Note - W-ASR.6 runtime limit
+### Note - W-ASR.6/W-ASR.22 runtime limit
 
 The W-ASR.6 runtime API returns a greedy token plus logits from the tiny
-synthetic Whisper model. It does not yet perform multi-token transcription,
-timestamp handling, decode masking, or token-to-text decoding.
+synthetic Whisper model. W-ASR.22 adds a separate real-Whisper runtime path that
+performs multi-token masked decode from a reusable encoded-audio state. The
+runtime still does not own token-to-text decoding, WER thresholds, cross-chunk
+state reuse, or decoder self-attention KV cache.
 
 ### Note - W-ASR.7/W-ASR.8 adapter groundwork limit
 
