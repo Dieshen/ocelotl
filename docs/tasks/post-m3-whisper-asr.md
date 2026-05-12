@@ -385,3 +385,19 @@ Ocelotl can run real Whisper weights yet.
   result and the measurable correctness, regression, optimized-default, and
   CPU-competitiveness gates. Optimized mode must not become the Whisper default
   until it beats scalar on the documented gate.
+
+## W-ASR.25 Add Resident-Model Whisper Timing
+
+- `Crates`: root CLI benchmark hook and benchmark docs.
+- `Test first`: extend the benchmark output schema test so it pins a
+  resident-model timing object separate from raw wall-clock setup timings.
+- `Done when`: `ocelotl bench-whisper-transcribe` reports a loaded-model
+  resident latency view that excludes model load and local artifact I/O, and the
+  docs state which resident metric should drive the next CPU optimization gate.
+- `Status note`: landed on 2026-05-12. The benchmark hook now emits
+  `resident_model_ms.audio_to_tokens` and `resident_model_ms.mel_to_tokens`.
+  The local scalar release proof passed exact token parity with total
+  `13,869 ms`, resident audio-to-tokens `9,925 ms`, and resident mel-to-tokens
+  `9,172 ms`.
+- `Out of scope`: changing model behavior, adding decoder KV cache, or claiming
+  a speedup. This task tightens measurement before optimization.

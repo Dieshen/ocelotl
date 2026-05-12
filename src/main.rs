@@ -45,6 +45,16 @@ struct BenchWhisperTimings {
     decode_token_ms: Vec<u128>,
 }
 
+impl BenchWhisperTimings {
+    fn resident_audio_to_tokens_ms(&self) -> u128 {
+        self.log_mel_ms + self.audio_encode_ms + self.decode_total_ms
+    }
+
+    fn resident_mel_to_tokens_ms(&self) -> u128 {
+        self.audio_encode_ms + self.decode_total_ms
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WavMetadata {
     audio_format: u16,
@@ -334,6 +344,10 @@ fn bench_whisper_output(
         "tokens": token_ids,
         "matches_expected": matches_expected,
         "cpu_kernel_mode": cpu_kernel_mode.as_str(),
+        "resident_model_ms": {
+            "audio_to_tokens": timings.resident_audio_to_tokens_ms(),
+            "mel_to_tokens": timings.resident_mel_to_tokens_ms(),
+        },
         "timings_ms": {
             "total": timings.total_ms,
             "config_parse": timings.config_parse_ms,
@@ -659,6 +673,8 @@ mod tests {
         assert_eq!(output["cpu_kernel_mode"], "optimized");
         assert_eq!(output["elapsed_ms"], 100);
         assert_eq!(output["token_count"], 2);
+        assert_eq!(output["resident_model_ms"]["audio_to_tokens"], 21);
+        assert_eq!(output["resident_model_ms"]["mel_to_tokens"], 15);
         assert_eq!(output["timings_ms"]["total"], 100);
         assert_eq!(output["timings_ms"]["config_parse"], 1);
         assert_eq!(output["timings_ms"]["manifest_validate"], 2);

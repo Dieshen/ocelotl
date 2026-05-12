@@ -147,7 +147,15 @@ are expected on machines that have not prepared `local-artifacts/`.
 A completed benchmark record names both command lines, both model paths, the
 shared audio path, thread count, exit code, wall-clock time in milliseconds, and
 an output summary. The Ocelotl stdout JSON includes `cpu_kernel_mode` plus
-`timings_ms` with:
+`resident_model_ms` and `timings_ms`.
+
+`resident_model_ms` separates the loaded-model product path from benchmark
+setup:
+
+- `audio_to_tokens`: log-mel + audio encoder + token decode after model load.
+- `mel_to_tokens`: audio encoder + token decode after model load and log-mel.
+
+`timings_ms` includes:
 
 - `config_parse`
 - `manifest_validate`
@@ -220,3 +228,21 @@ thread count as the comparison baseline.
 The next CPU task should target the actual remaining hot path: decoder
 projection/layout work and attention/MLP buffer reuse, measured by stage-level
 timings before and after the change.
+
+## W-ASR.25 Resident-Model Timing
+
+The benchmark hook now emits `resident_model_ms` in addition to raw wall-clock
+stage timings. This does not make the CPU path faster, but it prevents model
+loading and local fixture I/O from hiding the actual embedded-app latency
+surface.
+
+For the W-ASR.25 scalar direct hook run, the resident-model view is:
+
+| Metric | Formula | W-ASR.25 scalar value |
+| ------ | ------- | --------------------- |
+| Loaded model, audio to tokens | `log_mel + audio_encode + decode_total` | `9,925 ms` |
+| Loaded model, mel to tokens | `audio_encode + decode_total` | `9,172 ms` |
+
+For tiny.en, the first optimization gate should focus on this resident path.
+Model load remains important for startup and memory footprint, but it is the
+wrong denominator for steady-state embedded transcription latency.
