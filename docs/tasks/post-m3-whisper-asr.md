@@ -474,3 +474,20 @@ Ocelotl can run real Whisper weights yet.
   gate.
 - `Out of scope`: encoder forward optimization, cross-attention K/V precompute
   optimization, decoder changes, and making optimized CPU mode the default.
+
+## W-ASR.30 Split Audio Encode Timing
+
+- `Crates`: `ocelotl-models`, root CLI benchmark hook, and benchmark docs.
+- `Test first`: add a model regression proving the timed encode path returns
+  the same `WhisperEncodedAudio` as the plain encode path, and extend the
+  benchmark JSON schema test to pin the nested detail object.
+- `Done when`: `bench-whisper-transcribe` reports `audio_encode_detail.encoder`
+  and `audio_encode_detail.cross_attention_precompute`, exact local tiny.en
+  token parity still passes, and benchmark docs identify the dominant half of
+  audio encode.
+- `Status note`: landed on 2026-05-12. Scalar release proof passed exact token
+  parity. Total hook wall time was `2,817 ms`; `audio_encode` was `2,387 ms`,
+  split into `2,153 ms` encoder forward and `234 ms` cross-attention K/V
+  precompute. This shows encoder forward is the next CPU bottleneck.
+- `Out of scope`: optimizing encoder attention/linear kernels, changing public
+  runtime APIs, decoder changes, and making optimized CPU mode the default.

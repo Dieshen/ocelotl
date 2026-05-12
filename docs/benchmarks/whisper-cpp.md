@@ -386,3 +386,29 @@ clear the `<=3x` competitive claim gate. The remaining scalar hot spots are now:
 
 The next CPU task should split `audio_encode` into encoder forward vs
 cross-attention K/V precompute and then optimize the dominant half.
+
+## W-ASR.30 Audio Encode Detail Timing
+
+The benchmark hook now reports `timings_ms.audio_encode_detail` with:
+
+- `encoder`: convolution + encoder transformer stack + final encoder layer norm.
+- `cross_attention_precompute`: one-time decoder cross-attention K/V projection
+  from the encoded audio.
+
+Fresh scalar release run on the same tiny.en fixture:
+
+| Metric | W-ASR.30 scalar |
+| ------ | --------------- |
+| Total hook wall time | `2,817 ms` |
+| Resident audio to tokens | `2,753 ms` |
+| Log-mel | `46 ms` |
+| Audio encode total | `2,387 ms` |
+| Encoder | `2,153 ms` |
+| Cross-attention K/V precompute | `234 ms` |
+| Decode total | `320 ms` |
+
+This is a measurement seam, not a claimed optimization over W-ASR.29; the
+small total-time difference is run-to-run noise. The useful result is the split:
+about 90% of `audio_encode` is now known to be encoder forward, so the next CPU
+optimization should target the encoder transformer path rather than
+cross-attention K/V setup.

@@ -4,7 +4,10 @@
 //! OpenAI-style tensor names from `whisper::tensors` after W-ASR.8 validation
 //! and keeps all tensor values in owned `f32` buffers.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    time::Instant,
+};
 
 use ocelotl_core::{DType, InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId};
 use ocelotl_kernels::{CpuKernelBackend, softmax};
@@ -105,6 +108,12 @@ pub struct WhisperEncodedAudio {
     cross_attention: Vec<WhisperCrossAttentionCache>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WhisperAudioEncodeTimings {
+    pub encoder_ms: u128,
+    pub cross_attention_precompute_ms: u128,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct WhisperCrossAttentionCache {
     key: Vec<f32>,
@@ -192,9 +201,20 @@ impl WhisperModel {
         log_mel: &[f32],
         mel_frames: usize,
     ) -> Result<WhisperEncodedAudio> {
+        self.encode_audio_features_with_timings(log_mel, mel_frames)
+            .map(|(audio, _timings)| audio)
+    }
+
+    pub fn encode_audio_features_with_timings(
+        &self,
+        log_mel: &[f32],
+        mel_frames: usize,
+    ) -> Result<(WhisperEncodedAudio, WhisperAudioEncodeTimings)> {
         validate_audio_request(&self.config, log_mel, mel_frames)?;
 
+        let encoder_started = Instant::now();
         let values = self.encode_audio(log_mel, mel_frames)?;
+        let encoder_ms = encoder_started.elapsed().as_millis();
         let state_size = self.config.audio_state_size;
         if values.len() % state_size != 0 {
             return Err(invalid_model(
@@ -213,12 +233,22 @@ impl WhisperModel {
             ));
         }
 
-        Ok(WhisperEncodedAudio {
-            frames,
-            state_size,
-            cross_attention: self.precompute_cross_attention(&values, frames)?,
-            values,
-        })
+        let cross_attention_started = Instant::now();
+        let cross_attention = self.precompute_cross_attention(&values, frames)?;
+        let cross_attention_precompute_ms = cross_attention_started.elapsed().as_millis();
+
+        Ok((
+            WhisperEncodedAudio {
+                frames,
+                state_size,
+                cross_attention,
+                values,
+            },
+            WhisperAudioEncodeTimings {
+                encoder_ms,
+                cross_attention_precompute_ms,
+            },
+        ))
     }
 
     pub fn forward_next_token_logits_from_audio(
@@ -1723,6 +1753,22 @@ mod tests {
             assert_eq!(cache.value.len(), audio.frames() * cfg.text_state_size);
         }
         assert_close(&cached, &legacy, 0.0);
+    }
+
+    #[test]
+    fn timed_audio_encode_matches_plain_audio_encode() {
+        let cfg = tiny_config();
+        let model = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("model");
+        let mel = vec![0.0_f32; 4 * cfg.mel_bins];
+
+        let plain = model.encode_audio_features(&mel, 4).expect("plain encode");
+        let (timed, timings) = model
+            .encode_audio_features_with_timings(&mel, 4)
+            .expect("timed encode");
+
+        assert_eq!(timed, plain);
+        assert!(timings.encoder_ms < 1_000);
+        assert!(timings.cross_attention_precompute_ms < 1_000);
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub mod wer;
 
 pub use config::{WhisperConfig, parse_whisper_config_json};
 pub use model::{WhisperTinyConfig, WhisperTinyModel, WhisperTinyWeights};
-pub use real::{WhisperEncodedAudio, WhisperModel, WhisperWeights};
+pub use real::{WhisperAudioEncodeTimings, WhisperEncodedAudio, WhisperModel, WhisperWeights};
 pub use tensors::{required_whisper_tensor_names, validate_whisper_tensors};
 pub use wer::{
     WerCorpusCase, WerCorpusCaseScore, WerCorpusReport, WerEditCounts, WerScore,

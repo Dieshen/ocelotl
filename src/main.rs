@@ -5,7 +5,7 @@ use ocelotl_core::TokenId;
 use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode};
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 use ocelotl_models::whisper::{
-    WhisperConfig, WhisperEncodedAudio, WhisperModel,
+    WhisperAudioEncodeTimings, WhisperConfig, WhisperEncodedAudio, WhisperModel,
     audio::{AudioMetadata, log_mel_spectrogram},
     parse_whisper_config_json, required_whisper_tensor_names, validate_whisper_tensors,
 };
@@ -41,6 +41,7 @@ struct BenchWhisperTimings {
     wav_read_ms: u128,
     log_mel_ms: u128,
     audio_encode_ms: u128,
+    audio_encode_detail: WhisperAudioEncodeTimings,
     decode_total_ms: u128,
     decode_token_ms: Vec<u128>,
 }
@@ -290,8 +291,8 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
 
     let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
     let audio_encode_started = Instant::now();
-    let encoded_audio = model
-        .encode_audio_features(&mel.values, mel.frames)
+    let (encoded_audio, audio_encode_detail) = model
+        .encode_audio_features_with_timings(&mel.values, mel.frames)
         .map_err(|err| format!("failed to encode Whisper audio features - {err:?}"))?;
     let audio_encode_ms = audio_encode_started.elapsed().as_millis();
 
@@ -317,6 +318,7 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
         wav_read_ms,
         log_mel_ms,
         audio_encode_ms,
+        audio_encode_detail,
         decode_total_ms,
         decode_token_ms,
     };
@@ -357,6 +359,10 @@ fn bench_whisper_output(
             "wav_read": timings.wav_read_ms,
             "log_mel": timings.log_mel_ms,
             "audio_encode": timings.audio_encode_ms,
+            "audio_encode_detail": {
+                "encoder": timings.audio_encode_detail.encoder_ms,
+                "cross_attention_precompute": timings.audio_encode_detail.cross_attention_precompute_ms,
+            },
             "decode_total": timings.decode_total_ms,
             "decode_token": timings.decode_token_ms,
         }
@@ -666,6 +672,10 @@ mod tests {
             wav_read_ms: 5,
             log_mel_ms: 6,
             audio_encode_ms: 7,
+            audio_encode_detail: WhisperAudioEncodeTimings {
+                encoder_ms: 11,
+                cross_attention_precompute_ms: 12,
+            },
             decode_total_ms: 8,
             decode_token_ms: vec![9, 10],
         };
@@ -691,6 +701,11 @@ mod tests {
         assert_eq!(output["timings_ms"]["wav_read"], 5);
         assert_eq!(output["timings_ms"]["log_mel"], 6);
         assert_eq!(output["timings_ms"]["audio_encode"], 7);
+        assert_eq!(output["timings_ms"]["audio_encode_detail"]["encoder"], 11);
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["cross_attention_precompute"],
+            12
+        );
         assert_eq!(output["timings_ms"]["decode_total"], 8);
         assert_eq!(
             output["timings_ms"]["decode_token"],
