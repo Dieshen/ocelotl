@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use ocelotl_core::TokenId;
 use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode};
-use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensor_f32};
+use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 use ocelotl_models::whisper::{
     WhisperConfig, WhisperEncodedAudio, WhisperModel,
     audio::{AudioMetadata, log_mel_spectrogram},
@@ -397,17 +397,13 @@ fn load_required_whisper_tensors(
     path: &Path,
     config: &WhisperConfig,
 ) -> Result<Vec<LoadedTensor>, String> {
-    required_whisper_tensor_names(config)
-        .into_iter()
-        .map(|name| {
-            load_safetensors_tensor_f32(path, &name).map_err(|err| {
-                format!(
-                    "failed to load required Whisper tensor {name:?} from {} - {err:?}",
-                    path.display()
-                )
-            })
-        })
-        .collect()
+    let names = required_whisper_tensor_names(config);
+    load_safetensors_tensors_f32(path, &names).map_err(|err| {
+        format!(
+            "failed to load required Whisper tensors from {} - {err:?}",
+            path.display()
+        )
+    })
 }
 
 fn generate_tokens_to_expected_length(

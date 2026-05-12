@@ -320,3 +320,37 @@ The next CPU task should break down `audio_encode` internally before more broad
 optimization. Likely follow-ups are encoder/projection weight packing and
 FFT-based log-mel; decoder work is no longer the dominant resident bottleneck
 for tiny.en.
+
+## W-ASR.28 Bulk Safetensors Value Loading
+
+The benchmark hook and local proof helpers now load all required Whisper
+safetensors values from one parsed archive instead of calling
+`load_safetensors_tensor_f32` once per tensor. This is a startup-path
+optimization, not a resident-model optimization: it removes repeated file reads
+and safetensors header parses before model construction.
+
+Fresh scalar release run on the same tiny.en fixture:
+
+| Metric | W-ASR.27 scalar | W-ASR.28 scalar | Change |
+| ------ | --------------- | --------------- | ------ |
+| Total hook wall time | `7,409 ms` | `3,620 ms` | ~51% faster |
+| Tensor load + model construction | `3,901 ms` | `61 ms` | ~98% faster |
+| Resident audio to tokens | `3,506 ms` | `3,557 ms` | ~1% slower/noise |
+| Decode total | `319 ms` | `344 ms` | noise |
+
+Optimized mode remains parity-clean but slower for Whisper: `5,196 ms` total,
+`5,130 ms` resident audio-to-tokens, and `1,612 ms` decode total.
+
+This is the first result that clears the documented first CPU competitiveness
+gate by wall time: `3,620 ms / 564 ms ~= 6.4x`, under the `<=10x` threshold.
+It does **not** clear the competitive claim gate (`<=3x`). The remaining
+resident scalar hot spots are now:
+
+- `audio_encode`: `2,455 ms`.
+- `log_mel`: `758 ms`.
+- `decode_total`: `344 ms`.
+- `tensor_load_model`: `61 ms`.
+
+The next task should target resident audio processing, starting with an
+internal timing split for `audio_encode` so encoder forward and cross-attention
+K/V precompute are measured separately before optimizing either path.

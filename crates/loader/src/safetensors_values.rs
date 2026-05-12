@@ -25,7 +25,6 @@ pub fn load_safetensors_tensor_f32(path: &Path, tensor_name: &str) -> Result<Loa
             source,
         })
     })?;
-
     let tensors = safetensors::SafeTensors::deserialize(&bytes).map_err(|source| {
         invalid_safetensors(
             path,
@@ -33,6 +32,38 @@ pub fn load_safetensors_tensor_f32(path: &Path, tensor_name: &str) -> Result<Loa
             format!("failed to parse safetensors file: {source}"),
         )
     })?;
+    load_tensor_from_archive(path, &tensors, tensor_name)
+}
+
+pub fn load_safetensors_tensors_f32<S: AsRef<str>>(
+    path: &Path,
+    tensor_names: &[S],
+) -> Result<Vec<LoadedTensor>> {
+    let bytes = fs::read(path).map_err(|source| {
+        OcelotlError::from(IoError {
+            path: Some(path.to_path_buf()),
+            source,
+        })
+    })?;
+    let tensors = safetensors::SafeTensors::deserialize(&bytes).map_err(|source| {
+        invalid_safetensors(
+            path,
+            None,
+            format!("failed to parse safetensors file: {source}"),
+        )
+    })?;
+
+    tensor_names
+        .iter()
+        .map(|name| load_tensor_from_archive(path, &tensors, name.as_ref()))
+        .collect()
+}
+
+fn load_tensor_from_archive(
+    path: &Path,
+    tensors: &safetensors::SafeTensors<'_>,
+    tensor_name: &str,
+) -> Result<LoadedTensor> {
     let tensor = tensors.tensor(tensor_name).map_err(|source| {
         OcelotlError::from(InvalidModelError {
             path: Some(path.to_path_buf()),
@@ -231,6 +262,31 @@ mod tests {
         assert_eq!(loaded.shape, vec![2, 2]);
         assert_eq!(loaded.dtype, SupportedDtype::F32);
         assert_eq!(loaded.values, vec![1.0, -2.5, 0.0, 3.25]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_safetensors_tensors_f32_loads_many_tensors_from_one_archive() {
+        let path = tmp_path("many_values");
+        build_value_fixture(
+            &path,
+            &[
+                ("first", "F32", &[2], f32_bytes(&[1.0, 2.0])),
+                ("second", "F32", &[1], f32_bytes(&[-3.5])),
+            ],
+        );
+
+        let names = vec!["second".to_string(), "first".to_string()];
+        let loaded = load_safetensors_tensors_f32(&path, &names).expect("load tensors");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "second");
+        assert_eq!(loaded[0].shape, vec![1]);
+        assert_eq!(loaded[0].values, vec![-3.5]);
+        assert_eq!(loaded[1].name, "first");
+        assert_eq!(loaded[1].shape, vec![2]);
+        assert_eq!(loaded[1].values, vec![1.0, 2.0]);
 
         let _ = fs::remove_file(&path);
     }

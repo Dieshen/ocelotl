@@ -12,7 +12,9 @@ pub use safetensors_inspect::{
     SafetensorsManifest, SupportedDtype, TensorEntry, inspect_safetensors, require_tensors,
 };
 pub mod safetensors_values;
-pub use safetensors_values::{LoadedTensor, load_safetensors_tensor_f32};
+pub use safetensors_values::{
+    LoadedTensor, load_safetensors_tensor_f32, load_safetensors_tensors_f32,
+};
 
 /// Architectures the loader currently accepts. Anything outside this list is
 /// rejected with `OcelotlError::Unsupported` before any further validation.

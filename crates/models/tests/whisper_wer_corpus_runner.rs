@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use ocelotl_core::TokenId;
-use ocelotl_loader::{LoadedTensor, load_safetensors_tensor_f32};
+use ocelotl_loader::{LoadedTensor, load_safetensors_tensors_f32};
 use ocelotl_models::whisper::{
     WhisperConfig, WhisperModel,
     audio::{AudioMetadata, LogMelSpectrogram, log_mel_spectrogram},
@@ -594,17 +594,13 @@ fn masked_greedy_sample(logits: &[f32], mask: WhisperDecodeMask) -> TokenId {
 }
 
 fn load_required_whisper_tensors(path: &Path, config: &WhisperConfig) -> Vec<LoadedTensor> {
-    required_whisper_tensor_names(config)
-        .into_iter()
-        .map(|name| {
-            load_safetensors_tensor_f32(path, &name).unwrap_or_else(|err| {
-                panic!(
-                    "failed to load required Whisper tensor {name:?} from {} - {err:?}",
-                    path.display()
-                )
-            })
-        })
-        .collect()
+    let names = required_whisper_tensor_names(config);
+    load_safetensors_tensors_f32(path, &names).unwrap_or_else(|err| {
+        panic!(
+            "failed to load required Whisper tensors from {} - {err:?}",
+            path.display()
+        )
+    })
 }
 
 fn read_expected_token_ids(path: &Path) -> Vec<TokenId> {

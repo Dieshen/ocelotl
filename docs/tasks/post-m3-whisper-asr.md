@@ -437,3 +437,23 @@ Ocelotl can run real Whisper weights yet.
   scalar and stays opt-in.
 - `Out of scope`: encoder/audio-stage optimization, FFT log-mel,
   Whisper-specific weight packing, and making optimized CPU mode the default.
+
+## W-ASR.28 Bulk Safetensors Value Loading
+
+- `Crates`: `ocelotl-loader`, root CLI benchmark hook, local proof helpers,
+  and benchmark docs.
+- `Test first`: add a loader regression proving multiple named tensors can be
+  loaded from one safetensors archive while preserving requested order and
+  metadata.
+- `Done when`: Whisper benchmark/local proof paths load all required tensors
+  through one safetensors read/parse, exact local tiny.en token parity still
+  passes, and benchmark docs record the startup impact.
+- `Status note`: landed on 2026-05-12. Scalar release proof passed exact token
+  parity. Total hook wall time improved from `7,409 ms` to `3,620 ms`;
+  tensor load + model construction improved from `3,901 ms` to `61 ms`.
+  Resident audio-to-tokens stayed effectively unchanged (`3,506 ms` to
+  `3,557 ms`), as expected for a startup-only optimization. This clears the
+  first `<=10x whisper.cpp` wall-time gate (`~6.4x`) but not the `<=3x`
+  competitive claim gate.
+- `Out of scope`: resident audio encode, FFT log-mel, decoder changes, and
+  making optimized CPU mode the default.
