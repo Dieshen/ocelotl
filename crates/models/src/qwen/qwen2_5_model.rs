@@ -55,8 +55,9 @@
 //! becomes worth its overhead.
 
 use ocelotl_core::{DType, InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId};
-use ocelotl_kernels::{attention::scaled_dot_product_attention, vec_add};
-use ocelotl_kernels::{matmul, mlp::mlp_gated_silu, rmsnorm::rmsnorm, rope_apply_inplace};
+use ocelotl_kernels::{
+    CpuKernelBackend, mlp::mlp_gated_silu, rmsnorm::rmsnorm, rope_apply_inplace, vec_add,
+};
 
 use super::Qwen2_5Config;
 
@@ -124,6 +125,7 @@ pub struct Qwen2_5Weights {
 pub struct Qwen2_5Model {
     config: Qwen2_5Config,
     weights: Qwen2_5Weights,
+    kernels: CpuKernelBackend,
 }
 
 impl Qwen2_5Model {
@@ -134,6 +136,19 @@ impl Qwen2_5Model {
     /// before the kernel boundary; downstream forward code can assume
     /// every length is correct.
     pub fn new(config: Qwen2_5Config, weights: Qwen2_5Weights) -> Result<Self> {
+        Self::with_cpu_kernel_backend(config, weights, CpuKernelBackend::default())
+    }
+
+    /// Construct a model with an explicit CPU kernel backend.
+    ///
+    /// `Qwen2_5Model::new` uses the scalar CPU reference backend. This
+    /// constructor lets callers opt into the optimized CPU backend while
+    /// preserving the same model-level validation and public `prefill` API.
+    pub fn with_cpu_kernel_backend(
+        config: Qwen2_5Config,
+        weights: Qwen2_5Weights,
+        kernels: CpuKernelBackend,
+    ) -> Result<Self> {
         validate_config_for_model(&config)?;
         let h = config.hidden_size;
         let v = config.vocab_size;
@@ -233,12 +248,21 @@ impl Qwen2_5Model {
             )?;
         }
 
-        Ok(Self { config, weights })
+        Ok(Self {
+            config,
+            weights,
+            kernels,
+        })
     }
 
     /// Borrow the validated configuration.
     pub fn config(&self) -> &Qwen2_5Config {
         &self.config
+    }
+
+    /// Borrow the CPU kernel backend selected for this model instance.
+    pub fn kernel_backend(&self) -> &CpuKernelBackend {
+        &self.kernels
     }
 
     /// Run prefill over the prompt and return the logits at the final
@@ -339,11 +363,12 @@ impl Qwen2_5Model {
             )?;
 
             // Q = norm @ q_proj_w  ([seq,h] @ [h,q_out])
-            matmul(&norm_buf, (seq, h), &layer.q_proj_w, (h, q_out), &mut q_buf)?;
+            self.kernels
+                .matmul(&norm_buf, (seq, h), &layer.q_proj_w, (h, q_out), &mut q_buf)?;
             add_bias_per_row(&mut q_buf, &layer.q_proj_b, seq, q_out);
 
             // K = norm @ k_proj_w  ([seq,h] @ [h,kv_out])
-            matmul(
+            self.kernels.matmul(
                 &norm_buf,
                 (seq, h),
                 &layer.k_proj_w,
@@ -353,7 +378,7 @@ impl Qwen2_5Model {
             add_bias_per_row(&mut k_buf, &layer.k_proj_b, seq, kv_out);
 
             // V = norm @ v_proj_w  ([seq,h] @ [h,kv_out])
-            matmul(
+            self.kernels.matmul(
                 &norm_buf,
                 (seq, h),
                 &layer.v_proj_w,
@@ -383,7 +408,7 @@ impl Qwen2_5Model {
             }
 
             // Scaled-dot-product attention.
-            scaled_dot_product_attention(
+            self.kernels.scaled_dot_product_attention(
                 &q_buf,
                 &k_buf,
                 &v_buf,
@@ -395,7 +420,7 @@ impl Qwen2_5Model {
             )?;
 
             // O = attn_out @ o_proj_w  ([seq,q_out] @ [q_out,h])
-            matmul(
+            self.kernels.matmul(
                 &attn_out,
                 (seq, q_out),
                 &layer.o_proj_w,
@@ -452,7 +477,7 @@ impl Qwen2_5Model {
         let last_start = (seq - 1) * h;
         let last_row = &norm_buf[last_start..last_start + h];
         let mut logits = vec![0.0_f32; v];
-        matmul(
+        self.kernels.matmul(
             last_row,
             (1, h),
             &self.weights.lm_head_w,
@@ -694,6 +719,40 @@ mod tests {
         let b = model.prefill(&[TokenId(3), TokenId(7)]).unwrap();
 
         assert_eq!(a, b, "identical inputs must yield bit-identical logits");
+    }
+
+    #[test]
+    fn optimized_cpu_backend_preserves_prefill_logits() {
+        let cfg = tiny_config();
+        let scalar = Qwen2_5Model::new(cfg.clone(), tiny_weights(&cfg)).unwrap();
+        let optimized = Qwen2_5Model::with_cpu_kernel_backend(
+            cfg.clone(),
+            tiny_weights(&cfg),
+            CpuKernelBackend::optimized(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            optimized.kernel_backend().mode(),
+            ocelotl_kernels::CpuKernelMode::Optimized
+        );
+        let scalar_logits = scalar
+            .prefill(&[TokenId(3), TokenId(7), TokenId(11)])
+            .unwrap();
+        let optimized_logits = optimized
+            .prefill(&[TokenId(3), TokenId(7), TokenId(11)])
+            .unwrap();
+
+        for (idx, (got, want)) in optimized_logits
+            .iter()
+            .zip(scalar_logits.iter())
+            .enumerate()
+        {
+            assert!(
+                (got - want).abs() <= 1.0e-5,
+                "optimized prefill logit {idx} drifted: got {got}, want {want}"
+            );
+        }
     }
 
     #[test]

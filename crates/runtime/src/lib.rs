@@ -461,6 +461,12 @@ impl Runtime<CpuKernelBackend> {
             backend: CpuKernelBackend::default(),
         }
     }
+
+    pub fn optimized_cpu() -> Self {
+        Self {
+            backend: CpuKernelBackend::optimized(),
+        }
+    }
 }
 
 impl<B: KernelBackend> Runtime<B> {
@@ -517,6 +523,16 @@ mod tests {
                 temperature: None,
             },
         }
+    }
+
+    #[test]
+    fn optimized_cpu_runtime_selects_optimized_kernel_backend() {
+        let runtime = Runtime::optimized_cpu();
+
+        assert_eq!(
+            runtime.backend().mode(),
+            ocelotl_kernels::CpuKernelMode::Optimized
+        );
     }
 
     #[test]

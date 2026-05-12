@@ -35,6 +35,26 @@ pub mod attention;
 pub mod mlp;
 pub mod rmsnorm;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CpuKernelMode {
+    /// Original correctness-first CPU loops. This remains the default and the
+    /// parity oracle for optimized CPU, GPU, and quantized kernels.
+    #[default]
+    Scalar,
+    /// CPU loops with cache-friendlier accumulation order for hot matrix work.
+    /// This path stays safe Rust and keeps the same slice/shape contract.
+    Optimized,
+}
+
+impl CpuKernelMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Optimized => "optimized",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KernelContext {
     pub device: Device,
@@ -48,14 +68,117 @@ pub trait KernelBackend: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct CpuKernelBackend {
     context: KernelContext,
+    mode: CpuKernelMode,
 }
 
 impl Default for CpuKernelBackend {
     fn default() -> Self {
+        Self::scalar()
+    }
+}
+
+impl CpuKernelBackend {
+    pub fn scalar() -> Self {
+        Self::with_mode(CpuKernelMode::Scalar)
+    }
+
+    pub fn optimized() -> Self {
+        Self::with_mode(CpuKernelMode::Optimized)
+    }
+
+    pub fn with_mode(mode: CpuKernelMode) -> Self {
         Self {
             context: KernelContext {
                 device: Device::Cpu,
             },
+            mode,
+        }
+    }
+
+    pub fn mode(&self) -> CpuKernelMode {
+        self.mode
+    }
+
+    pub fn matmul(
+        &self,
+        a: &[f32],
+        a_shape: (usize, usize),
+        b: &[f32],
+        b_shape: (usize, usize),
+        out: &mut [f32],
+    ) -> Result<()> {
+        match self.mode {
+            CpuKernelMode::Scalar => matmul(a, a_shape, b, b_shape, out),
+            CpuKernelMode::Optimized => matmul_optimized(a, a_shape, b, b_shape, out),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_out_by_in(
+        &self,
+        x: &[f32],
+        rows: usize,
+        in_features: usize,
+        weight_out_by_in: &[f32],
+        out_features: usize,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        match self.mode {
+            CpuKernelMode::Scalar => linear_out_by_in(
+                x,
+                rows,
+                in_features,
+                weight_out_by_in,
+                out_features,
+                bias,
+                out,
+            ),
+            CpuKernelMode::Optimized => linear_out_by_in_optimized(
+                x,
+                rows,
+                in_features,
+                weight_out_by_in,
+                out_features,
+                bias,
+                out,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scaled_dot_product_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        match self.mode {
+            CpuKernelMode::Scalar => attention::scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                out,
+            ),
+            CpuKernelMode::Optimized => attention::scaled_dot_product_attention_optimized(
+                q,
+                k,
+                v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                out,
+            ),
         }
     }
 }
@@ -256,6 +379,50 @@ pub fn matmul(
     b_shape: (usize, usize),
     out: &mut [f32],
 ) -> Result<()> {
+    let (m, k, n) = validate_matmul(a, a_shape, b, b_shape, out)?;
+
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0_f32;
+            for p in 0..k {
+                acc += a[i * k + p] * b[p * n + j];
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    Ok(())
+}
+
+fn matmul_optimized(
+    a: &[f32],
+    a_shape: (usize, usize),
+    b: &[f32],
+    b_shape: (usize, usize),
+    out: &mut [f32],
+) -> Result<()> {
+    let (m, k, n) = validate_matmul(a, a_shape, b, b_shape, out)?;
+
+    out.fill(0.0);
+    for i in 0..m {
+        let out_row = &mut out[i * n..(i + 1) * n];
+        for p in 0..k {
+            let a_ip = a[i * k + p];
+            let b_row = &b[p * n..(p + 1) * n];
+            for j in 0..n {
+                out_row[j] += a_ip * b_row[j];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_matmul(
+    a: &[f32],
+    a_shape: (usize, usize),
+    b: &[f32],
+    b_shape: (usize, usize),
+    out: &[f32],
+) -> Result<(usize, usize, usize)> {
     let (m, k_a) = a_shape;
     let (k_b, n) = b_shape;
 
@@ -287,16 +454,130 @@ pub fn matmul(
         )));
     }
 
-    let k = k_a;
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0.0_f32;
-            for p in 0..k {
-                acc += a[i * k + p] * b[p * n + j];
+    Ok((m, k_a, n))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_out_by_in(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    validate_linear_out_by_in(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )?;
+
+    for row in 0..rows {
+        for out_dim in 0..out_features {
+            let mut acc = bias.map_or(0.0, |b| b[out_dim]);
+            for in_dim in 0..in_features {
+                acc += x[row * in_features + in_dim]
+                    * weight_out_by_in[out_dim * in_features + in_dim];
             }
-            out[i * n + j] = acc;
+            out[row * out_features + out_dim] = acc;
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_out_by_in_optimized(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    validate_linear_out_by_in(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )?;
+
+    for row in 0..rows {
+        let out_row = &mut out[row * out_features..(row + 1) * out_features];
+        match bias {
+            Some(bias) => out_row.copy_from_slice(bias),
+            None => out_row.fill(0.0),
+        }
+        let x_row = &x[row * in_features..(row + 1) * in_features];
+        for in_dim in 0..in_features {
+            let x_value = x_row[in_dim];
+            for out_dim in 0..out_features {
+                out_row[out_dim] += x_value * weight_out_by_in[out_dim * in_features + in_dim];
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_linear_out_by_in(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &[f32],
+) -> Result<()> {
+    let x_expected = checked_len_product("linear_out_by_in", "x", &[rows, in_features])?;
+    let weight_expected =
+        checked_len_product("linear_out_by_in", "weight", &[out_features, in_features])?;
+    let out_expected = checked_len_product("linear_out_by_in", "out", &[rows, out_features])?;
+
+    if x.len() != x_expected {
+        return Err(kernel_err(format!(
+            "linear_out_by_in x.len()={} does not match rows*in_features={}*{}={}",
+            x.len(),
+            rows,
+            in_features,
+            x_expected
+        )));
+    }
+    if weight_out_by_in.len() != weight_expected {
+        return Err(kernel_err(format!(
+            "linear_out_by_in weight.len()={} does not match out_features*in_features={}*{}={}",
+            weight_out_by_in.len(),
+            out_features,
+            in_features,
+            weight_expected
+        )));
+    }
+    if let Some(bias) = bias {
+        if bias.len() != out_features {
+            return Err(kernel_err(format!(
+                "linear_out_by_in bias.len()={} does not match out_features={out_features}",
+                bias.len()
+            )));
+        }
+    }
+    if out.len() != out_expected {
+        return Err(kernel_err(format!(
+            "linear_out_by_in out.len()={} does not match rows*out_features={}*{}={}",
+            out.len(),
+            rows,
+            out_features,
+            out_expected
+        )));
+    }
+
     Ok(())
 }
 
@@ -541,6 +822,121 @@ mod tests {
                 );
             }
             other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cpu_backend_defaults_to_scalar_mode() {
+        let backend = CpuKernelBackend::default();
+
+        assert_eq!(backend.mode(), CpuKernelMode::Scalar);
+        assert_eq!(backend.name(), "cpu");
+        assert_eq!(backend.context().device, Device::Cpu);
+    }
+
+    #[test]
+    fn cpu_backend_can_select_optimized_mode() {
+        let backend = CpuKernelBackend::optimized();
+
+        assert_eq!(backend.mode(), CpuKernelMode::Optimized);
+        assert_eq!(CpuKernelMode::Optimized.as_str(), "optimized");
+    }
+
+    #[test]
+    fn optimized_matmul_matches_scalar_for_non_square_shape() {
+        let a = [
+            0.25_f32, -0.5, 1.0, //
+            1.5, 0.75, -1.25,
+        ];
+        let b = [
+            0.5_f32, -1.0, 0.25, 2.0, //
+            -0.75, 0.5, 1.25, -0.5, //
+            1.0, 1.5, -1.0, 0.75,
+        ];
+        let scalar = CpuKernelBackend::scalar();
+        let optimized = CpuKernelBackend::optimized();
+        let mut scalar_out = [0.0_f32; 8];
+        let mut optimized_out = [0.0_f32; 8];
+
+        scalar
+            .matmul(&a, (2, 3), &b, (3, 4), &mut scalar_out)
+            .unwrap();
+        optimized
+            .matmul(&a, (2, 3), &b, (3, 4), &mut optimized_out)
+            .unwrap();
+
+        for (got, want) in optimized_out.iter().zip(scalar_out.iter()) {
+            assert!(
+                (got - want).abs() <= 1.0e-6,
+                "optimized matmul drifted: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_linear_out_by_in_matches_scalar_with_bias() {
+        let x = [
+            1.0_f32, -2.0, 0.5, //
+            -0.25, 1.5, 2.0,
+        ];
+        // [out_features, in_features] layout.
+        let w = [
+            0.5_f32, -1.0, 0.25, //
+            -0.75, 0.5, 1.25, //
+            1.0, 1.5, -1.0, //
+            0.0, -0.5, 0.75,
+        ];
+        let bias = [0.1_f32, -0.2, 0.3, -0.4];
+        let scalar = CpuKernelBackend::scalar();
+        let optimized = CpuKernelBackend::optimized();
+        let mut scalar_out = [0.0_f32; 8];
+        let mut optimized_out = [0.0_f32; 8];
+
+        scalar
+            .linear_out_by_in(&x, 2, 3, &w, 4, Some(&bias), &mut scalar_out)
+            .unwrap();
+        optimized
+            .linear_out_by_in(&x, 2, 3, &w, 4, Some(&bias), &mut optimized_out)
+            .unwrap();
+
+        for (got, want) in optimized_out.iter().zip(scalar_out.iter()) {
+            assert!(
+                (got - want).abs() <= 1.0e-6,
+                "optimized linear_out_by_in drifted: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_attention_matches_scalar_backend() {
+        let q = [
+            1.0_f32, 0.0, //
+            0.0, 1.0, //
+            0.5, 0.5,
+        ];
+        let k = q;
+        let v = [
+            1.0_f32, 2.0, //
+            3.0, 4.0, //
+            100.0, -50.0,
+        ];
+        let scalar = CpuKernelBackend::scalar();
+        let optimized = CpuKernelBackend::optimized();
+        let mut scalar_out = [0.0_f32; 6];
+        let mut optimized_out = [0.0_f32; 6];
+
+        scalar
+            .scaled_dot_product_attention(&q, &k, &v, 3, 1, 1, 2, &mut scalar_out)
+            .unwrap();
+        optimized
+            .scaled_dot_product_attention(&q, &k, &v, 3, 1, 1, 2, &mut optimized_out)
+            .unwrap();
+
+        for (got, want) in optimized_out.iter().zip(scalar_out.iter()) {
+            assert!(
+                (got - want).abs() <= 1.0e-6,
+                "optimized attention drifted: got {got}, want {want}"
+            );
         }
     }
 }

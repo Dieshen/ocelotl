@@ -360,6 +360,11 @@ Ocelotl can run real Whisper weights yet.
 - `Done when`: CPU kernel selection is explicit and Ocelotl can route hot
   matmul/attention work to a faster CPU implementation while preserving scalar
   fallback for correctness and portability.
+- `Status note`: landed on 2026-05-12. `CpuKernelBackend` now has explicit
+  `Scalar` and `Optimized` modes. The scalar backend remains default; optimized
+  mode routes Qwen prefill matmul/attention and real Whisper linear projection
+  work through cache-friendlier safe-Rust CPU kernels while preserving public
+  model outputs within pinned tolerances.
 - `Out of scope`: GPU/CubeCL and quantization-specific kernels.
 
 ## W-ASR.24 Refresh whisper.cpp Baseline and Set CPU Gates

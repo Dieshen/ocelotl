@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 
 use ocelotl_core::{DType, InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId};
-use ocelotl_kernels::softmax;
+use ocelotl_kernels::{CpuKernelBackend, softmax};
 use ocelotl_loader::{LoadedTensor, SupportedDtype};
 
 use super::{WhisperConfig, required_whisper_tensor_names};
@@ -94,6 +94,7 @@ impl WhisperWeights {
 pub struct WhisperModel {
     config: WhisperConfig,
     weights: WhisperWeights,
+    kernels: CpuKernelBackend,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,13 +120,29 @@ impl WhisperEncodedAudio {
 
 impl WhisperModel {
     pub fn new(config: WhisperConfig, tensors: Vec<LoadedTensor>) -> Result<Self> {
+        Self::with_cpu_kernel_backend(config, tensors, CpuKernelBackend::default())
+    }
+
+    pub fn with_cpu_kernel_backend(
+        config: WhisperConfig,
+        tensors: Vec<LoadedTensor>,
+        kernels: CpuKernelBackend,
+    ) -> Result<Self> {
         let config = config.validate()?;
         let weights = WhisperWeights::from_loaded_tensors(&config, tensors)?;
-        Ok(Self { config, weights })
+        Ok(Self {
+            config,
+            weights,
+            kernels,
+        })
     }
 
     pub fn config(&self) -> &WhisperConfig {
         &self.config
+    }
+
+    pub fn kernel_backend(&self) -> &CpuKernelBackend {
+        &self.kernels
     }
 
     pub fn forward_next_token_logits(
@@ -192,7 +209,15 @@ impl WhisperModel {
             self.weights.get("decoder.proj_out.weight")
         };
 
-        linear(last, 1, state, projection, self.config.vocab_size, None)
+        linear(
+            &self.kernels,
+            last,
+            1,
+            state,
+            projection,
+            self.config.vocab_size,
+            None,
+        )
     }
 
     fn encode_audio(&self, log_mel: &[f32], mel_frames: usize) -> Result<Vec<f32>> {
@@ -255,6 +280,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let attn = attention(
+                &self.kernels,
                 &attn_ln,
                 seq,
                 self.config.audio_state_size,
@@ -280,6 +306,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let mlp = mlp_gelu(
+                &self.kernels,
                 &mlp_ln,
                 seq,
                 self.config.audio_state_size,
@@ -330,6 +357,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let self_attn = attention(
+                &self.kernels,
                 &attn_ln,
                 seq,
                 text_state,
@@ -355,6 +383,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let cross_attn = attention(
+                &self.kernels,
                 &cross_ln,
                 seq,
                 text_state,
@@ -382,6 +411,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let mlp = mlp_gelu(
+                &self.kernels,
                 &mlp_ln,
                 seq,
                 text_state,
@@ -538,6 +568,7 @@ fn layer_norm(
 
 #[allow(clippy::too_many_arguments)]
 fn mlp_gelu(
+    kernels: &CpuKernelBackend,
     x: &[f32],
     rows: usize,
     hidden: usize,
@@ -547,13 +578,14 @@ fn mlp_gelu(
     fc2_w: &[f32],
     fc2_b: &[f32],
 ) -> Result<Vec<f32>> {
-    let mut hidden_act = linear(x, rows, hidden, fc1_w, ffn, Some(fc1_b))?;
+    let mut hidden_act = linear(kernels, x, rows, hidden, fc1_w, ffn, Some(fc1_b))?;
     gelu_inplace(&mut hidden_act);
-    linear(&hidden_act, rows, ffn, fc2_w, hidden, Some(fc2_b))
+    linear(kernels, &hidden_act, rows, ffn, fc2_w, hidden, Some(fc2_b))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn attention(
+    kernels: &CpuKernelBackend,
     x: &[f32],
     q_seq: usize,
     state: usize,
@@ -578,9 +610,17 @@ fn attention(
         ));
     }
     let (kv_source, kv_seq) = cross.unwrap_or((x, q_seq));
-    let q = linear(x, q_seq, state, query_w, state, Some(query_b))?;
-    let k = linear(kv_source, kv_seq, state, key_w, state, None)?;
-    let v = linear(kv_source, kv_seq, state, value_w, state, Some(value_b))?;
+    let q = linear(kernels, x, q_seq, state, query_w, state, Some(query_b))?;
+    let k = linear(kernels, kv_source, kv_seq, state, key_w, state, None)?;
+    let v = linear(
+        kernels,
+        kv_source,
+        kv_seq,
+        state,
+        value_w,
+        state,
+        Some(value_b),
+    )?;
 
     let head_dim = state / heads;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -617,10 +657,11 @@ fn attention(
         }
     }
 
-    linear(&context, q_seq, state, out_w, state, Some(out_b))
+    linear(kernels, &context, q_seq, state, out_w, state, Some(out_b))
 }
 
 fn linear(
+    kernels: &CpuKernelBackend,
     x: &[f32],
     rows: usize,
     in_features: usize,
@@ -654,17 +695,17 @@ fn linear(
         }
     }
 
-    let mut out = vec![0.0_f32; rows * out_features];
-    for row in 0..rows {
-        for out_dim in 0..out_features {
-            let mut acc = bias.map_or(0.0, |b| b[out_dim]);
-            for in_dim in 0..in_features {
-                acc += x[row * in_features + in_dim]
-                    * weight_out_by_in[out_dim * in_features + in_dim];
-            }
-            out[row * out_features + out_dim] = acc;
-        }
-    }
+    let out_len = checked_len_product("linear.out", &[rows, out_features])?;
+    let mut out = vec![0.0_f32; out_len];
+    kernels.linear_out_by_in(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        &mut out,
+    )?;
     Ok(out)
 }
 
@@ -973,8 +1014,9 @@ mod tests {
         let fc1_b = [0.0_f32, 0.0];
         let fc2_w = [1.0_f32, 0.0, 0.0, 1.0];
         let fc2_b = [0.0_f32, 0.0];
+        let kernels = CpuKernelBackend::default();
 
-        let out = mlp_gelu(&x, 1, 2, 2, &fc1_w, &fc1_b, &fc2_w, &fc2_b).expect("mlp");
+        let out = mlp_gelu(&kernels, &x, 1, 2, 2, &fc1_w, &fc1_b, &fc2_w, &fc2_b).expect("mlp");
 
         assert_close(&out, &[0.841_344_7, 0.0], 1.0e-6);
     }
@@ -990,8 +1032,10 @@ mod tests {
         let x = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
+        let kernels = CpuKernelBackend::default();
         let out = attention(
-            &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None, false,
+            &kernels, &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None,
+            false,
         )
         .expect("encoder self attention");
 
@@ -1003,8 +1047,10 @@ mod tests {
         let x = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
+        let kernels = CpuKernelBackend::default();
         let out = attention(
-            &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None, true,
+            &kernels, &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None,
+            true,
         )
         .expect("decoder self attention");
 
@@ -1017,7 +1063,9 @@ mod tests {
         let audio = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
+        let kernels = CpuKernelBackend::default();
         let out = attention(
+            &kernels,
             &text,
             2,
             1,
@@ -1096,6 +1144,34 @@ mod tests {
         assert_eq!(audio.state_size(), cfg.audio_state_size);
         assert_eq!(audio.values().len(), audio.frames() * audio.state_size());
         assert_close(&cached, &legacy, 0.0);
+    }
+
+    #[test]
+    fn optimized_cpu_backend_preserves_forward_logits() {
+        let cfg = tiny_config();
+        let scalar =
+            WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("scalar model");
+        let optimized = WhisperModel::with_cpu_kernel_backend(
+            cfg.clone(),
+            tiny_weight_tensors(&cfg),
+            CpuKernelBackend::optimized(),
+        )
+        .expect("optimized model");
+        let mel = vec![0.0_f32; 4 * cfg.mel_bins];
+        let tokens = [TokenId(0), TokenId(2)];
+
+        assert_eq!(
+            optimized.kernel_backend().mode(),
+            ocelotl_kernels::CpuKernelMode::Optimized
+        );
+        let scalar_logits = scalar
+            .forward_next_token_logits(&mel, 4, &tokens)
+            .expect("scalar logits");
+        let optimized_logits = optimized
+            .forward_next_token_logits(&mel, 4, &tokens)
+            .expect("optimized logits");
+
+        assert_close(&optimized_logits, &scalar_logits, 1.0e-5);
     }
 
     #[test]

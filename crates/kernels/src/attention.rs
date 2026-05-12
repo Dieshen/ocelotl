@@ -103,6 +103,132 @@ pub fn scaled_dot_product_attention(
     head_dim: usize,
     out: &mut [f32],
 ) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        out,
+    )?;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    // Per-(query position i, query head h) softmax buffer. We allocate it
+    // once and reuse across iterations; the masked tail beyond i+1 is not
+    // touched by either the score loop or the output accumulation loop.
+    let mut scores = vec![0.0_f32; seq_len];
+
+    for i in 0..seq_len {
+        for h in 0..num_q_heads {
+            let kh = h / group_size;
+
+            // 1) Compute scaled dot products for j in 0..=i; j>i stays
+            //    untouched and is never read (we only softmax/accumulate
+            //    over the unmasked prefix). Setting -inf is unnecessary
+            //    when we slice the prefix; numerically equivalent.
+            let q_base = (i * num_q_heads + h) * head_dim;
+            for (j, score) in scores.iter_mut().enumerate().take(i + 1) {
+                let mut acc = 0.0_f32;
+                let k_base = (j * num_kv_heads + kh) * head_dim;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+
+            // 2) Softmax over the unmasked prefix [0..=i]. Reuse the
+            //    in-place softmax kernel from M1.7.
+            softmax(&mut scores[..=i]);
+
+            // 3) Accumulate weighted V into out. Zero the output row
+            //    first because we accumulate.
+            let out_base = (i * num_q_heads + h) * head_dim;
+            for d in 0..head_dim {
+                out[out_base + d] = 0.0_f32;
+            }
+            for (j, &p) in scores.iter().enumerate().take(i + 1) {
+                let v_base = (j * num_kv_heads + kh) * head_dim;
+                for d in 0..head_dim {
+                    out[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_optimized(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        out,
+    )?;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0_f32; seq_len];
+
+    for i in 0..seq_len {
+        for h in 0..num_q_heads {
+            let kh = h / group_size;
+            let q_base = (i * num_q_heads + h) * head_dim;
+            let q_row = &q[q_base..q_base + head_dim];
+
+            for (j, score) in scores.iter_mut().enumerate().take(i + 1) {
+                let k_base = (j * num_kv_heads + kh) * head_dim;
+                let k_row = &k[k_base..k_base + head_dim];
+                let mut acc = 0.0_f32;
+                for d in 0..head_dim {
+                    acc += q_row[d] * k_row[d];
+                }
+                *score = acc * scale;
+            }
+
+            softmax(&mut scores[..=i]);
+
+            let out_base = (i * num_q_heads + h) * head_dim;
+            let out_row = &mut out[out_base..out_base + head_dim];
+            out_row.fill(0.0);
+            for (j, &p) in scores.iter().enumerate().take(i + 1) {
+                let v_base = (j * num_kv_heads + kh) * head_dim;
+                let v_row = &v[v_base..v_base + head_dim];
+                for d in 0..head_dim {
+                    out_row[d] += p * v_row[d];
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_scaled_dot_product_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    out: &[f32],
+) -> Result<usize> {
     if head_dim == 0 {
         return Err(kernel_err(
             "scaled_dot_product_attention head_dim must be non-zero".to_string(),
@@ -186,52 +312,7 @@ pub fn scaled_dot_product_attention(
         )));
     }
 
-    let group_size = num_q_heads / num_kv_heads;
-    let scale = 1.0_f32 / (head_dim as f32).sqrt();
-
-    // Per-(query position i, query head h) softmax buffer. We allocate it
-    // once and reuse across iterations; the masked tail beyond i+1 is not
-    // touched by either the score loop or the output accumulation loop.
-    let mut scores = vec![0.0_f32; seq_len];
-
-    for i in 0..seq_len {
-        for h in 0..num_q_heads {
-            let kh = h / group_size;
-
-            // 1) Compute scaled dot products for j in 0..=i; j>i stays
-            //    untouched and is never read (we only softmax/accumulate
-            //    over the unmasked prefix). Setting -inf is unnecessary
-            //    when we slice the prefix; numerically equivalent.
-            let q_base = (i * num_q_heads + h) * head_dim;
-            for (j, score) in scores.iter_mut().enumerate().take(i + 1) {
-                let mut acc = 0.0_f32;
-                let k_base = (j * num_kv_heads + kh) * head_dim;
-                for d in 0..head_dim {
-                    acc += q[q_base + d] * k[k_base + d];
-                }
-                *score = acc * scale;
-            }
-
-            // 2) Softmax over the unmasked prefix [0..=i]. Reuse the
-            //    in-place softmax kernel from M1.7.
-            softmax(&mut scores[..=i]);
-
-            // 3) Accumulate weighted V into out. Zero the output row
-            //    first because we accumulate.
-            let out_base = (i * num_q_heads + h) * head_dim;
-            for d in 0..head_dim {
-                out[out_base + d] = 0.0_f32;
-            }
-            for (j, &p) in scores.iter().enumerate().take(i + 1) {
-                let v_base = (j * num_kv_heads + kh) * head_dim;
-                for d in 0..head_dim {
-                    out[out_base + d] += p * v[v_base + d];
-                }
-            }
-        }
-    }
-
-    Ok(())
+    Ok(num_q_heads / num_kv_heads)
 }
 
 #[cfg(test)]
