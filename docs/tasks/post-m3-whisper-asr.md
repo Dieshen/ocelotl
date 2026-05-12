@@ -401,3 +401,20 @@ Ocelotl can run real Whisper weights yet.
   `9,172 ms`.
 - `Out of scope`: changing model behavior, adding decoder KV cache, or claiming
   a speedup. This task tightens measurement before optimization.
+
+## W-ASR.26 Cache Whisper Cross-Attention K/V
+
+- `Crates`: `ocelotl-models`; benchmark docs after proof.
+- `Test first`: add a model-level regression proving precomputed
+  cross-attention K/V produces the same output as the projected-on-demand path.
+- `Done when`: `WhisperEncodedAudio` carries one-time decoder cross-attention
+  K/V projections, decoder cross-attention consumes those cached projections,
+  exact local tiny.en token parity still passes, and resident benchmark docs
+  record the before/after CPU impact.
+- `Status note`: landed on 2026-05-12. Scalar release proof passed exact token
+  parity. Total hook wall time improved from `13,869 ms` to `8,582 ms`;
+  resident audio-to-tokens improved from `9,925 ms` to `4,635 ms`; decode total
+  improved from `7,062 ms` to `1,519 ms`. Optimized mode remains slower than
+  scalar and stays opt-in.
+- `Out of scope`: decoder self-attention KV reuse, one-token incremental
+  decoder execution, FFT log-mel, and Whisper-specific weight packing.

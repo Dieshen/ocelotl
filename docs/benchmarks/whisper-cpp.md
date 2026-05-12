@@ -246,3 +246,35 @@ For the W-ASR.25 scalar direct hook run, the resident-model view is:
 For tiny.en, the first optimization gate should focus on this resident path.
 Model load remains important for startup and memory footprint, but it is the
 wrong denominator for steady-state embedded transcription latency.
+
+## W-ASR.26 Cross-Attention K/V Cache
+
+The decoder now precomputes cross-attention key/value projections once inside
+`WhisperEncodedAudio` instead of recomputing them for every generated token.
+This is the first CPU speedup that changes model internals while preserving the
+same public transcription path and exact token parity.
+
+Fresh scalar release run on the same tiny.en fixture:
+
+| Metric | W-ASR.25 scalar | W-ASR.26 scalar | Change |
+| ------ | --------------- | --------------- | ------ |
+| Total hook wall time | `13,869 ms` | `8,582 ms` | ~38% faster |
+| Resident audio to tokens | `9,925 ms` | `4,635 ms` | ~53% faster |
+| Resident mel to tokens | `9,172 ms` | `3,884 ms` | ~58% faster |
+| Decode total | `7,062 ms` | `1,519 ms` | ~78% faster |
+
+Optimized mode remains opt-in and is still slower for Whisper after this change:
+`12,468 ms` total, `7,015 ms` resident audio-to-tokens, and `3,277 ms`
+decode total. Scalar remains the correct Whisper default.
+
+Current scalar hot spots after W-ASR.26:
+
+- `tensor_load_model`: `3,944 ms` startup cost.
+- `audio_encode`: `2,365 ms`, now including one-time cross-attention K/V
+  precompute.
+- `decode_total`: `1,519 ms`.
+- `log_mel`: `751 ms`.
+
+The next CPU speed task should target decoder self-attention KV reuse /
+one-token incremental decode. After that, the obvious remaining CPU work is
+FFT-based log-mel and Whisper-specific projection weight packing.

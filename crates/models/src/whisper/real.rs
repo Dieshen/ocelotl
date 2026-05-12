@@ -102,6 +102,13 @@ pub struct WhisperEncodedAudio {
     frames: usize,
     state_size: usize,
     values: Vec<f32>,
+    cross_attention: Vec<WhisperCrossAttentionCache>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WhisperCrossAttentionCache {
+    key: Vec<f32>,
+    value: Vec<f32>,
 }
 
 impl WhisperEncodedAudio {
@@ -186,6 +193,7 @@ impl WhisperModel {
         Ok(WhisperEncodedAudio {
             frames,
             state_size,
+            cross_attention: self.precompute_cross_attention(&values, frames)?,
             values,
         })
     }
@@ -198,7 +206,7 @@ impl WhisperModel {
         validate_encoded_audio(&self.config, audio)?;
         validate_decoder_tokens(&self.config, decoder_tokens)?;
 
-        let decoded = self.decode_tokens(decoder_tokens, audio.values())?;
+        let decoded = self.decode_tokens(decoder_tokens, audio)?;
         let state = self.config.text_state_size;
         let last_start = (decoder_tokens.len() - 1) * state;
         let last = &decoded[last_start..last_start + state];
@@ -329,10 +337,14 @@ impl WhisperModel {
         )
     }
 
-    fn decode_tokens(&self, decoder_tokens: &[TokenId], audio: &[f32]) -> Result<Vec<f32>> {
+    fn decode_tokens(
+        &self,
+        decoder_tokens: &[TokenId],
+        audio: &WhisperEncodedAudio,
+    ) -> Result<Vec<f32>> {
         let seq = decoder_tokens.len();
         let text_state = self.config.text_state_size;
-        let audio_seq = audio.len() / self.config.audio_state_size;
+        let audio_seq = audio.frames();
         let mut x = vec![0.0_f32; seq * text_state];
         let token_embedding = self.weights.get("decoder.token_embedding.weight");
         let positional_embedding = self.weights.get("decoder.positional_embedding");
@@ -382,7 +394,8 @@ impl WhisperModel {
                 self.weights.get(&format!("{prefix}.cross_attn_ln.bias")),
                 LAYER_NORM_EPS,
             )?;
-            let cross_attn = attention(
+            let cross_cache = &audio.cross_attention[layer];
+            let cross_attn = attention_with_precomputed_kv(
                 &self.kernels,
                 &cross_ln,
                 seq,
@@ -391,13 +404,11 @@ impl WhisperModel {
                 self.weights
                     .get(&format!("{prefix}.cross_attn.query.weight")),
                 self.weights.get(&format!("{prefix}.cross_attn.query.bias")),
-                self.weights.get(&format!("{prefix}.cross_attn.key.weight")),
-                self.weights
-                    .get(&format!("{prefix}.cross_attn.value.weight")),
-                self.weights.get(&format!("{prefix}.cross_attn.value.bias")),
+                &cross_cache.key,
+                &cross_cache.value,
+                audio_seq,
                 self.weights.get(&format!("{prefix}.cross_attn.out.weight")),
                 self.weights.get(&format!("{prefix}.cross_attn.out.bias")),
-                Some((audio, audio_seq)),
                 false,
             )?;
             add_inplace(&mut x, &cross_attn);
@@ -432,6 +443,38 @@ impl WhisperModel {
             self.weights.get("decoder.ln.bias"),
             LAYER_NORM_EPS,
         )
+    }
+
+    fn precompute_cross_attention(
+        &self,
+        encoded_audio: &[f32],
+        audio_seq: usize,
+    ) -> Result<Vec<WhisperCrossAttentionCache>> {
+        let state = self.config.text_state_size;
+        let mut caches = Vec::with_capacity(self.config.text_layers);
+        for layer in 0..self.config.text_layers {
+            let prefix = format!("decoder.blocks.{layer}.cross_attn");
+            let key = linear(
+                &self.kernels,
+                encoded_audio,
+                audio_seq,
+                state,
+                self.weights.get(&format!("{prefix}.key.weight")),
+                state,
+                None,
+            )?;
+            let value = linear(
+                &self.kernels,
+                encoded_audio,
+                audio_seq,
+                state,
+                self.weights.get(&format!("{prefix}.value.weight")),
+                state,
+                Some(self.weights.get(&format!("{prefix}.value.bias"))),
+            )?;
+            caches.push(WhisperCrossAttentionCache { key, value });
+        }
+        Ok(caches)
     }
 }
 
@@ -621,6 +664,77 @@ fn attention(
         state,
         Some(value_b),
     )?;
+
+    attention_from_projected(
+        kernels, &q, q_seq, &k, &v, kv_seq, state, heads, out_w, out_b, causal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_with_precomputed_kv(
+    kernels: &CpuKernelBackend,
+    x: &[f32],
+    q_seq: usize,
+    state: usize,
+    heads: usize,
+    query_w: &[f32],
+    query_b: &[f32],
+    key: &[f32],
+    value: &[f32],
+    kv_seq: usize,
+    out_w: &[f32],
+    out_b: &[f32],
+    causal: bool,
+) -> Result<Vec<f32>> {
+    let q = linear(kernels, x, q_seq, state, query_w, state, Some(query_b))?;
+    attention_from_projected(
+        kernels, &q, q_seq, key, value, kv_seq, state, heads, out_w, out_b, causal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_from_projected(
+    kernels: &CpuKernelBackend,
+    q: &[f32],
+    q_seq: usize,
+    k: &[f32],
+    v: &[f32],
+    kv_seq: usize,
+    state: usize,
+    heads: usize,
+    out_w: &[f32],
+    out_b: &[f32],
+    causal: bool,
+) -> Result<Vec<f32>> {
+    if heads == 0 {
+        return Err(invalid_model("attention.heads", "must be > 0"));
+    }
+    if state % heads != 0 {
+        return Err(invalid_model(
+            "attention.state",
+            &format!("state {state} must be divisible by heads {heads}"),
+        ));
+    }
+    let q_expected = checked_len_product("attention.q", &[q_seq, state])?;
+    if q.len() != q_expected {
+        return Err(invalid_request(
+            "attention.q",
+            &format!("expected length {q_expected}, got {}", q.len()),
+        ));
+    }
+    let kv_expected = checked_len_product("attention.kv", &[kv_seq, state])?;
+    if k.len() != kv_expected {
+        return Err(invalid_request(
+            "attention.key",
+            &format!("expected length {kv_expected}, got {}", k.len()),
+        ));
+    }
+    if v.len() != kv_expected {
+        return Err(invalid_request(
+            "attention.value",
+            &format!("expected length {kv_expected}, got {}", v.len()),
+        ));
+    }
 
     let head_dim = state / heads;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -819,6 +933,40 @@ fn validate_encoded_audio(config: &WhisperConfig, audio: &WhisperEncodedAudio) -
             "encoded_audio.values",
             &format!("expected length {expected}, got {}", audio.values.len()),
         ));
+    }
+    if audio.cross_attention.len() != config.text_layers {
+        return Err(invalid_request(
+            "encoded_audio.cross_attention",
+            &format!(
+                "expected {} decoder-layer cross-attention caches, got {}",
+                config.text_layers,
+                audio.cross_attention.len()
+            ),
+        ));
+    }
+    let expected_cross = checked_len_product(
+        "encoded_audio.cross_attention",
+        &[audio.frames, config.text_state_size],
+    )?;
+    for (layer, cache) in audio.cross_attention.iter().enumerate() {
+        if cache.key.len() != expected_cross {
+            return Err(invalid_request(
+                "encoded_audio.cross_attention.key",
+                &format!(
+                    "layer {layer} expected length {expected_cross}, got {}",
+                    cache.key.len()
+                ),
+            ));
+        }
+        if cache.value.len() != expected_cross {
+            return Err(invalid_request(
+                "encoded_audio.cross_attention.value",
+                &format!(
+                    "layer {layer} expected length {expected_cross}, got {}",
+                    cache.value.len()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1143,7 +1291,45 @@ mod tests {
         assert_eq!(audio.frames(), 2);
         assert_eq!(audio.state_size(), cfg.audio_state_size);
         assert_eq!(audio.values().len(), audio.frames() * audio.state_size());
+        assert_eq!(audio.cross_attention.len(), cfg.text_layers);
+        for cache in &audio.cross_attention {
+            assert_eq!(cache.key.len(), audio.frames() * cfg.text_state_size);
+            assert_eq!(cache.value.len(), audio.frames() * cfg.text_state_size);
+        }
         assert_close(&cached, &legacy, 0.0);
+    }
+
+    #[test]
+    fn precomputed_cross_attention_matches_projected_cross_attention() {
+        let text = [1.0_f32, 1.0];
+        let audio = [1.0_f32, 2.0, 7.0];
+        let identity = [1.0_f32];
+        let zero = [0.0_f32];
+        let kernels = CpuKernelBackend::default();
+
+        let projected = attention(
+            &kernels,
+            &text,
+            2,
+            1,
+            1,
+            &zero,
+            &zero,
+            &zero,
+            &identity,
+            &zero,
+            &identity,
+            &zero,
+            Some((&audio, 3)),
+            false,
+        )
+        .expect("projected cross attention");
+        let precomputed = attention_with_precomputed_kv(
+            &kernels, &text, 2, 1, 1, &zero, &zero, &audio, &audio, 3, &identity, &zero, false,
+        )
+        .expect("precomputed cross attention");
+
+        assert_close(&precomputed, &projected, 0.0);
     }
 
     #[test]
@@ -1182,6 +1368,7 @@ mod tests {
             frames: 1,
             state_size: cfg.audio_state_size + 1,
             values: vec![0.0; cfg.audio_state_size + 1],
+            cross_attention: Vec::new(),
         };
 
         let err = model
