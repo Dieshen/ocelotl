@@ -13,7 +13,9 @@
       "--audio-path",
       "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
       "--expected-tokens-path",
-      "local-artifacts/whisper_tiny_en/reference/expected_tokens.json"
+      "local-artifacts/whisper_tiny_en/reference/expected_tokens.json",
+      "--cpu-kernel-mode",
+      "optimized"
     ],
     "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
     "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",

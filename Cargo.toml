@@ -49,6 +49,7 @@ categories = ["science", "api-bindings"]
 
 [dependencies]
 ocelotl-core.workspace = true
+ocelotl-kernels.workspace = true
 ocelotl-loader.workspace = true
 ocelotl-models.workspace = true
 ocelotl-runtime.workspace = true

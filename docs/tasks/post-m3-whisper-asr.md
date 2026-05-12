@@ -376,3 +376,12 @@ Ocelotl can run real Whisper weights yet.
   W-ASR.20-W-ASR.23, the performance delta is documented, and follow-up CPU
   gates are stated as measurable targets rather than generic optimization work.
 - `Out of scope`: claiming parity across all Whisper sizes or across GPU.
+- `Status note`: landed on 2026-05-12. The benchmark hook now accepts
+  `--cpu-kernel-mode scalar|optimized`, and the example manifest measures the
+  W-ASR.23 optimized backend explicitly. The fresh local optimized run was
+  parity-clean but slower than scalar: Ocelotl optimized `16,648 ms` vs
+  whisper.cpp `564 ms` (~29.5x slower), while the same release hook in scalar
+  mode measured `14,179 ms`. `docs/benchmarks/whisper-cpp.md` now records the
+  result and the measurable correctness, regression, optimized-default, and
+  CPU-competitiveness gates. Optimized mode must not become the Whisper default
+  until it beats scalar on the documented gate.

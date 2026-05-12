@@ -98,6 +98,14 @@ fn whisper_cpp_benchmark_manifest_names_commands_inputs_and_threads() {
         "Ocelotl benchmark command must use the dedicated transcription timing hook"
     );
     assert!(
+        manifest
+            .ocelotl
+            .command
+            .windows(2)
+            .any(|args| args == ["--cpu-kernel-mode", "optimized"]),
+        "W-ASR.24 benchmark command must opt into the W-ASR.23 optimized CPU backend"
+    );
+    assert!(
         !manifest
             .ocelotl
             .command
