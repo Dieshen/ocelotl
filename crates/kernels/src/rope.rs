@@ -10,9 +10,11 @@
 //! `docs/tasks/m3-single-model-forward.md` M3.4 "Done when" line + the
 //! M3 Phase 1 scope split recorded in the assignments board).
 
-use ocelotl_core::Result;
+use ocelotl_core::{KernelError, OcelotlError, Result};
 
 use crate::kernel_err;
+
+const CPU_BACKEND: &str = "cpu";
 
 /// Apply rotary position embeddings in place.
 ///
@@ -62,48 +64,84 @@ pub fn rope_apply_inplace(
     position: usize,
     theta: f32,
 ) -> Result<()> {
-    if head_dim == 0 {
-        return Err(kernel_err(
-            "rope_apply_inplace head_dim must be non-zero".to_string(),
-        ));
-    }
-    if head_dim % 2 != 0 {
-        return Err(kernel_err(format!(
-            "rope_apply_inplace head_dim must be even, got {head_dim}"
-        )));
-    }
-    if x.is_empty() || x.len() % head_dim != 0 {
-        return Err(kernel_err(format!(
-            "rope_apply_inplace x.len()={} must be a positive multiple of head_dim={}",
-            x.len(),
-            head_dim
-        )));
-    }
-
-    let half = head_dim / 2;
-    let pos_f = position as f32;
-    let head_dim_f = head_dim as f32;
+    let half = validate_rope_shape(CPU_BACKEND, x.len(), head_dim)?;
+    let (cos, sin) = rope_trig_tables(head_dim, position, theta);
 
     // Walk each head row independently.
     for head_offset in (0..x.len()).step_by(head_dim) {
         for i in 0..half {
-            // inv_freq[i] = theta^(-2i / head_dim)
-            let exponent = -2.0_f32 * (i as f32) / head_dim_f;
-            let inv_freq = theta.powf(exponent);
-            let angle = pos_f * inv_freq;
-            let c = angle.cos();
-            let s = angle.sin();
-
             let lo = head_offset + i;
             let hi = head_offset + i + half;
             let x_lo = x[lo];
             let x_hi = x[hi];
-            x[lo] = x_lo * c - x_hi * s;
-            x[hi] = x_lo * s + x_hi * c;
+            x[lo] = x_lo * cos[i] - x_hi * sin[i];
+            x[hi] = x_lo * sin[i] + x_hi * cos[i];
         }
     }
 
     Ok(())
+}
+
+pub(crate) fn validate_rope_shape(
+    backend: &'static str,
+    x_len: usize,
+    head_dim: usize,
+) -> Result<usize> {
+    if head_dim == 0 {
+        return Err(rope_err(
+            backend,
+            "rope_apply_inplace head_dim must be non-zero".to_string(),
+        ));
+    }
+    if head_dim % 2 != 0 {
+        return Err(rope_err(
+            backend,
+            format!("rope_apply_inplace head_dim must be even, got {head_dim}"),
+        ));
+    }
+    if x_len == 0 || x_len % head_dim != 0 {
+        return Err(rope_err(
+            backend,
+            format!(
+                "rope_apply_inplace x.len()={x_len} must be a positive multiple of head_dim={head_dim}"
+            ),
+        ));
+    }
+
+    Ok(head_dim / 2)
+}
+
+pub(crate) fn rope_trig_tables(
+    head_dim: usize,
+    position: usize,
+    theta: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let pos_f = position as f32;
+    let head_dim_f = head_dim as f32;
+    let mut cos = Vec::with_capacity(half);
+    let mut sin = Vec::with_capacity(half);
+
+    for i in 0..half {
+        let exponent = -2.0_f32 * (i as f32) / head_dim_f;
+        let inv_freq = theta.powf(exponent);
+        let angle = pos_f * inv_freq;
+        cos.push(angle.cos());
+        sin.push(angle.sin());
+    }
+
+    (cos, sin)
+}
+
+fn rope_err(backend: &'static str, message: impl Into<String>) -> OcelotlError {
+    if backend == CPU_BACKEND {
+        return kernel_err(message);
+    }
+
+    OcelotlError::Kernel(KernelError {
+        backend: backend.to_string(),
+        message: message.into(),
+    })
 }
 
 #[cfg(test)]

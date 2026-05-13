@@ -19,6 +19,35 @@ Ocelotl-facing operations while allowing backend-specific implementations.
 - CubeK matmul, attention, reduction, and quantization kernels.
 - Burn tensor ops where they are useful and do not obscure memory ownership.
 
+## M4 CubeCL Spike
+
+The first non-CPU backend is a narrow CubeCL WGPU RoPE spike in
+`ocelotl-kernels`, behind the optional `cubecl-wgpu` feature. CPU remains the
+default backend and parity oracle.
+
+Why RoPE first:
+
+- It is layout-sensitive enough to test Ocelotl-owned indexing and validation.
+- It avoids making the first GPU decision around GEMM, where CubeK or another
+  tuned kernel library may be the right long-term choice.
+- It has compact hand-checked CPU fixtures already in the kernel crate.
+
+The spike deliberately copies CPU slices into CubeCL buffers, launches a simple
+f32 kernel, and copies results back. That is not the performance model for M4;
+it is a boundary proof that CubeCL can sit behind Ocelotl-owned kernel APIs
+without leaking into `ocelotl-runtime` or model-family code.
+
+Validation commands:
+
+```powershell
+cargo check -p ocelotl-kernels --features cubecl-wgpu --tests
+cargo test -p ocelotl-kernels --features cubecl-wgpu cubecl_backend -- --nocapture
+cargo test -p ocelotl-kernels --features cubecl-wgpu wgpu_rope_matches_cpu_reference_for_position_one -- --ignored --nocapture
+```
+
+The local execution proof uses `1e-5` tolerance against
+`rope_apply_inplace`. Default workspace validation does not build CubeCL.
+
 ## Initial Operations
 
 The first useful kernel interface should cover only what M1-M4 need:

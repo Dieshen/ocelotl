@@ -32,6 +32,12 @@ pub use rope::rope_apply_inplace;
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
 pub mod attention;
+#[cfg(feature = "cubecl")]
+pub mod cubecl_backend;
+#[cfg(feature = "cubecl-wgpu")]
+pub use cubecl_backend::rope_apply_inplace_wgpu;
+#[cfg(feature = "cubecl")]
+pub use cubecl_backend::{CubeClKernelBackend, rope_apply_inplace_cubecl};
 pub mod mlp;
 pub mod rmsnorm;
 
@@ -962,6 +968,26 @@ mod tests {
         assert_eq!(backend.mode(), CpuKernelMode::Scalar);
         assert_eq!(backend.name(), "cpu");
         assert_eq!(backend.context().device, Device::Cpu);
+    }
+
+    #[test]
+    fn cpu_backend_rejects_gpu_requirement_with_typed_unsupported_error() {
+        let backend = CpuKernelBackend::default();
+
+        let err = require_gpu(&backend).expect_err("CPU backend must not satisfy GPU requirement");
+
+        match err {
+            OcelotlError::Unsupported(UnsupportedError {
+                feature,
+                requested,
+                supported,
+            }) => {
+                assert_eq!(feature, "gpu_backend");
+                assert_eq!(requested.as_deref(), Some("gpu"));
+                assert_eq!(supported, vec!["cpu".to_string()]);
+            }
+            other => panic!("expected UnsupportedError, got {other:?}"),
+        }
     }
 
     #[test]

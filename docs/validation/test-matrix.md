@@ -124,6 +124,25 @@ tripwires`. Total at M3 close: **157 default tests + 8 doctests passing**; the
 gate (`ci/check-offline.ps1`) also passes, so the M3 default validation surface
 remains offline by construction.
 
+## M4 GPU Kernel Path Acceptance Traceability
+
+M4 is open. This table captures the first CubeCL spike without claiming the full
+milestone is closed.
+
+| # | Acceptance criterion | Test(s) proving it | Status |
+| - | -------------------- | ------------------ | ------ |
+| 1 | At least one hot operation has a GPU implementation and CPU parity test. | `ocelotl_kernels::cubecl_backend::tests::wgpu_rope_matches_cpu_reference_for_position_one` is feature-gated behind `cubecl-wgpu`, ignored by default, and compares CubeCL WGPU RoPE against CPU `rope_apply_inplace` at `1e-5`. | green (local opt-in) |
+| 2 | Runtime can select CPU or GPU backend explicitly. | Kernel-level groundwork only: `ocelotl_kernels::tests::cpu_backend_rejects_gpu_requirement_with_typed_unsupported_error` and `ocelotl_kernels::cubecl_backend::tests::cubecl_backend_advertises_gpu_device`. Runtime selection remains pending. | partial |
+| 3 | GPU path fails clearly when unavailable or invalid before launch. | `ocelotl_kernels::cubecl_backend::tests::wgpu_rope_rejects_invalid_shape_before_launch` proves invalid RoPE shape returns a typed CubeCL `KernelError` before WGPU runtime launch. Feature absence is handled by optional Cargo features; runtime unavailability handling still needs a public runtime path. | partial |
+| 4 | GPU prefill/decode parity exists for the M3 fixture path. | Not implemented yet. The first spike intentionally stops at the RoPE kernel boundary. | pending |
+| 5 | CPU reference remains available and tested. | Default `cargo test --workspace` does not enable CubeCL, so CPU tests remain the default validation surface. The CubeCL parity test computes expected output from CPU RoPE, not from a previous GPU run. | green for first kernel |
+
+Local M4 spike proof command that passed on 2026-05-13:
+
+```powershell
+cargo test -p ocelotl-kernels --features cubecl-wgpu wgpu_rope_matches_cpu_reference_for_position_one -- --ignored --nocapture
+```
+
 ## Post-M3 Whisper ASR Acceptance Traceability
 
 The table below maps `docs/milestones/post-m3-whisper-asr.md` acceptance

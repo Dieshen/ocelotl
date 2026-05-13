@@ -8,5 +8,11 @@ rust-version.workspace = true
 description = "Portable kernel dispatch boundary for Ocelotl."
 readme = "../../README.md"
 
+[features]
+default = []
+cubecl = ["dep:cubecl"]
+cubecl-wgpu = ["cubecl", "cubecl/wgpu"]
+
 [dependencies]
+cubecl = { version = "0.10.0", default-features = false, optional = true }
 ocelotl-core.workspace = true

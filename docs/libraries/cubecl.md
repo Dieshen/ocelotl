@@ -2,8 +2,8 @@
 
 ## Current Shape
 
-CubeCL is a Rust GPU compute framework for portable kernels. Crates.io currently
-shows `cubecl = "0.10.0-pre.4"`, so it is also on a pre-release line.
+CubeCL is a Rust GPU compute framework for portable kernels. The M4 spike pins
+`cubecl = "0.10.0"` as an optional `ocelotl-kernels` dependency.
 
 Context7 docs show:
 
@@ -71,6 +71,25 @@ fn scale_array<F: Float, N: Size>(
 Do not copy this shape directly into runtime code. Wrap it behind tested kernel
 functions and explicit buffer contracts.
 
+## M4 Spike Result
+
+The first repo integration uses CubeCL WGPU for RoPE only:
+
+- Feature flags: `cubecl` for the optional dependency, `cubecl-wgpu` for the
+  WGPU runtime.
+- Public kernel entry point:
+  `ocelotl_kernels::rope_apply_inplace_cubecl::<R>(...)`.
+- Convenience WGPU entry point:
+  `ocelotl_kernels::rope_apply_inplace_wgpu(...)`.
+- Backend marker: `CubeClKernelBackend::new_gpu(ordinal)` implements the
+  existing `KernelBackend` trait and advertises `Device::Gpu`.
+- Validation: an ignored local WGPU parity test compares against CPU RoPE at
+  `1e-5` tolerance and passed locally on 2026-05-13.
+
+This is not a performance implementation. It uses host-to-device and
+device-to-host copies for a single slice. The value is proving CubeCL launch
+shape, feature gating, validation-before-launch, and CPU-reference parity.
+
 ## TDD Requirements
 
 For every CubeCL kernel:
@@ -89,8 +108,8 @@ For every CubeCL kernel:
 
 ## Follow-Up Questions
 
-- Which CubeCL runtime should be first: WGPU for portability or CUDA for fastest
-  NVIDIA path?
+- Which CubeCL runtime should be second: CUDA for NVIDIA performance or CPU for
+  hardware-independent kernel debugging?
 - How should Ocelotl represent device buffers without leaking CubeCL types into
   `ocelotl-runtime`?
 - Which kernels should be handwritten versus delegated to CubeK?

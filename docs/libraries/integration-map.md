@@ -31,7 +31,8 @@ Keep tokenizer library types behind Ocelotl traits.
 Likely dependencies, introduced in stages:
 
 - CPU reference only for M1-M3.
-- `cubecl` for custom kernels in M4.
+- `cubecl` for custom kernels in M4. The first integration is optional
+  `cubecl = "0.10.0"` with `cubecl-wgpu` for the WGPU RoPE spike.
 - `cubek-matmul`, `cubek-attention`, `cubek-reduce`, or `cubek-quant` only when
   a failing parity test needs them.
 - Burn only if a Burn-backed kernel path proves useful and does not hide layout.
@@ -71,7 +72,7 @@ files or launch kernels.
 Current visible versions on 2026-05-02:
 
 - `burn = "0.21.0-pre.4"`
-- `cubecl = "0.10.0-pre.4"`
+- `cubecl = "0.10.0"` (M4 spike)
 - `cubek = "0.2.0-pre.4"`
 - `tokio = "1.52.1"`
 - `safetensors = "0.7.0"`

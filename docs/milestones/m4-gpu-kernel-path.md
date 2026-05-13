@@ -50,6 +50,14 @@ cargo test --workspace
 GPU-specific tests may be ignored by default until CI hardware exists, but the
 exact command to run them locally must be documented.
 
+First CubeCL WGPU RoPE spike commands:
+
+```powershell
+cargo check -p ocelotl-kernels --features cubecl-wgpu --tests
+cargo test -p ocelotl-kernels --features cubecl-wgpu cubecl_backend -- --nocapture
+cargo test -p ocelotl-kernels --features cubecl-wgpu wgpu_rope_matches_cpu_reference_for_position_one -- --ignored --nocapture
+```
+
 ## Known Risks
 
 - Kernel APIs that hide strides or layout will make cache bugs hard to diagnose.
