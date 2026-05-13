@@ -1,0 +1,147 @@
+{
+  "fixture_version": 1,
+  "name": "gemma4_e4b_it_q4_k_m_gguf_metadata",
+  "purpose": "Distilled GGUF metadata fixture for MF.3 Gemma4 metadata contract tests. Values mirror the local google_gemma-4-E4B-it-Q4_K_M.gguf header inspection without committing model weights.",
+  "source": {
+    "repository": "bartowski/google_gemma-4-E4B-it-GGUF",
+    "revision": "c04cb322fd63e347db759a08b6249b867488ccf8",
+    "base_repository": "google/gemma-4-E4B-it",
+    "artifact": "google_gemma-4-E4B-it-Q4_K_M.gguf",
+    "local_proof_path": "D:/Dev/ideas/04-granola-ai-clone/models/google_gemma-4-E4B-it-Q4_K_M.gguf"
+  },
+  "gguf": {
+    "version": 3,
+    "metadata": [
+      {
+        "key": "general.architecture",
+        "value": {
+          "type": "string",
+          "value": "gemma4"
+        }
+      },
+      {
+        "key": "general.file_type",
+        "value": {
+          "type": "u32",
+          "value": 15
+        }
+      },
+      {
+        "key": "gemma4.block_count",
+        "value": {
+          "type": "u32",
+          "value": 42
+        }
+      },
+      {
+        "key": "gemma4.context_length",
+        "value": {
+          "type": "u32",
+          "value": 131072
+        }
+      },
+      {
+        "key": "gemma4.embedding_length",
+        "value": {
+          "type": "u32",
+          "value": 2560
+        }
+      },
+      {
+        "key": "gemma4.feed_forward_length",
+        "value": {
+          "type": "u32",
+          "value": 10240
+        }
+      },
+      {
+        "key": "gemma4.attention.head_count",
+        "value": {
+          "type": "u32",
+          "value": 8
+        }
+      },
+      {
+        "key": "gemma4.attention.head_count_kv",
+        "value": {
+          "type": "u32",
+          "value": 2
+        }
+      },
+      {
+        "key": "gemma4.rope.dimension_count",
+        "value": {
+          "type": "u32",
+          "value": 512
+        }
+      },
+      {
+        "key": "gemma4.rope.freq_base",
+        "value": {
+          "type": "f32",
+          "value": 1000000.0
+        }
+      },
+      {
+        "key": "gemma4.attention.layer_norm_rms_epsilon",
+        "value": {
+          "type": "f32",
+          "value": 0.000001
+        }
+      },
+      {
+        "key": "gemma4.attention.sliding_window",
+        "value": {
+          "type": "u32",
+          "value": 512
+        }
+      },
+      {
+        "key": "gemma4.attention.shared_kv_layers",
+        "value": {
+          "type": "u32",
+          "value": 18
+        }
+      },
+      {
+        "key": "gemma4.final_logit_softcapping",
+        "value": {
+          "type": "f32",
+          "value": 30.0
+        }
+      },
+      {
+        "key": "tokenizer.ggml.model",
+        "value": {
+          "type": "string",
+          "value": "gemma4"
+        }
+      },
+      {
+        "key": "tokenizer.ggml.tokens",
+        "value": {
+          "type": "array",
+          "element_type": "string",
+          "len": 262144
+        }
+      }
+    ],
+    "tensors": [
+      {
+        "name": "token_embd.weight",
+        "shape": [
+          2560,
+          262144
+        ],
+        "tensor_type": "q4_k"
+      },
+      {
+        "name": "output_norm.weight",
+        "shape": [
+          2560
+        ],
+        "tensor_type": "f32"
+      }
+    ]
+  }
+}

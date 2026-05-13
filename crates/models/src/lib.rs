@@ -9,11 +9,14 @@
 //! synthetic path remains as a small compatibility fixture for the original
 //! M1 runtime smoke test.
 
+pub mod gemma;
 pub mod qwen;
 pub mod whisper;
+pub use gemma::{Gemma4Config, Gemma4Quantization};
 pub use qwen::{
     Qwen2_5Config, Qwen2_5KernelBackend, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights,
-    required_tensor_names, transpose_2d, validate_qwen2_5_tensors,
+    Qwen3_5Config, parse_qwen3_5_config_json, required_tensor_names, transpose_2d,
+    validate_qwen2_5_tensors,
 };
 
 use ocelotl_core::{

@@ -48,6 +48,14 @@ Gemma4:
   inspector that normalizes metadata and tensor descriptors into Ocelotl-owned
   structs without reading tensor payload bytes. The ignored local proof passed
   against `google_gemma-4-E4B-it-Q4_K_M.gguf` on 2026-05-13.
+- MF.3 adds `Gemma4Config`, a model-layer projection of the GGUF manifest that
+  preserves Gemma4 context length, sliding-window attention, shared-KV layers,
+  final-logit softcapping, embedded tokenizer metadata, and Q4_K_M status while
+  rejecting Gemma4 execution before compute.
+- MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
+  `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
+  from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8
+  execution features before compute.
 
 ## Boundary
 

@@ -267,12 +267,13 @@ huggingface-cli download bartowski/google_gemma-4-E4B-it-GGUF `
     --include "google_gemma-4-E4B-it-Q4_K_M.gguf"
 ```
 
-The MF.2 ignored local proof can also point at an existing GGUF file without
-copying it into the repo-local artifact directory:
+The MF.2 and MF.3 ignored local proofs can also point at an existing GGUF file
+without copying it into the repo-local artifact directory:
 
 ```powershell
 $env:OCELOTL_GEMMA4_GGUF_PATH="D:\path\to\google_gemma-4-E4B-it-Q4_K_M.gguf"
 cargo test -p ocelotl-loader local_gemma4_q4_k_m_gguf_header_contract_is_well_formed -- --ignored --nocapture
+cargo test -p ocelotl-models local_gemma4_q4_k_m_gguf_header_converts_to_gemma4_config -- --ignored --nocapture
 ```
 
 ## 6. Keeping Artifacts Out Of Git

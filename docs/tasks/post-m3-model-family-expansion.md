@@ -34,6 +34,9 @@ and does not modify the closed M3.6 MLP task.
 - `Done when`: Gemma4-specific context length, sliding window, shared KV,
   softcapping, tokenizer metadata presence, and quantization status are
   preserved or explicitly rejected.
+- `Status`: done 2026-05-13. `Gemma4Config` converts the distilled GGUF
+  metadata fixture, preserves context/sliding-window/shared-KV/softcap/tokenizer
+  and Q4_K_M status, and rejects Gemma4 execution features before compute.
 
 ## MF.4 Add Qwen3.5 Metadata Contract
 
@@ -43,6 +46,9 @@ and does not modify the closed M3.6 MLP task.
 - `Done when`: unsupported hybrid/MoE/multimodal features fail before compute,
   and Qwen2.5 tests prove the existing path still accepts only its intended
   dense decoder contract.
+- `Status`: done 2026-05-13. `parse_qwen3_5_config_json` recognizes the
+  Qwen3.5 MoE config separately from Qwen2.5 and `Qwen3_5Config` rejects
+  hybrid attention, MoE, multimodal, and FP8 execution features before compute.
 
 ## MF.5 Validate Required Tensor Inventories
 
