@@ -30,6 +30,7 @@ struct BenchmarkCommand {
 #[derive(Debug, Deserialize)]
 struct WhisperCppCommand {
     binary: String,
+    comparison_mode: String,
     command: Vec<String>,
     model_path: String,
     audio_path: String,
@@ -102,8 +103,16 @@ fn whisper_cpp_benchmark_manifest_names_commands_inputs_and_threads() {
             .ocelotl
             .command
             .windows(2)
-            .any(|args| args == ["--cpu-kernel-mode", "optimized"]),
-        "W-ASR.24 benchmark command must opt into the W-ASR.23 optimized CPU backend"
+            .any(|args| args == ["--cpu-kernel-mode", "scalar"]),
+        "W-ASR.36 benchmark command must use the current scalar Whisper CPU path"
+    );
+    assert!(
+        manifest.ocelotl.command.windows(2).any(|args| args
+            == [
+                "--tokenizer-path",
+                "local-artifacts/whisper_tiny_en/tokenizer.json"
+            ]),
+        "W-ASR.37 benchmark command must request tokenizer-backed text output"
     );
     assert!(
         !manifest
@@ -129,6 +138,14 @@ fn whisper_cpp_benchmark_manifest_names_commands_inputs_and_threads() {
             .any(|path| path == "local-artifacts/whisper_tiny_en/reference/expected_tokens.json"),
         "Ocelotl benchmark command must declare the local expected-token artifact it needs"
     );
+    assert!(
+        manifest
+            .ocelotl
+            .required_inputs
+            .iter()
+            .any(|path| path == "local-artifacts/whisper_tiny_en/tokenizer.json"),
+        "Ocelotl benchmark command must declare the local tokenizer artifact it needs"
+    );
     assert_command_shape(
         &BenchmarkCommand {
             command: manifest.whisper_cpp.command.clone(),
@@ -143,6 +160,7 @@ fn whisper_cpp_benchmark_manifest_names_commands_inputs_and_threads() {
         manifest.whisper_cpp.binary,
         "local-artifacts/whisper_cpp/whisper-cli.exe"
     );
+    assert_eq!(manifest.whisper_cpp.comparison_mode, "greedy_no_fallback");
     assert!(
         manifest
             .whisper_cpp
@@ -150,6 +168,20 @@ fn whisper_cpp_benchmark_manifest_names_commands_inputs_and_threads() {
             .iter()
             .any(|arg| arg == &manifest.threads.to_string()),
         "whisper.cpp command should include the manifest thread count"
+    );
+    assert!(
+        manifest
+            .whisper_cpp
+            .command
+            .windows(2)
+            .any(|args| args == ["-bs", "1"])
+            && manifest
+                .whisper_cpp
+                .command
+                .windows(2)
+                .any(|args| args == ["-bo", "1"])
+            && manifest.whisper_cpp.command.iter().any(|arg| arg == "-nf"),
+        "W-ASR.36 whisper.cpp command must pin greedy no-fallback comparison flags"
     );
 }
 

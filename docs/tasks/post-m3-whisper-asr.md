@@ -587,3 +587,49 @@ Ocelotl can run real Whisper weights yet.
   local runs.
 - `Out of scope`: AVX2 intrinsics, multi-threading, native F16/BF16 weights,
   and making optimized CPU mode the Whisper default.
+
+## W-ASR.36 Clean Up Apples-To-Apples whisper.cpp Benchmark Mode
+
+- `Crates`: benchmark fixtures, benchmark docs, and local benchmark tooling if
+  needed.
+- `Test first`: update the benchmark manifest-shape test so it fails unless
+  the example whisper.cpp command pins a greedy/no-fallback comparison mode and
+  the Ocelotl command uses the current scalar Whisper CPU path.
+- `Done when`: the committed manifest uses `--cpu-kernel-mode scalar` for
+  Ocelotl and `-bs 1 -bo 1 -nf` for whisper.cpp, docs explain how that differs
+  from the older default-beam baseline, and the fairer local ratios are
+  recorded without overstating the CPU competitiveness claim.
+- `Status note`: landed on 2026-05-12. The example manifest now pins
+  whisper.cpp `greedy_no_fallback` mode. Fresh local whisper.cpp runs measured
+  tiny.en `329.02 ms`, base.en `664.86 ms`, small.en `2,364.21 ms`, medium.en
+  `7,556.48 ms`, and large-v2 `15,186.45 ms`. Against W-ASR.35 Ocelotl scalar
+  totals, base through large-v2 remain below `<=3x`, but tiny.en is about
+  `3.26x`; the prior "all five sizes clear <=3x" claim only held against the
+  older default-beam whisper.cpp denominator.
+- `Out of scope`: changing Ocelotl generation semantics, treating whisper.cpp
+  text as the correctness oracle, or rerunning WER/corpus quality gates.
+
+## W-ASR.37 Emit Text From Whisper Benchmark Hook
+
+- `Crates`: root CLI benchmark hook, benchmark fixtures/tooling, and benchmark
+  docs.
+- `Test first`: extend the benchmark output schema test so it pins a top-level
+  `text` field plus tokenizer-load and text-decode timing fields, and update
+  the manifest-shape test so the example command declares the local
+  `tokenizer.json` artifact.
+- `Done when`: `ocelotl bench-whisper-transcribe` accepts
+  `--tokenizer-path <path>`, emits decoded transcript text when provided,
+  keeps token-only mode available when omitted, and the benchmark record helper
+  can summarize Ocelotl JSON stdout into `output.token_count` and
+  `output.text`.
+- `Status note`: landed on 2026-05-12. `bench-whisper-transcribe` now loads
+  `JsonTokenizer` only when `--tokenizer-path` is present, emits JSON `text`,
+  and reports nullable `timings_ms.tokenizer_load` and
+  `timings_ms.text_decode`. The example manifest declares
+  `local-artifacts/whisper_tiny_en/tokenizer.json`, and
+  `tools/whisper-cpp-bench.ps1` parses Ocelotl JSON stdout into benchmark
+  record output summaries. A local tiny.en release proof with tokenizer output
+  passed exact token parity at `1,161 ms` total and emitted the decoded
+  expected-token text.
+- `Out of scope`: adding a production transcription CLI, using text output as
+  a replacement for exact-token parity, or changing WER corpus scoring.

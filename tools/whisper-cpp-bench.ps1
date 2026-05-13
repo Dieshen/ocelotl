@@ -65,16 +65,30 @@ function New-OutputSummary {
     param([AllowNull()][string]$Stdout)
 
     $excerpt = $null
+    $tokenCount = $null
+    $text = $null
     if (-not [string]::IsNullOrWhiteSpace($Stdout)) {
         $excerpt = $Stdout.Trim()
+        try {
+            $json = $excerpt | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $json.PSObject.Properties["token_count"]) {
+                $tokenCount = [Nullable[int64]]$json.token_count
+            }
+            if ($null -ne $json.PSObject.Properties["text"] -and $null -ne $json.text) {
+                $text = [string]$json.text
+            }
+        } catch {
+            $tokenCount = $null
+            $text = $null
+        }
         if ($excerpt.Length -gt 2000) {
             $excerpt = $excerpt.Substring(0, 2000)
         }
     }
 
     return [ordered]@{
-        token_count = $null
-        text = $null
+        token_count = $tokenCount
+        text = $text
         stdout_excerpt = $excerpt
     }
 }

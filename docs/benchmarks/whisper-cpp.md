@@ -84,23 +84,31 @@ target/release/ocelotl.exe bench-whisper-transcribe `
   --model-path local-artifacts/whisper_tiny_en/model.safetensors `
   --audio-path local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav `
   --expected-tokens-path local-artifacts/whisper_tiny_en/reference/expected_tokens.json `
-  --cpu-kernel-mode optimized
+  --tokenizer-path local-artifacts/whisper_tiny_en/tokenizer.json `
+  --cpu-kernel-mode scalar
 ```
 
 The hook loads the Ocelotl safetensors bundle, decodes the shared WAV input,
 encodes audio once, runs the current no-timestamps transcription path to the
-expected token length using the encoded-audio state, and prints a JSON summary.
-It is a timing hook for local comparison, not a throughput-optimized public
-transcription CLI.
+expected token length using the encoded-audio state, optionally decodes the
+generated token IDs into transcript text when `--tokenizer-path` is provided,
+and prints a JSON summary. It is a timing hook for local comparison, not a
+throughput-optimized public transcription CLI.
 
 `--cpu-kernel-mode` defaults to `scalar`. The benchmark manifest currently
-passes `optimized` to measure the W-ASR.23 optimized CPU backend explicitly.
+passes `scalar` because the W-ASR.35 tiled scalar path is the current winning
+Whisper CPU path. `optimized` remains available as an explicit opt-in parity
+and performance probe.
 
 The whisper.cpp side of the example manifest runs:
 
 ```powershell
-local-artifacts/whisper_cpp/whisper-cli.exe -m local-artifacts/whisper_cpp/ggml-tiny.en.bin -f local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav -t 4 -otxt -nt
+local-artifacts/whisper_cpp/whisper-cli.exe -m local-artifacts/whisper_cpp/ggml-tiny.en.bin -f local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav -t 4 -otxt -nt -bs 1 -bo 1 -nf
 ```
+
+The `-bs 1 -bo 1 -nf` flags pin a greedy, no-fallback whisper.cpp comparison.
+Older local benchmark rows below that omit those flags used whisper.cpp's
+default `5 beams + best of 5` mode; W-ASR.36 records the stricter cleanup.
 
 ## Running Locally
 
@@ -555,3 +563,62 @@ performance parity claim: whisper.cpp is running a mature SIMD/threaded backend,
 and Ocelotl's non-tiny references are short expected-token contract checks. The
 next CPU work should choose between tiled-kernel threading, AVX2, or native
 F16/BF16 weights based on the remaining encoder gap.
+
+## W-ASR.36 Greedy whisper.cpp Comparison Cleanup
+
+The example benchmark manifest now compares Ocelotl's greedy benchmark hook
+against whisper.cpp with `-bs 1 -bo 1 -nf` instead of whisper.cpp's default
+`5 beams + best of 5`. The older default-beam numbers are still useful because
+they match the first command shape we ran locally, but they were not the fairest
+speed denominator for Ocelotl's deterministic greedy path.
+
+Fresh local whisper.cpp greedy/no-fallback runs on 2026-05-12:
+
+| Size | W-ASR.35 Ocelotl scalar total | whisper.cpp greedy total | whisper.cpp encode | Ratio |
+| ---- | ----------------------------- | ------------------------ | ------------------ | ----- |
+| tiny.en | `1,073 ms` | `329.02 ms` | `197.95 ms` | `~3.26x` |
+| base.en | `1,807 ms` | `664.86 ms` | `458.74 ms` | `~2.72x` |
+| small.en | `6,345 ms` | `2,364.21 ms` | `1,777.94 ms` | `~2.68x` |
+| medium.en | `20,941 ms` | `7,556.48 ms` | `5,881.14 ms` | `~2.77x` |
+| large-v2 | `40,416 ms` | `15,186.45 ms` | `11,896.86 ms` | `~2.66x` |
+
+This is a stricter baseline than W-ASR.35's table. It downgrades the broad
+"all five sizes are under `<=3x`" claim: base through large-v2 clear the
+greedy/no-fallback gate on this local sample, while tiny.en is close but still
+above it at about `3.26x`. The next CPU optimization should treat tiny.en
+`<=3x` against greedy whisper.cpp as the nearest performance target, then
+re-run all five sizes.
+
+## W-ASR.37 Benchmark Text Output
+
+`bench-whisper-transcribe` now accepts an optional `--tokenizer-path` argument.
+When provided, the hook loads the local tokenizer, decodes the generated token
+IDs with special tokens skipped, and emits a top-level JSON `text` field. The
+JSON timing schema also reports `timings_ms.tokenizer_load` and
+`timings_ms.text_decode`; both are `null` when the tokenizer path is omitted.
+
+The example manifest now includes:
+
+```powershell
+--tokenizer-path local-artifacts/whisper_tiny_en/tokenizer.json
+```
+
+`tools/whisper-cpp-bench.ps1` also parses Ocelotl's JSON stdout into benchmark
+record `output.token_count` and `output.text`, while retaining a truncated
+`stdout_excerpt` for diagnostics.
+
+A local tiny.en release proof with `--tokenizer-path` passed exact token parity
+and emitted:
+
+```text
+text = " And so my fellow Americans ask not what your country can do for you ask what you can do for your country."
+elapsed_ms = 1,161
+timings_ms.tokenizer_load = 52
+timings_ms.text_decode = 0
+```
+
+The text mirrors the current expected-token fixture, including its missing
+comma after "you"; exact token parity remains the correctness gate.
+
+A full local benchmark-runner pass also populated the Ocelotl record summary:
+`output.token_count = 26` and the same decoded `output.text`.

@@ -10,7 +10,7 @@ use ocelotl_models::whisper::{
     parse_whisper_config_json, required_whisper_tensor_names, validate_whisper_tensors,
 };
 use ocelotl_tokenizer::{
-    WhisperDecodeMask, WhisperStartupTokens, WhisperTokenMaskDecision,
+    JsonTokenizer, Tokenizer, WhisperDecodeMask, WhisperStartupTokens, WhisperTokenMaskDecision,
     whisper_multilingual_english_transcribe_tokens,
 };
 use serde::Deserialize;
@@ -23,6 +23,7 @@ struct BenchWhisperArgs {
     model_path: PathBuf,
     audio_path: PathBuf,
     expected_tokens_path: PathBuf,
+    tokenizer_path: Option<PathBuf>,
     cpu_kernel_mode: CpuKernelMode,
 }
 
@@ -38,12 +39,21 @@ struct BenchWhisperTimings {
     manifest_validate_ms: u128,
     expected_tokens_read_ms: u128,
     tensor_load_model_ms: u128,
+    tokenizer_load_ms: Option<u128>,
     wav_read_ms: u128,
     log_mel_ms: u128,
     audio_encode_ms: u128,
     audio_encode_detail: WhisperAudioEncodeTimings,
     decode_total_ms: u128,
+    text_decode_ms: Option<u128>,
     decode_token_ms: Vec<u128>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BenchWhisperTextOutput {
+    text: Option<String>,
+    tokenizer_load_ms: Option<u128>,
+    text_decode_ms: Option<u128>,
 }
 
 impl BenchWhisperTimings {
@@ -162,7 +172,7 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!(
-        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--cpu-kernel-mode scalar|optimized]"
+        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized]"
     );
 }
 
@@ -171,6 +181,7 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
     let mut model_path = None;
     let mut audio_path = None;
     let mut expected_tokens_path = None;
+    let mut tokenizer_path = None;
     let mut cpu_kernel_mode = CpuKernelMode::Scalar;
     let mut iter = args.into_iter();
 
@@ -183,6 +194,7 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
             "--model-path" => model_path = Some(PathBuf::from(value)),
             "--audio-path" => audio_path = Some(PathBuf::from(value)),
             "--expected-tokens-path" => expected_tokens_path = Some(PathBuf::from(value)),
+            "--tokenizer-path" => tokenizer_path = Some(PathBuf::from(value)),
             "--cpu-kernel-mode" => cpu_kernel_mode = parse_cpu_kernel_mode(&value)?,
             _ => {
                 return Err(format!(
@@ -197,6 +209,7 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
         model_path: model_path.ok_or("missing --model-path")?,
         audio_path: audio_path.ok_or("missing --audio-path")?,
         expected_tokens_path: expected_tokens_path.ok_or("missing --expected-tokens-path")?,
+        tokenizer_path,
         cpu_kernel_mode,
     })
 }
@@ -217,6 +230,9 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
     ensure_file(&args.model_path, "model")?;
     ensure_file(&args.audio_path, "audio")?;
     ensure_file(&args.expected_tokens_path, "expected tokens")?;
+    if let Some(tokenizer_path) = &args.tokenizer_path {
+        ensure_file(tokenizer_path, "tokenizer")?;
+    }
 
     let config_started = Instant::now();
     let config_raw = std::fs::read_to_string(&args.config_path).map_err(|err| {
@@ -306,6 +322,8 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
         &mut decode_token_ms,
     )?;
     let decode_total_ms = decode_started.elapsed().as_millis();
+
+    let text_output = decode_generated_text(args.tokenizer_path.as_deref(), &generated)?;
     let elapsed_ms = started.elapsed().as_millis();
 
     let matches_expected = generated == expected_tokens;
@@ -315,14 +333,22 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
         manifest_validate_ms,
         expected_tokens_read_ms,
         tensor_load_model_ms,
+        tokenizer_load_ms: text_output.tokenizer_load_ms,
         wav_read_ms,
         log_mel_ms,
         audio_encode_ms,
         audio_encode_detail,
         decode_total_ms,
+        text_decode_ms: text_output.text_decode_ms,
         decode_token_ms,
     };
-    let output = bench_whisper_output(matches_expected, args.cpu_kernel_mode, &generated, &timings);
+    let output = bench_whisper_output(
+        matches_expected,
+        args.cpu_kernel_mode,
+        &generated,
+        text_output.text.as_deref(),
+        &timings,
+    );
     println!("{output}");
 
     if matches_expected {
@@ -336,6 +362,7 @@ fn bench_whisper_output(
     matches_expected: bool,
     cpu_kernel_mode: CpuKernelMode,
     generated: &[TokenId],
+    transcript_text: Option<&str>,
     timings: &BenchWhisperTimings,
 ) -> serde_json::Value {
     let token_ids: Vec<u32> = generated.iter().map(|token| token.0).collect();
@@ -344,6 +371,7 @@ fn bench_whisper_output(
         "elapsed_ms": timings.total_ms,
         "token_count": generated.len(),
         "tokens": token_ids,
+        "text": transcript_text,
         "matches_expected": matches_expected,
         "cpu_kernel_mode": cpu_kernel_mode.as_str(),
         "resident_model_ms": {
@@ -356,6 +384,7 @@ fn bench_whisper_output(
             "manifest_validate": timings.manifest_validate_ms,
             "expected_tokens_read": timings.expected_tokens_read_ms,
             "tensor_load_model": timings.tensor_load_model_ms,
+            "tokenizer_load": timings.tokenizer_load_ms,
             "wav_read": timings.wav_read_ms,
             "log_mel": timings.log_mel_ms,
             "audio_encode": timings.audio_encode_ms,
@@ -364,8 +393,42 @@ fn bench_whisper_output(
                 "cross_attention_precompute": timings.audio_encode_detail.cross_attention_precompute_ms,
             },
             "decode_total": timings.decode_total_ms,
+            "text_decode": timings.text_decode_ms,
             "decode_token": timings.decode_token_ms,
         }
+    })
+}
+
+fn decode_generated_text(
+    tokenizer_path: Option<&Path>,
+    generated: &[TokenId],
+) -> Result<BenchWhisperTextOutput, String> {
+    let Some(tokenizer_path) = tokenizer_path else {
+        return Ok(BenchWhisperTextOutput::default());
+    };
+
+    let tokenizer_started = Instant::now();
+    let tokenizer = JsonTokenizer::from_json_path(tokenizer_path).map_err(|err| {
+        format!(
+            "failed to load tokenizer at {} - {err:?}",
+            tokenizer_path.display()
+        )
+    })?;
+    let tokenizer_load_ms = tokenizer_started.elapsed().as_millis();
+
+    let text_started = Instant::now();
+    let text = tokenizer.decode(generated).map_err(|err| {
+        format!(
+            "failed to decode generated tokens with tokenizer at {} - {err:?}",
+            tokenizer_path.display()
+        )
+    })?;
+    let text_decode_ms = text_started.elapsed().as_millis();
+
+    Ok(BenchWhisperTextOutput {
+        text: Some(text),
+        tokenizer_load_ms: Some(tokenizer_load_ms),
+        text_decode_ms: Some(text_decode_ms),
     })
 }
 
@@ -659,6 +722,14 @@ mod tests {
         optimized.extend(["--cpu-kernel-mode".to_string(), "optimized".to_string()]);
         let optimized_args = parse_bench_args(optimized).expect("optimized args");
         assert_eq!(optimized_args.cpu_kernel_mode, CpuKernelMode::Optimized);
+
+        let mut with_tokenizer = base.iter().copied().map(str::to_string).collect::<Vec<_>>();
+        with_tokenizer.extend(["--tokenizer-path".to_string(), "tokenizer.json".to_string()]);
+        let tokenizer_args = parse_bench_args(with_tokenizer).expect("tokenizer args");
+        assert_eq!(
+            tokenizer_args.tokenizer_path,
+            Some(PathBuf::from("tokenizer.json"))
+        );
     }
 
     #[test]
@@ -669,6 +740,7 @@ mod tests {
             manifest_validate_ms: 2,
             expected_tokens_read_ms: 3,
             tensor_load_model_ms: 4,
+            tokenizer_load_ms: Some(13),
             wav_read_ms: 5,
             log_mel_ms: 6,
             audio_encode_ms: 7,
@@ -677,6 +749,7 @@ mod tests {
                 cross_attention_precompute_ms: 12,
             },
             decode_total_ms: 8,
+            text_decode_ms: Some(14),
             decode_token_ms: vec![9, 10],
         };
 
@@ -684,6 +757,7 @@ mod tests {
             true,
             CpuKernelMode::Optimized,
             &[TokenId(50257), TokenId(50362)],
+            Some("example transcript"),
             &timings,
         );
 
@@ -691,6 +765,7 @@ mod tests {
         assert_eq!(output["cpu_kernel_mode"], "optimized");
         assert_eq!(output["elapsed_ms"], 100);
         assert_eq!(output["token_count"], 2);
+        assert_eq!(output["text"], "example transcript");
         assert_eq!(output["resident_model_ms"]["audio_to_tokens"], 21);
         assert_eq!(output["resident_model_ms"]["mel_to_tokens"], 15);
         assert_eq!(output["timings_ms"]["total"], 100);
@@ -698,6 +773,7 @@ mod tests {
         assert_eq!(output["timings_ms"]["manifest_validate"], 2);
         assert_eq!(output["timings_ms"]["expected_tokens_read"], 3);
         assert_eq!(output["timings_ms"]["tensor_load_model"], 4);
+        assert_eq!(output["timings_ms"]["tokenizer_load"], 13);
         assert_eq!(output["timings_ms"]["wav_read"], 5);
         assert_eq!(output["timings_ms"]["log_mel"], 6);
         assert_eq!(output["timings_ms"]["audio_encode"], 7);
@@ -707,6 +783,7 @@ mod tests {
             12
         );
         assert_eq!(output["timings_ms"]["decode_total"], 8);
+        assert_eq!(output["timings_ms"]["text_decode"], 14);
         assert_eq!(
             output["timings_ms"]["decode_token"],
             serde_json::json!([9, 10])

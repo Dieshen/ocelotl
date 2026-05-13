@@ -14,8 +14,10 @@
       "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
       "--expected-tokens-path",
       "local-artifacts/whisper_tiny_en/reference/expected_tokens.json",
+      "--tokenizer-path",
+      "local-artifacts/whisper_tiny_en/tokenizer.json",
       "--cpu-kernel-mode",
-      "optimized"
+      "scalar"
     ],
     "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
     "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
@@ -40,7 +42,12 @@
       "-t",
       "4",
       "-otxt",
-      "-nt"
+      "-nt",
+      "-bs",
+      "1",
+      "-bo",
+      "1",
+      "-nf"
     ],
     "model_path": "local-artifacts/whisper_cpp/ggml-tiny.en.bin",
     "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
