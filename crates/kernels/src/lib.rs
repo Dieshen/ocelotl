@@ -477,14 +477,40 @@ fn linear_out_by_in(
         out,
     )?;
 
+    let unrolled_out = out_features - (out_features % 4);
+
     for row in 0..rows {
-        for out_dim in 0..out_features {
+        let x_row = &x[row * in_features..(row + 1) * in_features];
+        let out_row = &mut out[row * out_features..(row + 1) * out_features];
+
+        for out_dim in (0..unrolled_out).step_by(4) {
+            let mut acc0 = bias.map_or(0.0, |b| b[out_dim]);
+            let mut acc1 = bias.map_or(0.0, |b| b[out_dim + 1]);
+            let mut acc2 = bias.map_or(0.0, |b| b[out_dim + 2]);
+            let mut acc3 = bias.map_or(0.0, |b| b[out_dim + 3]);
+            let w0 = out_dim * in_features;
+            let w1 = (out_dim + 1) * in_features;
+            let w2 = (out_dim + 2) * in_features;
+            let w3 = (out_dim + 3) * in_features;
+            for in_dim in 0..in_features {
+                let x_value = x_row[in_dim];
+                acc0 += x_value * weight_out_by_in[w0 + in_dim];
+                acc1 += x_value * weight_out_by_in[w1 + in_dim];
+                acc2 += x_value * weight_out_by_in[w2 + in_dim];
+                acc3 += x_value * weight_out_by_in[w3 + in_dim];
+            }
+            out_row[out_dim] = acc0;
+            out_row[out_dim + 1] = acc1;
+            out_row[out_dim + 2] = acc2;
+            out_row[out_dim + 3] = acc3;
+        }
+
+        for out_dim in unrolled_out..out_features {
             let mut acc = bias.map_or(0.0, |b| b[out_dim]);
             for in_dim in 0..in_features {
-                acc += x[row * in_features + in_dim]
-                    * weight_out_by_in[out_dim * in_features + in_dim];
+                acc += x_row[in_dim] * weight_out_by_in[out_dim * in_features + in_dim];
             }
-            out[row * out_features + out_dim] = acc;
+            out_row[out_dim] = acc;
         }
     }
     Ok(())

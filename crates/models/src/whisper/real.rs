@@ -1006,12 +1006,11 @@ fn attention_from_projected(
                 ));
             }
             let q_base = qi * state + head * head_dim;
+            let q_row = &q[q_base..q_base + head_dim];
             for (ki, score) in scores.iter_mut().enumerate().take(visible) {
                 let k_base = ki * state + head * head_dim;
-                let mut acc = 0.0_f32;
-                for dim in 0..head_dim {
-                    acc += q[q_base + dim] * k[k_base + dim];
-                }
+                let k_row = &k[k_base..k_base + head_dim];
+                let acc = dot_unrolled_4(q_row, k_row);
                 *score = acc * scale;
             }
             softmax(&mut scores[..visible]);
@@ -1029,6 +1028,24 @@ fn attention_from_projected(
     }
 
     linear(kernels, &context, q_seq, state, out_w, state, Some(out_b))
+}
+
+fn dot_unrolled_4(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let unrolled = a.len() - (a.len() % 4);
+    let mut acc = 0.0_f32;
+
+    for idx in (0..unrolled).step_by(4) {
+        acc += a[idx] * b[idx];
+        acc += a[idx + 1] * b[idx + 1];
+        acc += a[idx + 2] * b[idx + 2];
+        acc += a[idx + 3] * b[idx + 3];
+    }
+    for idx in unrolled..a.len() {
+        acc += a[idx] * b[idx];
+    }
+
+    acc
 }
 
 #[allow(clippy::too_many_arguments)]

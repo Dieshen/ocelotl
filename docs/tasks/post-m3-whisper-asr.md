@@ -508,3 +508,23 @@ Ocelotl can run real Whisper weights yet.
   whisper.cpp wall time.
 - `Out of scope`: weight packing, SIMD/GPU, changing default CPU mode, or
   altering the public runtime API.
+
+## W-ASR.32 Unroll Scalar Linear And Whisper Attention Dots
+
+- `Crates`: `ocelotl-kernels`, `ocelotl-models`, and benchmark docs.
+- `Test first`: use existing scalar/optimized kernel parity tests plus Whisper
+  real-attention/model parity tests as the behavior fence, then prove the local
+  tiny.en benchmark still matches exact expected tokens.
+- `Done when`: scalar linear computes four output dimensions per input loop,
+  Whisper attention dot products are unrolled by four, exact local tiny.en token
+  parity still passes, and benchmark docs record whether the `<=3x`
+  whisper.cpp gate is cleared.
+- `Status note`: landed on 2026-05-12. Scalar release proof passed exact token
+  parity twice after the change (`1,646 ms`, then `1,623 ms`). The latest run
+  improved total wall time from `2,559 ms` to `1,623 ms`, resident
+  audio-to-tokens from `2,496 ms` to `1,560 ms`, and encoder timing from
+  `1,896 ms` to `1,166 ms`. This clears the documented `<=3x` tiny.en
+  whisper.cpp wall-time gate (`~2.88x`).
+- `Out of scope`: claiming competitiveness for larger Whisper sizes, making
+  optimized CPU mode the default, SIMD/GPU work, or replacing scalar kernels
+  with packed-weight kernels.

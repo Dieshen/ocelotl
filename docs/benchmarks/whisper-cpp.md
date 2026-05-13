@@ -435,3 +435,34 @@ Fresh scalar release run on the same tiny.en fixture:
 Against the W-ASR.24 whisper.cpp wall-time baseline (`564 ms`), scalar Ocelotl
 is now about `4.5x` slower (`2,559 / 564`). The remaining dominant bottleneck
 is still encoder forward.
+
+## W-ASR.32 Scalar Linear + Attention Dot Unroll
+
+The scalar `[out, in]` linear kernel now computes four output dimensions per
+inner input loop, reducing repeated reads of the same input row while preserving
+the per-output accumulation order. Whisper attention also unrolls the
+head-dimension dot product by four. An attempted eight-output linear unroll was
+measured and rejected because it regressed the tiny.en benchmark.
+
+Fresh scalar release runs on the same tiny.en fixture both passed exact token
+parity:
+
+| Metric | W-ASR.31 scalar | W-ASR.32 scalar | Change |
+| ------ | --------------- | --------------- | ------ |
+| Total hook wall time | `2,559 ms` | `1,623 ms` | ~37% faster |
+| Resident audio to tokens | `2,496 ms` | `1,560 ms` | ~38% faster |
+| Audio encode total | `2,132 ms` | `1,290 ms` | ~39% faster |
+| Encoder | `1,896 ms` | `1,166 ms` | ~39% faster |
+| Cross-attention K/V precompute | `235 ms` | `124 ms` | ~47% faster |
+| Decode total | `317 ms` | `224 ms` | ~29% faster |
+| Log-mel | `47 ms` | `46 ms` | noise |
+
+The immediately preceding W-ASR.32 scalar run measured `1,646 ms`, so the
+result is not a single-run fluke. Against the W-ASR.24 whisper.cpp wall-time
+baseline (`564 ms`), scalar Ocelotl is now about `2.88x` slower (`1,623 / 564`)
+and clears the documented `<=3x` tiny.en CPU competitiveness gate.
+
+This is still not "done optimizing CPU" in the broad sense. It is the first
+validated competitive tiny.en gate. Larger Whisper sizes and longer audio still
+need their own measurements, and optimized CPU mode remains opt-in until it
+beats scalar.
