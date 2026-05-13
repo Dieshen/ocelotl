@@ -48,6 +48,31 @@ cargo test -p ocelotl-kernels --features cubecl-wgpu wgpu_rope_matches_cpu_refer
 The local execution proof uses `1e-5` tolerance against
 `rope_apply_inplace`. Default workspace validation does not build CubeCL.
 
+## M4 Model/Runtime Path
+
+M4 wires the first GPU-backed kernel into the Qwen2.5 model path without
+claiming full-model GPU execution. `Qwen2_5KernelBackend::CubeClWgpu` advertises
+a CubeCL GPU execution backend and routes RoPE through CubeCL WGPU. Every other
+operation still goes through the CPU fallback backend.
+
+This split is deliberate:
+
+- It proves the model/runtime dispatch seam can select a non-CPU backend.
+- It preserves CPU as the parity oracle and default implementation.
+- It avoids forcing matmul or attention through an immature GPU abstraction
+  before Ocelotl has explicit device-buffer and dtype layout contracts.
+
+Local M4 parity covers three levels:
+
+- RoPE kernel output versus CPU RoPE at `1e-5`.
+- Qwen tiny synthetic prefill logits versus CPU prefill at the existing M3
+  `1e-4` fixture tolerance.
+- Qwen tiny synthetic one-token decode versus CPU exact token equality.
+
+Unsupported CubeCL RoPE layouts fail before launch. The currently supported
+layout is contiguous f32 `[num_heads, head_dim]` rows with
+`row_stride == head_dim`.
+
 ## Initial Operations
 
 The first useful kernel interface should cover only what M1-M4 need:

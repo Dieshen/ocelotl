@@ -13,10 +13,12 @@ use ocelotl_core::{
     GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, RuntimeError,
     TokenId, UnsupportedError,
 };
+#[cfg(feature = "cubecl-wgpu")]
+use ocelotl_kernels::CubeClKernelBackend;
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
 use ocelotl_models::whisper::audio::{AudioMetadata, log_mel_spectrogram, validate_audio_metadata};
 use ocelotl_models::whisper::{WhisperEncodedAudio, WhisperModel, WhisperTinyModel};
-use ocelotl_models::{Qwen2_5Model, tiny_synthetic_forward};
+use ocelotl_models::{Qwen2_5Config, Qwen2_5Model, Qwen2_5Weights, tiny_synthetic_forward};
 use ocelotl_tokenizer::{WhisperDecodeMask, WhisperTokenMaskDecision};
 use serde::{Deserialize, Serialize};
 
@@ -475,6 +477,31 @@ impl Runtime<CpuKernelBackend> {
             backend: CpuKernelBackend::optimized(),
         }
     }
+
+    pub fn qwen2_5_model(
+        &self,
+        config: Qwen2_5Config,
+        weights: Qwen2_5Weights,
+    ) -> Result<Qwen2_5Model> {
+        Qwen2_5Model::with_cpu_kernel_backend(config, weights, self.backend.clone())
+    }
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+impl Runtime<CubeClKernelBackend> {
+    pub fn cubecl_wgpu(ordinal: usize) -> Self {
+        Self {
+            backend: CubeClKernelBackend::new_gpu(ordinal),
+        }
+    }
+
+    pub fn qwen2_5_model(
+        &self,
+        config: Qwen2_5Config,
+        weights: Qwen2_5Weights,
+    ) -> Result<Qwen2_5Model> {
+        Qwen2_5Model::with_cubecl_wgpu_backend(config, weights, self.backend.clone())
+    }
 }
 
 impl<B: KernelBackend> Runtime<B> {
@@ -533,6 +560,53 @@ mod tests {
         }
     }
 
+    fn tiny_qwen_config_and_weights() -> (Qwen2_5Config, Qwen2_5Weights) {
+        use ocelotl_models::{Qwen2_5LayerWeights, transpose_2d};
+
+        let cfg = Qwen2_5Config {
+            vocab_size: 8,
+            num_hidden_layers: 1,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            context_length: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            dtype: DType::F32,
+        };
+        let h = cfg.hidden_size;
+        let v = cfg.vocab_size;
+        let q_out = cfg.num_attention_heads * cfg.head_dim;
+        let kv_out = cfg.num_key_value_heads * cfg.head_dim;
+        let i_size = cfg.intermediate_size;
+        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32) * 0.01).collect();
+        let lm_head_w = transpose_2d(&embed, v, h);
+        let weights = Qwen2_5Weights {
+            embed_tokens: embed,
+            layers: vec![Qwen2_5LayerWeights {
+                q_proj_w: vec![0.01; h * q_out],
+                q_proj_b: vec![0.0; q_out],
+                k_proj_w: vec![0.01; h * kv_out],
+                k_proj_b: vec![0.0; kv_out],
+                v_proj_w: vec![0.01; h * kv_out],
+                v_proj_b: vec![0.0; kv_out],
+                o_proj_w: vec![0.01; q_out * h],
+                input_layernorm_w: vec![1.0; h],
+                post_attention_layernorm_w: vec![1.0; h],
+                gate_proj_w: vec![0.01; h * i_size],
+                up_proj_w: vec![0.01; h * i_size],
+                down_proj_w: vec![0.01; i_size * h],
+            }],
+            final_norm_w: vec![1.0; h],
+            lm_head_w,
+            tie_word_embeddings: true,
+        };
+
+        (cfg, weights)
+    }
+
     #[test]
     fn optimized_cpu_runtime_selects_optimized_kernel_backend() {
         let runtime = Runtime::optimized_cpu();
@@ -540,6 +614,42 @@ mod tests {
         assert_eq!(
             runtime.backend().mode(),
             ocelotl_kernels::CpuKernelMode::Optimized
+        );
+    }
+
+    #[test]
+    fn cpu_runtime_builds_qwen_model_with_selected_cpu_backend() {
+        let runtime = Runtime::optimized_cpu();
+        let (cfg, weights) = tiny_qwen_config_and_weights();
+
+        let model = runtime
+            .qwen2_5_model(cfg, weights)
+            .expect("runtime should construct Qwen model");
+
+        assert_eq!(
+            model.kernel_backend().mode(),
+            ocelotl_kernels::CpuKernelMode::Optimized
+        );
+        assert_eq!(
+            model.execution_backend().context().device,
+            ocelotl_core::Device::Cpu
+        );
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn cubecl_wgpu_runtime_builds_qwen_model_with_gpu_execution_backend_without_launch() {
+        let runtime = Runtime::cubecl_wgpu(0);
+        let (cfg, weights) = tiny_qwen_config_and_weights();
+
+        let model = runtime
+            .qwen2_5_model(cfg, weights)
+            .expect("runtime should construct CubeCL-backed Qwen model");
+
+        assert_eq!(model.execution_backend().name(), "cubecl");
+        assert_eq!(
+            model.execution_backend().context().device,
+            ocelotl_core::Device::Gpu { ordinal: 0 }
         );
     }
 

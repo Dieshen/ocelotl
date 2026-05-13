@@ -214,3 +214,34 @@ fn prefill_matches_pinned_fixture_within_tolerance() {
         );
     }
 }
+
+#[cfg(feature = "cubecl-wgpu")]
+#[test]
+#[ignore = "requires a CubeCL WGPU-capable local runtime"]
+fn cubecl_wgpu_prefill_matches_cpu_reference_within_tolerance() {
+    let cfg = tiny_config();
+    let cpu =
+        Qwen2_5Model::new(cfg.clone(), tiny_weights(&cfg)).expect("CPU tiny model must construct");
+    let cubecl = Qwen2_5Model::with_cubecl_wgpu_backend(
+        cfg.clone(),
+        tiny_weights(&cfg),
+        ocelotl_kernels::CubeClKernelBackend::new_gpu(0),
+    )
+    .expect("CubeCL tiny model must construct");
+
+    assert_eq!(cubecl.execution_backend().name(), "cubecl");
+    let prompt = [TokenId(3), TokenId(7), TokenId(11)];
+    let expected = cpu.prefill(&prompt).expect("CPU prefill must succeed");
+    let actual = cubecl
+        .prefill(&prompt)
+        .expect("CubeCL prefill must succeed");
+
+    assert_eq!(actual.len(), expected.len());
+    for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (got - want).abs();
+        assert!(
+            diff < TOLERANCE,
+            "CubeCL-backed prefill logit {idx}: got {got}, want {want}, diff {diff} exceeds {TOLERANCE}"
+        );
+    }
+}

@@ -122,6 +122,29 @@ floating-point comparison documented above. Both must hold.
   metadata, observed max absolute error, and any adjustment to the target
   `1e-3` tolerance in one patch.
 
+## M4 — CubeCL WGPU Kernel Path
+
+M4 GPU parity is CPU-referenced at every level. The CubeCL path must not compare
+against previously captured GPU output.
+
+- **RoPE kernel parity, opt-in local execution**:
+  `ocelotl_kernels::cubecl_backend::tests::wgpu_rope_matches_cpu_reference_for_position_one`
+  runs the CubeCL WGPU RoPE kernel and compares against
+  `ocelotl_kernels::rope_apply_inplace` at `1e-5`.
+- **Qwen prefill parity, opt-in local execution**:
+  `crates/models/tests/qwen2_5_tiny_synthetic_prefill.rs::cubecl_wgpu_prefill_matches_cpu_reference_within_tolerance`
+  constructs a Qwen model with `Qwen2_5KernelBackend::CubeClWgpu`, runs the M3
+  tiny prompt, and compares logits against the CPU model at the existing M3
+  `1e-4` tolerance.
+- **Qwen decode parity, opt-in local execution**:
+  `crates/runtime/tests/qwen2_5_tiny_synthetic_decode.rs::cubecl_wgpu_decode_one_token_matches_cpu_reference`
+  constructs the CubeCL-backed model through `Runtime::cubecl_wgpu(0)` and
+  asserts exact token equality against CPU decode.
+
+The M4 model path is intentionally partial: RoPE uses CubeCL WGPU, and matmul,
+attention, RMSNorm, MLP, residual adds, and logits projection use CPU fallback.
+Full-model GPU execution remains deferred.
+
 ## Post-M3 Whisper ASR
 
 Whisper ASR parity is split into default-on synthetic coverage and an opt-in

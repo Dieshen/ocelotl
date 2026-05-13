@@ -160,6 +160,27 @@ fn decode_one_token_matches_pinned_argmax_of_m3_7_fixture() {
     );
 }
 
+#[cfg(feature = "cubecl-wgpu")]
+#[test]
+#[ignore = "requires a CubeCL WGPU-capable local runtime"]
+fn cubecl_wgpu_decode_one_token_matches_cpu_reference() {
+    let cfg = tiny_config();
+    let cpu = Qwen2_5Model::new(cfg.clone(), tiny_weights(&cfg)).expect("CPU model must construct");
+    let cubecl = ocelotl_runtime::Runtime::cubecl_wgpu(0)
+        .qwen2_5_model(cfg.clone(), tiny_weights(&cfg))
+        .expect("CubeCL-backed model must construct");
+    let prompt = [TokenId(3), TokenId(7), TokenId(11)];
+
+    let expected = decode_one_token(&cpu, &prompt).expect("CPU decode must succeed");
+    let actual = decode_one_token(&cubecl, &prompt).expect("CubeCL decode must succeed");
+
+    assert_eq!(expected, EXPECTED_DECODED_TOKEN);
+    assert_eq!(
+        actual, expected,
+        "CubeCL-backed runtime decode must preserve the CPU reference token"
+    );
+}
+
 #[test]
 fn decode_one_token_propagates_invalid_request_for_empty_prompt() {
     // The runtime's decode path goes through runtime::prefill, which

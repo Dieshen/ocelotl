@@ -8,12 +8,35 @@
 use std::mem::size_of_val;
 
 use cubecl::prelude::*;
-use ocelotl_core::{Device, KernelError, OcelotlError, Result};
+use ocelotl_core::{DType, Device, KernelError, OcelotlError, Result};
 
 use crate::rope::{rope_trig_tables, validate_rope_shape};
 use crate::{KernelBackend, KernelContext};
 
 const CUBECL_BACKEND: &str = "cubecl";
+
+/// Layout contract for the CubeCL RoPE spike.
+///
+/// M4 intentionally keeps device buffers out of the public model/runtime API,
+/// but the backend still needs an explicit shape/dtype/stride contract before
+/// launch. The first supported layout is contiguous f32 rows:
+/// `[num_heads, head_dim]`, row-major, with `row_stride == head_dim`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CubeClRopeLayout {
+    pub dtype: DType,
+    pub head_dim: usize,
+    pub row_stride: usize,
+}
+
+impl CubeClRopeLayout {
+    pub fn contiguous_f32(head_dim: usize) -> Self {
+        Self {
+            dtype: DType::F32,
+            head_dim,
+            row_stride: head_dim,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CubeClKernelBackend {
@@ -63,6 +86,41 @@ pub fn rope_apply_inplace_cubecl<R: Runtime>(
     position: usize,
     theta: f32,
 ) -> Result<()> {
+    rope_apply_inplace_cubecl_with_layout::<R>(
+        device,
+        x,
+        CubeClRopeLayout::contiguous_f32(head_dim),
+        position,
+        theta,
+    )
+}
+
+/// Apply RoPE through CubeCL with an explicit layout contract.
+///
+/// Unsupported dtype and non-contiguous row stride are rejected before the
+/// CubeCL runtime client is requested, so invalid layouts fail even on hosts
+/// without a working WGPU device.
+pub fn rope_apply_inplace_cubecl_with_layout<R: Runtime>(
+    device: &R::Device,
+    x: &mut [f32],
+    layout: CubeClRopeLayout,
+    position: usize,
+    theta: f32,
+) -> Result<()> {
+    if layout.dtype != DType::F32 {
+        return Err(cubecl_err(format!(
+            "CubeCL RoPE supports only F32 input, got {:?}",
+            layout.dtype
+        )));
+    }
+    if layout.row_stride != layout.head_dim {
+        return Err(cubecl_err(format!(
+            "CubeCL RoPE requires contiguous rows (row_stride == head_dim), got row_stride {} for head_dim {}",
+            layout.row_stride, layout.head_dim
+        )));
+    }
+
+    let head_dim = layout.head_dim;
     let _half = validate_rope_shape(CUBECL_BACKEND, x.len(), head_dim)?;
     u32::try_from(head_dim).map_err(|_| {
         cubecl_err(format!(
@@ -191,6 +249,65 @@ mod tests {
                 assert_eq!(backend, "cubecl");
                 assert!(
                     message.contains("head_dim must be even"),
+                    "unexpected diagnostic: {message}"
+                );
+            }
+            other => panic!("expected CubeCL KernelError, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_rope_rejects_non_f32_dtype_before_launch() {
+        let mut actual = [1.0_f32, 2.0, 3.0, 4.0];
+        let layout = CubeClRopeLayout {
+            dtype: DType::BF16,
+            head_dim: 4,
+            row_stride: 4,
+        };
+
+        let err = rope_apply_inplace_cubecl_with_layout::<cubecl::wgpu::WgpuRuntime>(
+            &Default::default(),
+            &mut actual,
+            layout,
+            1,
+            10_000.0,
+        )
+        .expect_err("unsupported dtype must be rejected before CubeCL launch");
+
+        match err {
+            OcelotlError::Kernel(KernelError { backend, message }) => {
+                assert_eq!(backend, "cubecl");
+                assert!(message.contains("F32"), "unexpected diagnostic: {message}");
+            }
+            other => panic!("expected CubeCL KernelError, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_rope_rejects_non_contiguous_stride_before_launch() {
+        let mut actual = [1.0_f32, 2.0, 3.0, 4.0];
+        let layout = CubeClRopeLayout {
+            dtype: DType::F32,
+            head_dim: 4,
+            row_stride: 8,
+        };
+
+        let err = rope_apply_inplace_cubecl_with_layout::<cubecl::wgpu::WgpuRuntime>(
+            &Default::default(),
+            &mut actual,
+            layout,
+            1,
+            10_000.0,
+        )
+        .expect_err("non-contiguous layout must be rejected before CubeCL launch");
+
+        match err {
+            OcelotlError::Kernel(KernelError { backend, message }) => {
+                assert_eq!(backend, "cubecl");
+                assert!(
+                    message.contains("contiguous"),
                     "unexpected diagnostic: {message}"
                 );
             }

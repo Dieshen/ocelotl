@@ -45,34 +45,48 @@ feature-gated and must not weaken the CPU reference path.
     build CubeCL. WGPU tests require `--features cubecl-wgpu`; the execution
     parity test is `#[ignore]` and has an explicit local command.
 
-- [ ] M4.5 Add failure tests for unsupported layouts.
+- [x] M4.5 Add failure tests for unsupported layouts.
   - Crates: `ocelotl-kernels`
   - Test first: pass unsupported shape, dtype, stride, or non-contiguous layout to the GPU path.
   - Done when: kernel dispatch rejects invalid layouts before launch.
-  - Status (2026-05-13): RoPE invalid shape rejection is covered before CubeCL
-    launch. Dtype/stride/non-contiguous layout rejection remains pending because
-    the current spike accepts only a contiguous `&mut [f32]`; a device-buffer
-    contract is still needed before those cases are representable.
+  - Status (2026-05-13): CubeCL RoPE now carries an explicit
+    `CubeClRopeLayout` with dtype, head_dim, and row_stride. Invalid shape,
+    non-F32 dtype, and non-contiguous stride are rejected before the WGPU
+    runtime client is requested.
 
-- [ ] M4.6 Evaluate CubeK or higher-level matmul integration.
+- [x] M4.6 Evaluate CubeK or higher-level matmul integration.
   - Crates: docs, `ocelotl-kernels`
   - Test first: document the smallest blocked matmul or attention case that requires a library decision.
   - Done when: the repo has a clear decision to use, defer, or avoid CubeK for the next kernel family.
+  - Status (2026-05-13): CubeK remains the preferred evaluation path for the
+    next GPU matmul/attention-size operation, but is deferred out of M4 because
+    RoPE is a better first boundary proof and the current Qwen model path still
+    needs a device-buffer/tensor layout contract before CubeK can be adapted
+    cleanly.
 
-- [ ] M4.7 Preserve CPU reference authority.
+- [x] M4.7 Preserve CPU reference authority.
   - Crates: `ocelotl-kernels`, `ocelotl-runtime`
   - Test first: every GPU parity test has a CPU expected-output source.
   - Done when: GPU tests compare against CPU/reference fixtures, not GPU output from a previous run.
-  - Status (2026-05-13): The first CubeCL RoPE parity test compares against
-    the CPU RoPE implementation. Milestone-wide runtime/model parity remains
-    pending.
+  - Status (2026-05-13): CubeCL RoPE, Qwen prefill, and Qwen one-token decode
+    parity tests all compare against CPU output, not captured GPU output. The
+    model/runtime path selects CubeCL only for RoPE and uses CPU fallback for
+    matmul, attention, RMSNorm, MLP, residuals, and logits.
 
 ## Exit Criteria
 
-- At least one GPU-backed kernel executes through Ocelotl's kernel boundary.
-- CPU/GPU parity is tested with documented tolerance.
-- GPU tests are optional or feature-gated and do not break default CI.
-- Unsupported GPU layouts fail explicitly before kernel launch.
+- [x] At least one GPU-backed kernel executes through Ocelotl's kernel boundary.
+- [x] CPU/GPU parity is tested with documented tolerance.
+- [x] GPU tests are optional or feature-gated and do not break default CI.
+- [x] Unsupported GPU layouts fail explicitly before kernel launch.
+
+## Closure
+
+M4 closed on 2026-05-13. The shipped GPU path is intentionally narrow:
+Qwen2.5 prefill/decode can select a CubeCL WGPU execution backend, and that
+backend executes RoPE on CubeCL while all non-M4 kernels run through the CPU
+fallback. This satisfies the first-backend boundary proof without claiming full
+model GPU execution.
 
 ## Deferred
 

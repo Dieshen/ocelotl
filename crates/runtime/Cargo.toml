@@ -8,6 +8,10 @@ rust-version.workspace = true
 description = "Request lifecycle and generation runtime for Ocelotl."
 readme = "../../README.md"
 
+[features]
+default = []
+cubecl-wgpu = ["ocelotl-kernels/cubecl-wgpu", "ocelotl-models/cubecl-wgpu"]
+
 [dependencies]
 ocelotl-core.workspace = true
 ocelotl-kernels.workspace = true

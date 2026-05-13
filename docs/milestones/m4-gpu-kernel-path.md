@@ -58,6 +58,20 @@ cargo test -p ocelotl-kernels --features cubecl-wgpu cubecl_backend -- --nocaptu
 cargo test -p ocelotl-kernels --features cubecl-wgpu wgpu_rope_matches_cpu_reference_for_position_one -- --ignored --nocapture
 ```
 
+M4 model/runtime parity commands:
+
+```powershell
+cargo check -p ocelotl-runtime --features cubecl-wgpu --tests
+cargo test -p ocelotl-models --features cubecl-wgpu cubecl -- --nocapture
+cargo test -p ocelotl-runtime --features cubecl-wgpu cubecl -- --nocapture
+cargo test -p ocelotl-models --features cubecl-wgpu cubecl_wgpu_prefill_matches_cpu_reference_within_tolerance -- --ignored --nocapture
+cargo test -p ocelotl-runtime --features cubecl-wgpu cubecl_wgpu_decode_one_token_matches_cpu_reference -- --ignored --nocapture
+```
+
+The M4 model/runtime path is GPU-backed for RoPE only. CPU remains the
+reference implementation and fallback for matmul, attention, RMSNorm, MLP,
+residual adds, and logits projection.
+
 ## Known Risks
 
 - Kernel APIs that hide strides or layout will make cache bugs hard to diagnose.

@@ -55,8 +55,10 @@
 //! becomes worth its overhead.
 
 use ocelotl_core::{DType, InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId};
+#[cfg(feature = "cubecl-wgpu")]
+use ocelotl_kernels::CubeClKernelBackend;
 use ocelotl_kernels::{
-    CpuKernelBackend, mlp::mlp_gated_silu, rmsnorm::rmsnorm, rope_apply_inplace, vec_add,
+    CpuKernelBackend, KernelBackend, mlp::mlp_gated_silu, rmsnorm::rmsnorm, vec_add,
 };
 
 use super::Qwen2_5Config;
@@ -120,12 +122,116 @@ pub struct Qwen2_5Weights {
     pub tie_word_embeddings: bool,
 }
 
+/// Kernel backend selection for the Qwen2.5 model path.
+///
+/// CPU remains the reference backend for every operation. The M4 CubeCL path is
+/// intentionally partial: RoPE is executed through CubeCL WGPU, while matmul,
+/// attention, RMSNorm, MLP, and residual work continue to use the CPU fallback.
+/// This proves the model/runtime dispatch boundary without claiming full-model
+/// GPU execution.
+#[derive(Debug, Clone)]
+pub enum Qwen2_5KernelBackend {
+    Cpu(CpuKernelBackend),
+    #[cfg(feature = "cubecl-wgpu")]
+    CubeClWgpu {
+        cubecl: CubeClKernelBackend,
+        cpu_fallback: CpuKernelBackend,
+    },
+}
+
+impl Default for Qwen2_5KernelBackend {
+    fn default() -> Self {
+        Self::Cpu(CpuKernelBackend::default())
+    }
+}
+
+impl Qwen2_5KernelBackend {
+    pub fn cpu(kernels: CpuKernelBackend) -> Self {
+        Self::Cpu(kernels)
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    pub fn cubecl_wgpu(cubecl: CubeClKernelBackend) -> Self {
+        Self::CubeClWgpu {
+            cubecl,
+            cpu_fallback: CpuKernelBackend::default(),
+        }
+    }
+
+    pub fn cpu_backend(&self) -> &CpuKernelBackend {
+        match self {
+            Self::Cpu(cpu) => cpu,
+            #[cfg(feature = "cubecl-wgpu")]
+            Self::CubeClWgpu { cpu_fallback, .. } => cpu_fallback,
+        }
+    }
+
+    pub fn execution_backend(&self) -> &dyn KernelBackend {
+        match self {
+            Self::Cpu(cpu) => cpu,
+            #[cfg(feature = "cubecl-wgpu")]
+            Self::CubeClWgpu { cubecl, .. } => cubecl,
+        }
+    }
+
+    fn matmul(
+        &self,
+        a: &[f32],
+        a_shape: (usize, usize),
+        b: &[f32],
+        b_shape: (usize, usize),
+        out: &mut [f32],
+    ) -> Result<()> {
+        self.cpu_backend().matmul(a, a_shape, b, b_shape, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        self.cpu_backend().scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            out,
+        )
+    }
+
+    fn rope_apply_inplace(
+        &self,
+        x: &mut [f32],
+        head_dim: usize,
+        position: usize,
+        theta: f32,
+    ) -> Result<()> {
+        match self {
+            Self::Cpu(_) => ocelotl_kernels::rope_apply_inplace(x, head_dim, position, theta),
+            #[cfg(feature = "cubecl-wgpu")]
+            Self::CubeClWgpu { cubecl, .. } => {
+                cubecl.rope_apply_inplace(x, head_dim, position, theta)
+            }
+        }
+    }
+}
+
 /// Validated Qwen2.5 model: configuration plus weights.
 #[derive(Debug)]
 pub struct Qwen2_5Model {
     config: Qwen2_5Config,
     weights: Qwen2_5Weights,
-    kernels: CpuKernelBackend,
+    kernels: Qwen2_5KernelBackend,
 }
 
 impl Qwen2_5Model {
@@ -148,6 +254,15 @@ impl Qwen2_5Model {
         config: Qwen2_5Config,
         weights: Qwen2_5Weights,
         kernels: CpuKernelBackend,
+    ) -> Result<Self> {
+        Self::with_kernel_backend(config, weights, Qwen2_5KernelBackend::cpu(kernels))
+    }
+
+    /// Construct a model with an explicit Qwen kernel backend selection.
+    pub fn with_kernel_backend(
+        config: Qwen2_5Config,
+        weights: Qwen2_5Weights,
+        kernels: Qwen2_5KernelBackend,
     ) -> Result<Self> {
         validate_config_for_model(&config)?;
         let h = config.hidden_size;
@@ -255,6 +370,19 @@ impl Qwen2_5Model {
         })
     }
 
+    /// Construct a model whose RoPE calls execute through CubeCL WGPU.
+    ///
+    /// Other M4 operations still run through the CPU fallback; CPU remains the
+    /// reference path for matmul, attention, normalization, MLP, and logits.
+    #[cfg(feature = "cubecl-wgpu")]
+    pub fn with_cubecl_wgpu_backend(
+        config: Qwen2_5Config,
+        weights: Qwen2_5Weights,
+        kernels: CubeClKernelBackend,
+    ) -> Result<Self> {
+        Self::with_kernel_backend(config, weights, Qwen2_5KernelBackend::cubecl_wgpu(kernels))
+    }
+
     /// Borrow the validated configuration.
     pub fn config(&self) -> &Qwen2_5Config {
         &self.config
@@ -262,6 +390,18 @@ impl Qwen2_5Model {
 
     /// Borrow the CPU kernel backend selected for this model instance.
     pub fn kernel_backend(&self) -> &CpuKernelBackend {
+        self.kernels.cpu_backend()
+    }
+
+    /// Borrow the active execution backend.
+    ///
+    /// For the M4 CubeCL path this advertises the GPU backend even though only
+    /// RoPE executes on CubeCL and the remaining operations use CPU fallback.
+    pub fn execution_backend(&self) -> &dyn KernelBackend {
+        self.kernels.execution_backend()
+    }
+
+    pub fn qwen_kernel_backend(&self) -> &Qwen2_5KernelBackend {
         &self.kernels
     }
 
@@ -392,14 +532,14 @@ impl Qwen2_5Model {
             // a slice of `num_heads * head_dim` per position.
             for pos in 0..seq {
                 let q_start = pos * q_out;
-                rope_apply_inplace(
+                self.kernels.rope_apply_inplace(
                     &mut q_buf[q_start..q_start + q_out],
                     cfg.head_dim,
                     pos,
                     theta,
                 )?;
                 let k_start = pos * kv_out;
-                rope_apply_inplace(
+                self.kernels.rope_apply_inplace(
                     &mut k_buf[k_start..k_start + kv_out],
                     cfg.head_dim,
                     pos,
@@ -753,6 +893,41 @@ mod tests {
                 "optimized prefill logit {idx} drifted: got {got}, want {want}"
             );
         }
+    }
+
+    #[test]
+    fn new_uses_cpu_execution_backend_by_default() {
+        let cfg = tiny_config();
+        let weights = tiny_weights(&cfg);
+        let model = Qwen2_5Model::new(cfg, weights).unwrap();
+
+        assert_eq!(model.execution_backend().name(), "cpu");
+        assert_eq!(
+            model.execution_backend().context().device,
+            ocelotl_core::Device::Cpu
+        );
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn cubecl_wgpu_model_advertises_gpu_execution_backend_without_launch() {
+        let cfg = tiny_config();
+        let model = Qwen2_5Model::with_cubecl_wgpu_backend(
+            cfg.clone(),
+            tiny_weights(&cfg),
+            ocelotl_kernels::CubeClKernelBackend::new_gpu(0),
+        )
+        .unwrap();
+
+        assert_eq!(model.execution_backend().name(), "cubecl");
+        assert_eq!(
+            model.execution_backend().context().device,
+            ocelotl_core::Device::Gpu { ordinal: 0 }
+        );
+        assert_eq!(
+            model.kernel_backend().mode(),
+            ocelotl_kernels::CpuKernelMode::Scalar
+        );
     }
 
     #[test]
