@@ -477,13 +477,117 @@ fn linear_out_by_in(
         out,
     )?;
 
-    let unrolled_out = out_features - (out_features % 4);
+    let tiled_rows = rows - (rows % 4);
+    let tiled_out = out_features - (out_features % 4);
 
-    for row in 0..rows {
+    for row in (0..tiled_rows).step_by(4) {
+        let x0 = &x[row * in_features..(row + 1) * in_features];
+        let x1 = &x[(row + 1) * in_features..(row + 2) * in_features];
+        let x2 = &x[(row + 2) * in_features..(row + 3) * in_features];
+        let x3 = &x[(row + 3) * in_features..(row + 4) * in_features];
+
+        for out_dim in (0..tiled_out).step_by(4) {
+            // acc{output offset}{row offset}: four output dimensions by four activation rows.
+            let mut acc00 = bias.map_or(0.0, |b| b[out_dim]);
+            let mut acc01 = acc00;
+            let mut acc02 = acc00;
+            let mut acc03 = acc00;
+            let mut acc10 = bias.map_or(0.0, |b| b[out_dim + 1]);
+            let mut acc11 = acc10;
+            let mut acc12 = acc10;
+            let mut acc13 = acc10;
+            let mut acc20 = bias.map_or(0.0, |b| b[out_dim + 2]);
+            let mut acc21 = acc20;
+            let mut acc22 = acc20;
+            let mut acc23 = acc20;
+            let mut acc30 = bias.map_or(0.0, |b| b[out_dim + 3]);
+            let mut acc31 = acc30;
+            let mut acc32 = acc30;
+            let mut acc33 = acc30;
+            let w0 = out_dim * in_features;
+            let w1 = (out_dim + 1) * in_features;
+            let w2 = (out_dim + 2) * in_features;
+            let w3 = (out_dim + 3) * in_features;
+
+            for in_dim in 0..in_features {
+                let weight0 = weight_out_by_in[w0 + in_dim];
+                let weight1 = weight_out_by_in[w1 + in_dim];
+                let weight2 = weight_out_by_in[w2 + in_dim];
+                let weight3 = weight_out_by_in[w3 + in_dim];
+                let x0_value = x0[in_dim];
+                let x1_value = x1[in_dim];
+                let x2_value = x2[in_dim];
+                let x3_value = x3[in_dim];
+
+                acc00 += x0_value * weight0;
+                acc10 += x0_value * weight1;
+                acc20 += x0_value * weight2;
+                acc30 += x0_value * weight3;
+
+                acc01 += x1_value * weight0;
+                acc11 += x1_value * weight1;
+                acc21 += x1_value * weight2;
+                acc31 += x1_value * weight3;
+
+                acc02 += x2_value * weight0;
+                acc12 += x2_value * weight1;
+                acc22 += x2_value * weight2;
+                acc32 += x2_value * weight3;
+
+                acc03 += x3_value * weight0;
+                acc13 += x3_value * weight1;
+                acc23 += x3_value * weight2;
+                acc33 += x3_value * weight3;
+            }
+
+            let out0 = row * out_features + out_dim;
+            let out1 = (row + 1) * out_features + out_dim;
+            let out2 = (row + 2) * out_features + out_dim;
+            let out3 = (row + 3) * out_features + out_dim;
+
+            out[out0] = acc00;
+            out[out0 + 1] = acc10;
+            out[out0 + 2] = acc20;
+            out[out0 + 3] = acc30;
+            out[out1] = acc01;
+            out[out1 + 1] = acc11;
+            out[out1 + 2] = acc21;
+            out[out1 + 3] = acc31;
+            out[out2] = acc02;
+            out[out2 + 1] = acc12;
+            out[out2 + 2] = acc22;
+            out[out2 + 3] = acc32;
+            out[out3] = acc03;
+            out[out3 + 1] = acc13;
+            out[out3 + 2] = acc23;
+            out[out3 + 3] = acc33;
+        }
+
+        for tail_out in tiled_out..out_features {
+            let mut acc0 = bias.map_or(0.0, |b| b[tail_out]);
+            let mut acc1 = acc0;
+            let mut acc2 = acc0;
+            let mut acc3 = acc0;
+            let weight_start = tail_out * in_features;
+            for in_dim in 0..in_features {
+                let weight = weight_out_by_in[weight_start + in_dim];
+                acc0 += x0[in_dim] * weight;
+                acc1 += x1[in_dim] * weight;
+                acc2 += x2[in_dim] * weight;
+                acc3 += x3[in_dim] * weight;
+            }
+            out[row * out_features + tail_out] = acc0;
+            out[(row + 1) * out_features + tail_out] = acc1;
+            out[(row + 2) * out_features + tail_out] = acc2;
+            out[(row + 3) * out_features + tail_out] = acc3;
+        }
+    }
+
+    for row in tiled_rows..rows {
         let x_row = &x[row * in_features..(row + 1) * in_features];
         let out_row = &mut out[row * out_features..(row + 1) * out_features];
 
-        for out_dim in (0..unrolled_out).step_by(4) {
+        for out_dim in (0..tiled_out).step_by(4) {
             let mut acc0 = bias.map_or(0.0, |b| b[out_dim]);
             let mut acc1 = bias.map_or(0.0, |b| b[out_dim + 1]);
             let mut acc2 = bias.map_or(0.0, |b| b[out_dim + 2]);
@@ -505,7 +609,7 @@ fn linear_out_by_in(
             out_row[out_dim + 3] = acc3;
         }
 
-        for out_dim in unrolled_out..out_features {
+        for out_dim in tiled_out..out_features {
             let mut acc = bias.map_or(0.0, |b| b[out_dim]);
             for in_dim in 0..in_features {
                 acc += x_row[in_dim] * weight_out_by_in[out_dim * in_features + in_dim];
@@ -931,6 +1035,54 @@ mod tests {
                 "optimized linear_out_by_in drifted: got {got}, want {want}"
             );
         }
+    }
+
+    #[test]
+    fn scalar_linear_out_by_in_handles_row_and_output_tile_tails() {
+        let rows = 5;
+        let in_features = 3;
+        let out_features = 5;
+        let x = [
+            1.0_f32, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, //
+            10.0, 11.0, 12.0, //
+            13.0, 14.0, 15.0,
+        ];
+        let w = [
+            0.5_f32, 1.0, -0.5, //
+            -1.0, 0.25, 0.75, //
+            1.5, -0.25, 0.0, //
+            0.0, -0.5, 2.0, //
+            -0.75, 0.5, 1.25,
+        ];
+        let bias = [0.1_f32, -0.2, 0.3, -0.4, 0.5];
+        let mut got = [0.0_f32; 25];
+        let mut want = [0.0_f32; 25];
+
+        CpuKernelBackend::scalar()
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&bias),
+                &mut got,
+            )
+            .unwrap();
+
+        for row in 0..rows {
+            for out_dim in 0..out_features {
+                let mut acc = bias[out_dim];
+                for in_dim in 0..in_features {
+                    acc += x[row * in_features + in_dim] * w[out_dim * in_features + in_dim];
+                }
+                want[row * out_features + out_dim] = acc;
+            }
+        }
+
+        assert_eq!(got, want);
     }
 
     #[test]

@@ -466,3 +466,92 @@ This is still not "done optimizing CPU" in the broad sense. It is the first
 validated competitive tiny.en gate. Larger Whisper sizes and longer audio still
 need their own measurements, and optimized CPU mode remains opt-in until it
 beats scalar.
+
+## W-ASR.33 All-Size Scalar CPU Comparison
+
+Fresh local all-size scalar runs on 2026-05-12 used the dedicated
+`bench-whisper-transcribe` hook for Ocelotl and `whisper-cli -t 4 -otxt -nt`
+for whisper.cpp. The large-v2 whisper.cpp command also passed `-l en`.
+
+The Ocelotl rows compare against each bundle's
+`reference/expected_tokens.json` and every row below had
+`matches_expected = true`. The non-tiny expected-token references are short
+contract checks rather than full transcript-quality proofs, so the encoder
+timing is the useful performance signal. whisper.cpp used its default
+`5 beams + best of 5`; Ocelotl used greedy decoding to the expected-token
+length.
+
+| Size | Ocelotl scalar total | Ocelotl encoder | whisper.cpp total | whisper.cpp encode | Ratio |
+| ---- | -------------------- | --------------- | ----------------- | ------------------ | ----- |
+| tiny.en | `1,681 ms` | `1,215 ms` | `810 ms` | `208.52 ms` | `~2.07x` |
+| base.en | `3,286 ms` | `2,759 ms` | `805 ms` | `452.28 ms` | `~4.08x` |
+| small.en | `12,988 ms` | `11,003 ms` | `2,656.89 ms` | `1,790.08 ms` | `~4.89x` |
+| medium.en | `44,153 ms` | `37,543 ms` | `8,406.72 ms` | `5,873.18 ms` | `~5.25x` |
+| large-v2 | `90,024 ms` | `75,904 ms` | `16,317.55 ms` | `11,813.18 ms` | `~5.52x` |
+
+This confirms the W-ASR.32 tiny.en gate was real but narrow. Ocelotl can load
+and run all classic local Whisper sizes with exact token parity for the pinned
+references, but only tiny.en is currently within the `<=3x` wall-time gate.
+The larger sizes scale with the encoder gap, not model load, log-mel, or
+decoder work.
+
+The next performance work should target encoder GEMM. The useful upstream
+comparison is no longer "does Ocelotl work?" but "why is whisper.cpp encoder
+about `~6x` faster across base/small/medium/large?" The reference notes in
+Obsidian point to register-tiled GEMM, SIMD vec-dot, dynamic tile threading,
+and native F16/BF16 weight handling as the main deltas.
+
+## W-ASR.34 Scratch-Arena Prototype Rejected
+
+An encoder scratch-arena prototype was evaluated after the all-size comparison.
+The prototype replaced the encoder's per-helper `Vec<f32>` returns with
+caller-owned scratch buffers for conv/layernorm/attention/MLP intermediates.
+It preserved exact token parity in focused model tests and in release local
+benchmarks, but it did **not** improve performance:
+
+| Size | Prior scalar total | Scratch prototype total | Result |
+| ---- | ------------------ | ----------------------- | ------ |
+| tiny.en | `1,681 ms` | `1,739 ms`, then `1,772 ms` | regression/noise in the wrong direction |
+| base.en | `3,286 ms` | `3,535 ms` | regression |
+
+The change was backed out and should not be treated as a shipped optimization.
+Scratch reuse may become worthwhile once tiled kernels or native dtype buffers
+change the allocation/compute balance, but current evidence says the next
+implementation slice should be register-tiled scalar GEMM, not scratch plumbing.
+
+## W-ASR.35 Register-Tiled Scalar Linear
+
+The scalar `linear_out_by_in` kernel now computes a 4-row x 4-output tile for
+the row-major activation / `[out, in]` weight layout used by Whisper
+projections. The tile keeps 16 accumulators live and reuses each loaded weight
+across four activation rows while preserving the per-output K-loop accumulation
+order. Row and output tails fall back to the previous scalar shape.
+
+Fresh release scalar runs on 2026-05-12:
+
+| Size | W-ASR.33 scalar total | W-ASR.35 scalar total | Change | whisper.cpp total | Ratio after W-ASR.35 |
+| ---- | --------------------- | --------------------- | ------ | ----------------- | -------------------- |
+| tiny.en | `1,681 ms` | `1,073 ms` | ~36% faster | `810 ms` | `~1.32x` |
+| base.en | `3,286 ms` | `1,807 ms` | ~45% faster | `805 ms` | `~2.24x` |
+| small.en | `12,988 ms` | `6,345 ms` | ~51% faster | `2,656.89 ms` | `~2.39x` |
+| medium.en | `44,153 ms` | `20,941 ms` | ~53% faster | `8,406.72 ms` | `~2.49x` |
+| large-v2 | `90,024 ms` | `40,416 ms` | ~55% faster | `16,317.55 ms` | `~2.48x` |
+
+All five Ocelotl runs had `matches_expected = true`.
+
+Stage-level detail:
+
+| Size | Encoder before | Encoder after | Audio encode after | Decode after |
+| ---- | -------------- | ------------- | ------------------ | ------------ |
+| tiny.en | `1,215 ms` | `698 ms` | `745 ms` | `221 ms` |
+| base.en | `2,759 ms` | `1,502 ms` | `1,623 ms` | `19 ms` |
+| small.en | `11,003 ms` | `5,263 ms` | `5,808 ms` | `64 ms` |
+| medium.en | `37,543 ms` | `17,399 ms` | `19,358 ms` | `187 ms` |
+| large-v2 | `75,904 ms` | `33,203 ms` | `37,323 ms` | `296 ms` |
+
+This clears the existing `<=3x` whisper.cpp wall-time gate for all five classic
+local Whisper sizes on the local benchmark set. It is still not a blanket CPU
+performance parity claim: whisper.cpp is running a mature SIMD/threaded backend,
+and Ocelotl's non-tiny references are short expected-token contract checks. The
+next CPU work should choose between tiled-kernel threading, AVX2, or native
+F16/BF16 weights based on the remaining encoder gap.

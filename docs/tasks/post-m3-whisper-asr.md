@@ -528,3 +528,62 @@ Ocelotl can run real Whisper weights yet.
 - `Out of scope`: claiming competitiveness for larger Whisper sizes, making
   optimized CPU mode the default, SIMD/GPU work, or replacing scalar kernels
   with packed-weight kernels.
+
+## W-ASR.33 Record All-Size Whisper CPU Comparison
+
+- `Crates`: docs and benchmark traceability only.
+- `Test first`: no code test; preserve the exact local benchmark command
+  shape and require `matches_expected = true` for every Ocelotl row recorded.
+- `Done when`: `docs/benchmarks/whisper-cpp.md` records the local scalar
+  Ocelotl vs whisper.cpp comparison for tiny.en, base.en, small.en,
+  medium.en, and large-v2 on the same sample audio shape, including caveats
+  about short non-tiny expected-token references and whisper.cpp's default
+  beam/best-of settings.
+- `Status note`: landed on 2026-05-12 as a docs-only benchmark record. All
+  Ocelotl runs matched expected token IDs, but only tiny.en clears the existing
+  `<=3x` wall-time competitiveness gate. Larger sizes remain `~4.1x` to
+  `~5.5x` slower than whisper.cpp, and the gap scales with encoder size.
+- `Out of scope`: changing gates, claiming production CPU parity, or treating
+  whisper.cpp output as the correctness oracle.
+
+## W-ASR.34 Evaluate Encoder Scratch Arena
+
+- `Crates`: `ocelotl-models` and benchmark docs if a code change survives
+  measurement.
+- `Test first`: preserve existing Whisper real-adapter parity tests, then run
+  local release benchmarks before claiming any allocation-reuse win.
+- `Done when`: either an encoder scratch arena lands with exact token parity
+  and measured improvement, or the attempt is documented as rejected with the
+  observed benchmark numbers and the next task is updated accordingly.
+- `Status note`: evaluated on 2026-05-12 and **not landed**. A senior prototype
+  replaced the encoder's per-helper `Vec<f32>` returns with caller-owned scratch
+  buffers for conv/layernorm/attention/MLP intermediates. It was parity-clean,
+  but release benchmarks regressed tiny.en (`1,739 ms`, then `1,772 ms` vs the
+  prior `1,681 ms` local scalar run) and base.en (`3,535 ms` vs prior
+  `3,286 ms`). The prototype was backed out. Scratch reuse may still matter
+  after tiled kernels or native dtype work, but it should not precede GEMM
+  tiling.
+- `Out of scope`: landing a non-winning refactor as "groundwork" or weakening
+  scalar parity to chase allocation counts.
+
+## W-ASR.35 Add Register-Tiled Scalar F32 Linear Kernel
+
+- `Crates`: `ocelotl-kernels`, benchmark docs, and local proof notes.
+- `Test first`: extend the existing scalar linear parity/shape tests if the
+  tile loop adds edge handling beyond current coverage.
+- `Done when`: the scalar `linear_out_by_in` path uses a row/output tile that
+  reuses weights and activations across multiple rows/outputs without changing
+  the public kernel contract, exact local Whisper token parity still passes,
+  and tiny/base/small benchmark deltas are recorded.
+- `Status note`: landed on 2026-05-12. The scalar `[out, in]` linear kernel
+  now computes a 4-row x 4-output tile before falling back to row/output tails,
+  preserving per-output accumulation order while reusing each loaded weight
+  across four activation rows. Release local proofs passed exact token parity:
+  tiny.en `1,073 ms`, base.en `1,807 ms`, and small.en `6,345 ms`, improving
+  from W-ASR.33's `1,681 ms`, `3,286 ms`, and `12,988 ms`. Follow-up medium
+  and large-v2 runs also passed exact token parity at `20,941 ms` and
+  `40,416 ms`, down from `44,153 ms` and `90,024 ms`. All five classic local
+  Whisper sizes now clear the `<=3x` whisper.cpp wall-time gate on the recorded
+  local runs.
+- `Out of scope`: AVX2 intrinsics, multi-threading, native F16/BF16 weights,
+  and making optimized CPU mode the Whisper default.
