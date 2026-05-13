@@ -396,6 +396,42 @@ mod tests {
         assert!((m.rope_theta - 1_000_000.0_f64).abs() < 1e-6);
         assert!((m.rms_norm_eps - 1e-6_f64).abs() < 1e-12);
     }
+
+    #[test]
+    fn kv_cache_layout_calculates_shape_and_bytes() {
+        let layout = KvCacheLayout::new(2, 3, 5, 4, DType::F32, Device::Cpu)
+            .expect("valid layout must construct");
+
+        assert_eq!(layout.values_per_position().unwrap(), 12);
+        assert_eq!(layout.values_per_layer_tensor().unwrap(), 60);
+        assert_eq!(layout.values_per_all_key_tensors().unwrap(), 120);
+        assert_eq!(layout.total_values().unwrap(), 240);
+        assert_eq!(layout.total_bytes().unwrap(), 960);
+        assert_eq!(layout.layer_position_offset(1, 2).unwrap(), 84);
+    }
+
+    #[test]
+    fn paged_kv_layout_maps_positions_and_rejects_bad_tables() {
+        let base = KvCacheLayout::new(1, 2, 6, 4, DType::F32, Device::Cpu).unwrap();
+        let layout = PagedKvCacheLayout::new(base, 4, 3).unwrap();
+
+        assert_eq!(layout.required_pages_for_tokens(0).unwrap(), 0);
+        assert_eq!(layout.required_pages_for_tokens(1).unwrap(), 1);
+        assert_eq!(layout.required_pages_for_tokens(6).unwrap(), 2);
+        assert_eq!(layout.logical_page_and_offset(5).unwrap(), (1, 1));
+        assert_eq!(layout.values_per_page_tensor().unwrap(), 32);
+        layout.validate_page_table(&[0, 2]).unwrap();
+
+        let duplicate = layout
+            .validate_page_table(&[1, 1])
+            .expect_err("duplicate physical pages must be rejected");
+        assert!(format!("{duplicate}").contains("appears more than once"));
+
+        let out_of_range = layout
+            .validate_page_table(&[0, 3])
+            .expect_err("out-of-range physical pages must be rejected");
+        assert!(format!("{out_of_range}").contains("out of range"));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,6 +448,248 @@ pub enum DType {
     BF16,
     Q4,
     Q8,
+}
+
+// ---------------------------------------------------------------------------
+// KV cache contracts (M5/M6)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvCacheLayout {
+    pub num_layers: usize,
+    pub num_key_value_heads: usize,
+    pub capacity_tokens: usize,
+    pub head_dim: usize,
+    pub dtype: DType,
+    pub device: Device,
+}
+
+impl KvCacheLayout {
+    pub fn new(
+        num_layers: usize,
+        num_key_value_heads: usize,
+        capacity_tokens: usize,
+        head_dim: usize,
+        dtype: DType,
+        device: Device,
+    ) -> Result<Self> {
+        if num_layers == 0 {
+            return Err(runtime_err("kv cache num_layers must be > 0"));
+        }
+        if num_key_value_heads == 0 {
+            return Err(runtime_err("kv cache num_key_value_heads must be > 0"));
+        }
+        if capacity_tokens == 0 {
+            return Err(runtime_err("kv cache capacity_tokens must be > 0"));
+        }
+        if head_dim == 0 {
+            return Err(runtime_err("kv cache head_dim must be > 0"));
+        }
+
+        Ok(Self {
+            num_layers,
+            num_key_value_heads,
+            capacity_tokens,
+            head_dim,
+            dtype,
+            device,
+        })
+    }
+
+    pub fn values_per_position(&self) -> Result<usize> {
+        checked_product(
+            "kv cache values_per_position",
+            &[self.num_key_value_heads, self.head_dim],
+        )
+    }
+
+    pub fn values_per_layer_tensor(&self) -> Result<usize> {
+        checked_product(
+            "kv cache values_per_layer_tensor",
+            &[
+                self.capacity_tokens,
+                self.num_key_value_heads,
+                self.head_dim,
+            ],
+        )
+    }
+
+    pub fn values_per_all_key_tensors(&self) -> Result<usize> {
+        checked_product(
+            "kv cache values_per_all_key_tensors",
+            &[
+                self.num_layers,
+                self.capacity_tokens,
+                self.num_key_value_heads,
+                self.head_dim,
+            ],
+        )
+    }
+
+    pub fn total_values(&self) -> Result<usize> {
+        checked_product(
+            "kv cache total_values",
+            &[2, self.values_per_all_key_tensors()?],
+        )
+    }
+
+    pub fn bytes_per_value(&self) -> usize {
+        match self.dtype {
+            DType::F32 => 4,
+            DType::F16 | DType::BF16 => 2,
+            DType::Q4 | DType::Q8 => 1,
+        }
+    }
+
+    pub fn total_bytes(&self) -> Result<usize> {
+        checked_product(
+            "kv cache total_bytes",
+            &[self.total_values()?, self.bytes_per_value()],
+        )
+    }
+
+    pub fn layer_position_offset(&self, layer: usize, position: usize) -> Result<usize> {
+        if layer >= self.num_layers {
+            return Err(runtime_err(format!(
+                "kv cache layer {layer} out of range for {} layers",
+                self.num_layers
+            )));
+        }
+        if position >= self.capacity_tokens {
+            return Err(runtime_err(format!(
+                "kv cache position {position} out of range for capacity {}",
+                self.capacity_tokens
+            )));
+        }
+        let layer_base = checked_product(
+            "kv cache layer offset",
+            &[layer, self.values_per_layer_tensor()?],
+        )?;
+        let position_base = checked_product(
+            "kv cache position offset",
+            &[position, self.values_per_position()?],
+        )?;
+        layer_base.checked_add(position_base).ok_or_else(|| {
+            runtime_err("kv cache layer position offset overflowed usize".to_string())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PagedKvCacheLayout {
+    pub base: KvCacheLayout,
+    pub page_size_tokens: usize,
+    pub physical_pages: usize,
+}
+
+impl PagedKvCacheLayout {
+    pub fn new(
+        base: KvCacheLayout,
+        page_size_tokens: usize,
+        physical_pages: usize,
+    ) -> Result<Self> {
+        if page_size_tokens == 0 {
+            return Err(runtime_err("paged kv page_size_tokens must be > 0"));
+        }
+        if physical_pages == 0 {
+            return Err(runtime_err("paged kv physical_pages must be > 0"));
+        }
+        let layout = Self {
+            base,
+            page_size_tokens,
+            physical_pages,
+        };
+        let required = layout.required_pages_for_tokens(layout.base.capacity_tokens)?;
+        if required > physical_pages {
+            return Err(runtime_err(format!(
+                "paged kv capacity requires {required} pages but allocator has {physical_pages}"
+            )));
+        }
+        Ok(layout)
+    }
+
+    pub fn required_pages_for_tokens(&self, tokens: usize) -> Result<usize> {
+        if tokens == 0 {
+            return Ok(0);
+        }
+        tokens
+            .checked_add(self.page_size_tokens - 1)
+            .and_then(|v| v.checked_div(self.page_size_tokens))
+            .ok_or_else(|| runtime_err("paged kv page count overflowed usize".to_string()))
+    }
+
+    pub fn logical_page_and_offset(&self, position: usize) -> Result<(usize, usize)> {
+        if position >= self.base.capacity_tokens {
+            return Err(runtime_err(format!(
+                "paged kv position {position} out of range for capacity {}",
+                self.base.capacity_tokens
+            )));
+        }
+        Ok((
+            position / self.page_size_tokens,
+            position % self.page_size_tokens,
+        ))
+    }
+
+    pub fn values_per_page_tensor(&self) -> Result<usize> {
+        checked_product(
+            "paged kv values_per_page_tensor",
+            &[self.page_size_tokens, self.base.values_per_position()?],
+        )
+    }
+
+    pub fn validate_page_table(&self, table: &[usize]) -> Result<()> {
+        let required = self.required_pages_for_tokens(self.base.capacity_tokens)?;
+        if table.len() < required {
+            return Err(runtime_err(format!(
+                "paged kv page table has {} pages but capacity requires {required}",
+                table.len()
+            )));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(table.len());
+        for &page in table {
+            if page >= self.physical_pages {
+                return Err(runtime_err(format!(
+                    "paged kv physical page {page} out of range for {} pages",
+                    self.physical_pages
+                )));
+            }
+            if !seen.insert(page) {
+                return Err(runtime_err(format!(
+                    "paged kv physical page {page} appears more than once"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub trait KvCacheStore {
+    fn layout(&self) -> &KvCacheLayout;
+    fn len_tokens(&self) -> usize;
+    fn set_len_tokens(&mut self, len_tokens: usize) -> Result<()>;
+    fn write_layer_kv(
+        &mut self,
+        layer: usize,
+        position: usize,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()>;
+    fn read_layer_keys(&self, layer: usize, len_tokens: usize, out: &mut [f32]) -> Result<()>;
+    fn read_layer_values(&self, layer: usize, len_tokens: usize, out: &mut [f32]) -> Result<()>;
+}
+
+fn checked_product(label: &str, dims: &[usize]) -> Result<usize> {
+    dims.iter()
+        .copied()
+        .try_fold(1usize, usize::checked_mul)
+        .ok_or_else(|| runtime_err(format!("{label} overflowed usize for dims {dims:?}")))
+}
+
+fn runtime_err(message: impl Into<String>) -> OcelotlError {
+    OcelotlError::Runtime(RuntimeError {
+        message: message.into(),
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,17 @@
 //! Request lifecycle and generation runtime.
 
+mod kv_cache;
 mod sampling;
+mod scheduler;
 mod whisper_streaming;
 
+pub use kv_cache::{ContiguousKvCache, PagedKvCache, PagedKvCacheAllocator, qwen2_5_kv_layout};
 pub use sampling::greedy_sample;
+pub use scheduler::{
+    ContinuousBatchScheduler, GreedyDecodeModel, QwenGreedyModel, ScheduledGenerationRequest,
+    ScheduledGenerationResponse, SchedulerConfig, SchedulerEvent, SchedulerRequestState,
+    generate_qwen_batch,
+};
 pub use whisper_streaming::{
     ChunkedTranscriptionRequest, TranscriptionChunk, TranscriptionChunkingConfig,
     plan_transcription_chunks,
@@ -271,6 +279,135 @@ pub fn decode_one_token(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<Toke
     greedy_sample(&logits)
 }
 
+/// Runtime-owned contiguous Qwen2.5 cache state.
+///
+/// `last_logits` is the sampling surface for the next token. The cache stores
+/// K/V for every token already consumed by the model. Keeping both together in
+/// runtime prevents callers from mixing logits from one request with cache
+/// storage from another request.
+#[derive(Debug, Clone)]
+pub struct Qwen2_5ContiguousCacheState {
+    cache: ContiguousKvCache,
+    last_logits: Vec<f32>,
+}
+
+impl Qwen2_5ContiguousCacheState {
+    pub fn cache(&self) -> &ContiguousKvCache {
+        &self.cache
+    }
+
+    pub fn last_logits(&self) -> &[f32] {
+        &self.last_logits
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.cache.is_released()
+    }
+
+    pub fn release(&mut self) {
+        self.cache.release();
+        self.last_logits.clear();
+    }
+}
+
+/// Prefill a Qwen2.5 prompt and populate a request-scoped contiguous KV cache.
+pub fn prepare_qwen2_5_contiguous_cache(
+    model: &Qwen2_5Model,
+    tokens: &[TokenId],
+) -> Result<Qwen2_5ContiguousCacheState> {
+    let mut cache = ContiguousKvCache::for_qwen2_5(model.config())?;
+    let last_logits = model.prefill_with_cache(tokens, &mut cache)?;
+    Ok(Qwen2_5ContiguousCacheState { cache, last_logits })
+}
+
+/// Greedily sample one token from cached state, append its K/V, and return it.
+pub fn decode_one_token_with_contiguous_cache(
+    model: &Qwen2_5Model,
+    state: &mut Qwen2_5ContiguousCacheState,
+) -> Result<TokenId> {
+    let token = greedy_sample(&state.last_logits)?;
+    state.last_logits = model.decode_token_with_cache(token, &mut state.cache)?;
+    Ok(token)
+}
+
+/// Runtime-owned paged Qwen2.5 cache state.
+///
+/// The cache is optional only so `release_into` can return physical pages to
+/// the allocator exactly once while leaving a visible released state behind.
+#[derive(Debug, Clone)]
+pub struct Qwen2_5PagedCacheState {
+    cache: Option<PagedKvCache>,
+    last_logits: Vec<f32>,
+}
+
+impl Qwen2_5PagedCacheState {
+    pub fn cache(&self) -> Option<&PagedKvCache> {
+        self.cache.as_ref()
+    }
+
+    pub fn last_logits(&self) -> &[f32] {
+        &self.last_logits
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.cache.is_none()
+    }
+
+    pub fn release_into(&mut self, allocator: &mut PagedKvCacheAllocator) {
+        if let Some(cache) = self.cache.take() {
+            allocator.release(cache);
+        }
+        self.last_logits.clear();
+    }
+}
+
+/// Prefill a Qwen2.5 prompt and populate a request-scoped paged KV cache.
+///
+/// Allocation happens in runtime, not in the model. If prefill fails after page
+/// allocation, the pages are returned before the error escapes.
+pub fn prepare_qwen2_5_paged_cache(
+    model: &Qwen2_5Model,
+    tokens: &[TokenId],
+    allocator: &mut PagedKvCacheAllocator,
+    capacity_tokens: usize,
+) -> Result<Qwen2_5PagedCacheState> {
+    if tokens.len() > capacity_tokens {
+        return Err(invalid_request(
+            "kv_cache.capacity",
+            &format!(
+                "prompt length {} exceeds requested paged cache capacity {capacity_tokens}",
+                tokens.len()
+            ),
+        ));
+    }
+
+    let mut cache = allocator.allocate(capacity_tokens)?;
+    match model.prefill_with_cache(tokens, &mut cache) {
+        Ok(last_logits) => Ok(Qwen2_5PagedCacheState {
+            cache: Some(cache),
+            last_logits,
+        }),
+        Err(err) => {
+            allocator.release(cache);
+            Err(err)
+        }
+    }
+}
+
+/// Greedily sample one token from paged cached state, append its K/V, and return it.
+pub fn decode_one_token_with_paged_cache(
+    model: &Qwen2_5Model,
+    state: &mut Qwen2_5PagedCacheState,
+) -> Result<TokenId> {
+    let token = greedy_sample(&state.last_logits)?;
+    let cache = state
+        .cache
+        .as_mut()
+        .ok_or_else(|| runtime_error("paged Qwen2.5 cache state has been released"))?;
+    state.last_logits = model.decode_token_with_cache(token, cache)?;
+    Ok(token)
+}
+
 /// Run one synthetic Whisper transcription step through the runtime boundary.
 ///
 /// W-ASR.6 keeps this intentionally narrow: runtime validates request-owned
@@ -461,6 +598,12 @@ fn invalid_request(field: &str, message: &str) -> OcelotlError {
     })
 }
 
+fn runtime_error(message: impl Into<String>) -> OcelotlError {
+    OcelotlError::Runtime(RuntimeError {
+        message: message.into(),
+    })
+}
+
 pub struct Runtime<B: KernelBackend = CpuKernelBackend> {
     backend: B,
 }
@@ -528,7 +671,7 @@ impl<B: KernelBackend> Runtime<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocelotl_core::DType;
+    use ocelotl_core::{DType, KvCacheStore};
 
     /// Build a model metadata fixture with a controllable context length.
     /// Other fields are placeholders — validation only inspects context_length.
@@ -1008,6 +1151,109 @@ mod tests {
             (token.0 as usize) < model.config().vocab_size,
             "decoded token must be within vocabulary, got {token:?}",
         );
+    }
+
+    #[test]
+    fn contiguous_cache_decode_matches_no_cache_decode_and_appends_token() {
+        let model = tiny_model_for_decode();
+        let prompt = [TokenId(1), TokenId(2)];
+        let expected = decode_one_token(&model, &prompt).unwrap();
+
+        let mut state =
+            prepare_qwen2_5_contiguous_cache(&model, &prompt).expect("cached prefill must succeed");
+
+        assert_eq!(state.cache().len_tokens(), prompt.len());
+        assert_eq!(
+            state.cache().key_at(0, 0).unwrap().len(),
+            model.config().num_key_value_heads * model.config().head_dim
+        );
+        assert!(state.last_logits().iter().all(|v| v.is_finite()));
+
+        let actual = decode_one_token_with_contiguous_cache(&model, &mut state)
+            .expect("cached decode must succeed");
+
+        assert_eq!(actual, expected);
+        assert_eq!(state.cache().len_tokens(), prompt.len() + 1);
+    }
+
+    #[test]
+    fn contiguous_cache_rejects_capacity_overflow_before_advancing_len() {
+        let model = tiny_model_for_decode();
+        let layout = qwen2_5_kv_layout(model.config(), 2).unwrap();
+        let mut cache = ContiguousKvCache::new(layout).unwrap();
+
+        let err = model
+            .prefill_with_cache(&[TokenId(1), TokenId(2), TokenId(3)], &mut cache)
+            .expect_err("prompt beyond cache capacity must be rejected");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "kv_cache.capacity");
+            }
+            other => panic!("expected InvalidRequest(kv_cache.capacity), got {other:?}"),
+        }
+        assert_eq!(cache.len_tokens(), 0);
+    }
+
+    #[test]
+    fn contiguous_cache_release_clears_runtime_state_on_cancellation() {
+        let model = tiny_model_for_decode();
+        let mut state = prepare_qwen2_5_contiguous_cache(&model, &[TokenId(1), TokenId(2)])
+            .expect("cached prefill must succeed");
+
+        state.release();
+
+        assert!(state.is_released());
+        assert!(state.last_logits().is_empty());
+    }
+
+    #[test]
+    fn paged_cache_decode_matches_no_cache_decode_across_page_boundary() {
+        let model = tiny_model_for_decode();
+        let prompt = [TokenId(1), TokenId(2), TokenId(3)];
+        let expected = decode_one_token(&model, &prompt).unwrap();
+        let mut allocator = PagedKvCacheAllocator::for_qwen2_5(model.config(), 4, 2, 3)
+            .expect("allocator must construct");
+
+        let mut state = prepare_qwen2_5_paged_cache(&model, &prompt, &mut allocator, 4)
+            .expect("paged cached prefill must succeed");
+
+        let cache = state.cache().expect("state must hold a cache");
+        assert_eq!(cache.page_table(), &[0, 1]);
+        assert_eq!(cache.physical_page_for_position(2).unwrap(), 1);
+        assert_eq!(cache.len_tokens(), prompt.len());
+        assert_eq!(allocator.free_page_count(), 1);
+
+        let actual = decode_one_token_with_paged_cache(&model, &mut state)
+            .expect("paged cached decode must succeed");
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            state.cache().expect("cache remains live").len_tokens(),
+            prompt.len() + 1
+        );
+
+        state.release_into(&mut allocator);
+        assert!(state.is_released());
+        assert_eq!(allocator.free_page_count(), 3);
+    }
+
+    #[test]
+    fn paged_cache_releases_pages_when_prefill_fails_after_allocation() {
+        let model = tiny_model_for_decode();
+        let mut allocator = PagedKvCacheAllocator::for_qwen2_5(model.config(), 4, 2, 3)
+            .expect("allocator must construct");
+
+        let err = prepare_qwen2_5_paged_cache(&model, &[TokenId(99)], &mut allocator, 4)
+            .expect_err("invalid token should fail prefill after allocation");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "tokens");
+            }
+            other => panic!("expected InvalidRequest(tokens), got {other:?}"),
+        }
+        assert_eq!(allocator.free_page_count(), 3);
     }
 
     #[test]

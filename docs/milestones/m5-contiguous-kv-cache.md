@@ -51,3 +51,10 @@ cargo test --workspace
 - Cache position bugs often only appear after the first token.
 - Request isolation must be tested before scheduler work begins.
 - A contiguous layout should not be over-generalized into a fake paged design.
+
+## Closure Note (2026-05-13)
+
+Closed for CPU/reference execution. Runtime owns contiguous Qwen2.5 cache state,
+prefill writes prompt K/V, cached decode reads existing K/V and appends the next
+position, and cached greedy output matches the M3 no-cache path. GPU cache
+residency remains deferred.

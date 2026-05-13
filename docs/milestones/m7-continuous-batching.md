@@ -51,3 +51,11 @@ cargo test --workspace
 - Scheduling can hide cache ownership bugs.
 - Fairness and throughput goals can conflict; correctness wins first.
 - Cancellation paths often miss GPU/cache cleanup unless tested directly.
+
+## Closure Note (2026-05-13)
+
+Closed as deterministic scheduler correctness plumbing. Runtime exposes
+bounded admission, explicit request states, cancellation cleanup, round-robin
+token emission, and a public Qwen2.5 batch helper whose outputs match
+independent unbatched greedy decode. Throughput-oriented scheduling remains
+deferred.

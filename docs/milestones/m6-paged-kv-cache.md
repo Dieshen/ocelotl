@@ -51,3 +51,10 @@ cargo test --workspace
 - Tests that only hit page 0 do not validate paged KV.
 - Stride mismatches between writer and reader kernels can pass simple tests.
 - Model-family attention variation can break page sizing assumptions.
+
+## Closure Note (2026-05-13)
+
+Closed for CPU/reference execution. Runtime owns paged layout, allocator,
+release, failure cleanup, multi-page read/write, and paged/no-cache Qwen2.5
+greedy-token parity. Kernel-visible paged attention and GPU-resident pages
+remain deferred.

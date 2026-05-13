@@ -143,6 +143,29 @@ Local M4 spike proof command that passed on 2026-05-13:
 cargo test -p ocelotl-kernels --features cubecl-wgpu wgpu_rope_matches_cpu_reference_for_position_one -- --ignored --nocapture
 ```
 
+## M5-M7 Runtime State Acceptance Traceability
+
+M5 through M7 are closed for CPU/reference correctness. GPU cache residency,
+paged-attention kernels, and throughput-oriented batching remain later work.
+
+| # | Acceptance criterion | Test(s) proving it | Status |
+| - | -------------------- | ------------------ | ------ |
+| 1 | Contiguous KV cache metadata is explicit and shared across runtime/model boundaries. | `ocelotl_core::tests::kv_cache_layout_calculates_shape_and_bytes` pins layer/head/token/head-dim sizing, dtype/device metadata, byte counts, and layer-position offsets. | green |
+| 2 | Runtime allocates request-scoped contiguous cache storage without sharing mutable K/V between requests. | `ocelotl_runtime::kv_cache::tests::contiguous_cache_allocations_are_request_isolated` creates two caches from the same layout and proves writes to one do not appear in the other. | green |
+| 3 | Qwen2.5 prefill writes K/V into the contiguous cache, and cached decode appends the next token position. | `ocelotl_runtime::tests::contiguous_cache_decode_matches_no_cache_decode_and_appends_token` runs cached prefill, observes finite K/V/logit state, performs cached decode, and asserts cache length advances by one. | green |
+| 4 | Cache capacity errors fail before the request state advances. | `ocelotl_runtime::tests::contiguous_cache_rejects_capacity_overflow_before_advancing_len` rejects a three-token prefill against a two-token cache and proves `len_tokens` stays at zero. | green |
+| 5 | Contiguous cached decode preserves the M3 no-cache greedy token. | `ocelotl_runtime::tests::contiguous_cache_decode_matches_no_cache_decode_and_appends_token` compares `decode_one_token` against `decode_one_token_with_contiguous_cache` on the same tiny Qwen2.5 prompt. | green |
+| 6 | Runtime cleanup can release contiguous cache resources on cancellation. | `ocelotl_runtime::tests::contiguous_cache_release_clears_runtime_state_on_cancellation` clears K/V storage and logits through `Qwen2_5ContiguousCacheState::release`. | green |
+| 7 | Paged KV cache layout maps logical positions to pages and rejects malformed page tables before compute. | `ocelotl_core::tests::paged_kv_layout_maps_positions_and_rejects_bad_tables` and `ocelotl_runtime::kv_cache::tests::paged_cache_rejects_invalid_layouts_before_storage_use` cover page sizing, duplicate pages, out-of-range pages, and unsupported dtype. | green |
+| 8 | Paged allocation, release, and multi-page read/write behavior are deterministic. | `ocelotl_runtime::kv_cache::tests::{paged_allocator_releases_pages_back_to_pool,paged_cache_reads_and_writes_across_page_one}` prove free-page reuse and reads from page ID greater than zero. | green |
+| 9 | Paged cached decode preserves the no-cache greedy token and returns pages on failure. | `ocelotl_runtime::tests::{paged_cache_decode_matches_no_cache_decode_across_page_boundary,paged_cache_releases_pages_when_prefill_fails_after_allocation}` prove page-spanning parity and failure cleanup. | green |
+| 10 | Scheduler state transitions, queue bounds, duplicate request IDs, cancellation, fairness, and batched/unbatched parity are tested. | `ocelotl_runtime::scheduler::tests::{state_transitions_reject_invalid_edges,scheduler_emits_tokens_round_robin_for_mock_requests,scheduler_cancels_one_request_without_cleaning_active_peer,scheduler_rejects_requests_beyond_queue_bound,scheduler_rejects_duplicate_request_ids,scheduler_short_request_makes_progress_before_long_request_completes,qwen_batched_generation_matches_unbatched_decode}`. | green |
+
+### Closure note (2026-05-13)
+
+Senior local proof: `cargo test --workspace` passed with **310 default tests +
+8 doctests**. The **9 ignored tests** remain opt-in local-artifact/GPU checks.
+
 ## Post-M3 Whisper ASR Acceptance Traceability
 
 The table below maps `docs/milestones/post-m3-whisper-asr.md` acceptance
