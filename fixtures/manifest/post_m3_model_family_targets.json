@@ -1,0 +1,65 @@
+{
+  "fixture_version": 1,
+  "name": "post_m3_model_family_targets",
+  "purpose": "Machine-readable pins for the first post-M3 model-family expansion candidates. These are compatibility-discovery artifacts, not execution fixtures.",
+  "date_pinned": "2026-05-13",
+  "pinned_by_task": "MF.1",
+  "artifacts": [
+    {
+      "family": "qwen",
+      "model": "qwen3.5-35b-a3b-fp8",
+      "host": "huggingface",
+      "repository": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "revision": "9d1823d2dee688a6b25e77009dc727688c44936e",
+      "revision_branch_at_pin_time": "main",
+      "url": "https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8/tree/9d1823d2dee688a6b25e77009dc727688c44936e",
+      "base_repository": "Qwen/Qwen3.5-35B-A3B",
+      "base_revision_at_pin_time": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+      "license": "apache-2.0",
+      "license_source": "Hugging Face repo metadata at pinned revision",
+      "format": "safetensors",
+      "quantization": "fp8",
+      "multimodal": true,
+      "expected_local_path": "local-artifacts/qwen3_5_35b_a3b_fp8/",
+      "required_files": [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "*.safetensors"
+      ],
+      "support_note": "Candidate only. Qwen3.5 uses hybrid attention, sparse MoE, multimodal processors, and FP8 weights; MF.4/MF.5 must reject unsupported features before compute until those contracts land."
+    },
+    {
+      "family": "gemma",
+      "model": "gemma-4-e4b-it-q4_k_m",
+      "host": "huggingface",
+      "repository": "bartowski/google_gemma-4-E4B-it-GGUF",
+      "revision": "c04cb322fd63e347db759a08b6249b867488ccf8",
+      "revision_branch_at_pin_time": "main",
+      "url": "https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/tree/c04cb322fd63e347db759a08b6249b867488ccf8",
+      "base_repository": "google/gemma-4-E4B-it",
+      "base_revision_at_pin_time": "3555bddc93a623db8887dd2e52123facc45ade77",
+      "license": "apache-2.0",
+      "license_source": "Hugging Face repo metadata at pinned revision",
+      "format": "gguf",
+      "quantization": "q4_k_m",
+      "multimodal": true,
+      "expected_local_path": "local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf",
+      "required_files": [
+        "google_gemma-4-E4B-it-Q4_K_M.gguf"
+      ],
+      "support_note": "Candidate only. Gemma4 GGUF carries embedded tokenizer metadata, quantized tensor types, sliding-window/shared-KV metadata, and multimodal/audio capability; MF.2 inspects headers only and later tasks must reject unsupported execution before compute."
+    }
+  ],
+  "scope": {
+    "weight_files_committed": false,
+    "default_tests_require_artifacts": false,
+    "covers_tasks": [
+      "MF.1",
+      "MF.2",
+      "MF.3",
+      "MF.4",
+      "MF.5"
+    ]
+  }
+}

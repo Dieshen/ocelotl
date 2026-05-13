@@ -11,6 +11,8 @@ and does not modify the closed M3.6 MLP task.
 - `Done when`: Qwen3.5 and Gemma4 each have one candidate artifact with a pinned
   source and an explicit note on whether it is safetensors, GGUF, quantized, or
   multimodal.
+- `Status`: done 2026-05-13. `fixtures/manifest/post_m3_model_family_targets.json`
+  pins Qwen3.5 FP8 safetensors and Gemma4 Q4_K_M GGUF candidates.
 
 ## MF.2 Add GGUF Header-Only Inspection
 
@@ -19,6 +21,10 @@ and does not modify the closed M3.6 MLP task.
   Ocelotl-owned manifest without reading tensor payloads.
 - `Done when`: truncated headers, unsupported versions, bad tensor offsets, and
   oversized metadata fail with typed errors.
+- `Status`: done 2026-05-13. `ocelotl_loader::inspect_gguf` parses GGUF v3
+  metadata/tensor descriptors, summarizes array metadata without storing large
+  tokenizer arrays, validates tensor offsets, and exposes an ignored local
+  Gemma4 Q4_K_M header-contract proof.
 
 ## MF.3 Add Gemma4 Metadata Contract
 
@@ -75,4 +81,3 @@ and does not modify the closed M3.6 MLP task.
 This track closes when Qwen3.5 and Gemma4 can both be inspected and rejected
 correctly for unsupported features, and at least one explicitly supported subset
 has a tiny synthetic runtime fixture without regressing Qwen2.5 M3 parity.
-

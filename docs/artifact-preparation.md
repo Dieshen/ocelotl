@@ -231,7 +231,51 @@ check used by `tiny.en`. If `reference/expected_tokens_timestamped.json` is
 present for a size, the same ignored test also validates the optional timestamped
 reference with the W-ASR.15 segment schema.
 
-## 5. Keeping Artifacts Out Of Git
+## 5. Post-M3 Model-Family Expansion Artifacts
+
+MF.1 pins the first Qwen3.5 and Gemma4 compatibility-discovery candidates in
+`fixtures/manifest/post_m3_model_family_targets.json`. These are not execution
+fixtures yet. They exist so MF.3-MF.5 can inspect and reject unsupported
+features against stable artifact identities instead of moving upstream branches.
+
+| Target | Upstream artifact | Pinned revision | Local path | Notes |
+| --- | --- | --- | --- | --- |
+| Qwen3.5 | `Qwen/Qwen3.5-35B-A3B-FP8` | `9d1823d2dee688a6b25e77009dc727688c44936e` | `local-artifacts/qwen3_5_35b_a3b_fp8/` | Official FP8 safetensors candidate. Multimodal, hybrid attention, sparse MoE; reject before compute until the model contract lands. |
+| Gemma4 | `bartowski/google_gemma-4-E4B-it-GGUF` / `google_gemma-4-E4B-it-Q4_K_M.gguf` | `c04cb322fd63e347db759a08b6249b867488ccf8` | `local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf` | GGUF Q4_K_M candidate derived from `google/gemma-4-E4B-it`. Header-only inspection is supported; quantized execution is not. |
+
+Fetch Qwen3.5 FP8 only when you are working on the Qwen3.5 metadata/tensor
+contract. It is a large artifact and default tests do not require it:
+
+```powershell
+huggingface-cli download Qwen/Qwen3.5-35B-A3B-FP8 `
+    --revision 9d1823d2dee688a6b25e77009dc727688c44936e `
+    --local-dir local-artifacts/qwen3_5_35b_a3b_fp8 `
+    --local-dir-use-symlinks False `
+    --include "config.json" "tokenizer.json" "tokenizer_config.json" "*.safetensors"
+```
+
+Fetch the Gemma4 GGUF when you are working on GGUF inspection or Gemma4
+metadata/tensor contracts:
+
+```powershell
+New-Item -ItemType Directory -Force local-artifacts/gemma4_e4b_it_q4_k_m
+
+huggingface-cli download bartowski/google_gemma-4-E4B-it-GGUF `
+    --revision c04cb322fd63e347db759a08b6249b867488ccf8 `
+    --local-dir local-artifacts/gemma4_e4b_it_q4_k_m `
+    --local-dir-use-symlinks False `
+    --include "google_gemma-4-E4B-it-Q4_K_M.gguf"
+```
+
+The MF.2 ignored local proof can also point at an existing GGUF file without
+copying it into the repo-local artifact directory:
+
+```powershell
+$env:OCELOTL_GEMMA4_GGUF_PATH="D:\path\to\google_gemma-4-E4B-it-Q4_K_M.gguf"
+cargo test -p ocelotl-loader local_gemma4_q4_k_m_gguf_header_contract_is_well_formed -- --ignored --nocapture
+```
+
+## 6. Keeping Artifacts Out Of Git
 
 `local-artifacts/` is listed in `.gitignore`. This is intentional and
 enforced by tooling, not by convention:
@@ -246,7 +290,7 @@ If `git status` ever lists a file under `local-artifacts/`, do not force-add
 it. Either the path is wrong or the `.gitignore` entry is broken — fix the
 root cause before committing anything else.
 
-## 6. How Tests Find The Artifacts
+## 7. How Tests Find The Artifacts
 
 Tests that depend on real artifacts MUST be `#[ignore]` by default and run
 explicitly with `cargo test -- --ignored` (or a focused
@@ -306,7 +350,7 @@ Tests that use only the small committed fixtures under `fixtures/` should
 **not** be marked `#[ignore]`. The distinction is: committed fixtures =
 default-on; local artifacts = opt-in.
 
-## 7. How To Fetch
+## 8. How To Fetch
 
 The project does not ship a fetch script. Each contributor runs the command
 manually so that the pinned SHA is visible at the call site (matching the
@@ -344,7 +388,7 @@ Get-ChildItem local-artifacts/qwen2_5_0_5b_instruct
 
 You should see the files listed in section 2.
 
-## 8. License Reminder
+## 9. License Reminder
 
 Apache-2.0 means redistribution is permitted with attribution. We avoid
 checking the artifacts into this repository for size and review-friction

@@ -7,6 +7,11 @@ use ocelotl_core::{
 };
 use serde::Deserialize;
 
+pub mod gguf_inspect;
+pub use gguf_inspect::{
+    GgmlTensorType, GgufManifest, GgufMetadataEntry, GgufMetadataType, GgufMetadataValue,
+    GgufTensorEntry, inspect_gguf,
+};
 pub mod safetensors_inspect;
 pub use safetensors_inspect::{
     SafetensorsManifest, SupportedDtype, TensorEntry, inspect_safetensors, require_tensors,
@@ -684,6 +689,74 @@ mod tests {
         assert_eq!(
             extract_missing_field(message).as_deref(),
             Some("vocab_size")
+        );
+    }
+
+    #[test]
+    fn post_m3_model_family_target_manifest_pins_qwen3_5_and_gemma4() {
+        #[derive(Debug, Deserialize)]
+        struct Manifest {
+            fixture_version: u32,
+            name: String,
+            artifacts: Vec<TargetArtifact>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct TargetArtifact {
+            family: String,
+            repository: String,
+            revision: String,
+            license: String,
+            format: String,
+            quantization: String,
+            multimodal: bool,
+            expected_local_path: String,
+        }
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("manifest")
+            .join("post_m3_model_family_targets.json");
+        let raw = std::fs::read_to_string(&path).expect("read target manifest fixture");
+        let manifest: Manifest =
+            serde_json::from_str(&raw).expect("target manifest fixture must parse");
+
+        assert_eq!(manifest.fixture_version, 1);
+        assert_eq!(manifest.name, "post_m3_model_family_targets");
+        assert_eq!(manifest.artifacts.len(), 2);
+
+        let qwen = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.family == "qwen")
+            .expect("manifest must name a Qwen-family target");
+        assert_eq!(qwen.repository, "Qwen/Qwen3.5-35B-A3B-FP8");
+        assert_eq!(qwen.revision, "9d1823d2dee688a6b25e77009dc727688c44936e");
+        assert_eq!(qwen.license, "apache-2.0");
+        assert_eq!(qwen.format, "safetensors");
+        assert_eq!(qwen.quantization, "fp8");
+        assert!(qwen.multimodal);
+        assert_eq!(
+            qwen.expected_local_path,
+            "local-artifacts/qwen3_5_35b_a3b_fp8/"
+        );
+
+        let gemma = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.family == "gemma")
+            .expect("manifest must name a Gemma-family target");
+        assert_eq!(gemma.repository, "bartowski/google_gemma-4-E4B-it-GGUF");
+        assert_eq!(gemma.revision, "c04cb322fd63e347db759a08b6249b867488ccf8");
+        assert_eq!(gemma.license, "apache-2.0");
+        assert_eq!(gemma.format, "gguf");
+        assert_eq!(gemma.quantization, "q4_k_m");
+        assert!(gemma.multimodal);
+        assert_eq!(
+            gemma.expected_local_path,
+            "local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf"
         );
     }
 }

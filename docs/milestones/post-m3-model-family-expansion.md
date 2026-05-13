@@ -22,6 +22,10 @@ Qwen3.5:
 
 - Official Hugging Face model cards exist under the `Qwen/` namespace, including
   `Qwen/Qwen3.5-35B-A3B`.
+- MF.1 pins `Qwen/Qwen3.5-35B-A3B-FP8` at revision
+  `9d1823d2dee688a6b25e77009dc727688c44936e` as the first Qwen3.5
+  compatibility-discovery artifact. The base non-FP8 repo was observed at
+  `59d61f3ce65a6d9863b86d2e96597125219dc754` at pin time.
 - The Qwen3.5 model card describes a unified vision-language foundation and an
   efficient hybrid architecture using Gated Delta Networks plus sparse
   Mixture-of-Experts.
@@ -31,11 +35,19 @@ Gemma4:
 
 - Official Google Hugging Face model cards exist, including
   `google/gemma-4-E4B`.
+- MF.1 pins `bartowski/google_gemma-4-E4B-it-GGUF` at revision
+  `c04cb322fd63e347db759a08b6249b867488ccf8` for
+  `google_gemma-4-E4B-it-Q4_K_M.gguf`. The base `google/gemma-4-E4B-it` repo
+  was observed at `3555bddc93a623db8887dd2e52123facc45ade77` at pin time.
 - Gemma4 models are multimodal. The small E2B/E4B models include native audio
   support; all generate text output.
 - The local Gemma4 GGUF artifact inspected during post-M3 reconnaissance is
   quantized GGUF v3 with `general.architecture = gemma4`, embedded tokenizer
   metadata, sliding-window/shared-KV metadata, and Gemma-specific softcapping.
+- MF.2 adds `ocelotl_loader::inspect_gguf`, a bounded header-only GGUF v3
+  inspector that normalizes metadata and tensor descriptors into Ocelotl-owned
+  structs without reading tensor payload bytes. The ignored local proof passed
+  against `google_gemma-4-E4B-it-Q4_K_M.gguf` on 2026-05-13.
 
 ## Boundary
 
@@ -132,4 +144,3 @@ artifact paths.
   correctness requirements.
 - Large artifacts can make default tests slow or non-portable if not kept behind
   local-artifact gates.
-

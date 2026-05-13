@@ -15,6 +15,7 @@ but it should not provide less than this baseline.
 | M7 Continuous Batching | Scheduler ordering tests, cancellation tests, batched/unbatched parity. |
 | M8 Server API | API request validation, runtime error mapping, streaming lifecycle tests. |
 | Post-M3 Whisper ASR | Audio metadata/log-mel tests, tokenizer startup/mask tests, tiny synthetic Whisper path tests, ignored local-artifact parity harness. |
+| Post-M3 Model-Family Expansion | Target-artifact manifest tests, GGUF header-only inspection tests, family-specific metadata rejection tests. |
 
 ## Validation Tiers
 
@@ -165,6 +166,19 @@ paged-attention kernels, and throughput-oriented batching remain later work.
 
 Senior local proof: `cargo test --workspace` passed with **310 default tests +
 8 doctests**. The **9 ignored tests** remain opt-in local-artifact/GPU checks.
+
+## Post-M3 Model-Family Expansion Acceptance Traceability
+
+This track is open. The table below captures the first inspect/reject slice for
+Qwen3.5 and Gemma4 without claiming runtime support for either family.
+
+| # | Acceptance criterion | Test(s) proving it | Status |
+| - | -------------------- | ------------------ | ------ |
+| 1 | Qwen3.5 and Gemma4 each have a pinned candidate artifact and documented source. | `ocelotl_loader::tests::post_m3_model_family_target_manifest_pins_qwen3_5_and_gemma4` validates `fixtures/manifest/post_m3_model_family_targets.json`, including repository, revision SHA, license, format, quantization, multimodal flag, and expected local path. | green |
+| 2 | Gemma4 GGUF header metadata is normalized into an Ocelotl-owned manifest without reading tensor payloads. | `ocelotl_loader::gguf_inspect::tests::inspect_gguf_parses_minimal_v3_manifest_without_payload_read` parses a tiny synthetic GGUF v3 fixture with scalar metadata, tokenizer array metadata, and one tensor descriptor into `GgufManifest`. | green |
+| 3 | Malformed GGUF headers fail with typed errors. | `ocelotl_loader::gguf_inspect::tests::{inspect_gguf_returns_io_error_when_file_does_not_exist,inspect_gguf_rejects_truncated_header_with_invalid_model,inspect_gguf_rejects_unsupported_version_with_typed_unsupported,inspect_gguf_rejects_bad_tensor_offset_before_payload_read,inspect_gguf_rejects_oversized_metadata_string,inspect_gguf_rejects_unaligned_tensor_offsets}` cover missing files, truncation, unsupported versions, invalid offsets, metadata bounds, and alignment. | green |
+| 4 | Real Gemma4 GGUF inspection remains opt-in and local-artifact gated. | `ocelotl_loader::gguf_inspect::tests::local_gemma4_q4_k_m_gguf_header_contract_is_well_formed` is `#[ignore]`'d and resolves either `local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf` or `OCELOTL_GEMMA4_GGUF_PATH`. Senior local proof on 2026-05-13 passed against `D:\Dev\ideas\04-granola-ai-clone\models\google_gemma-4-E4B-it-Q4_K_M.gguf` in 1.37s. | green (local opt-in) |
+| 5 | Unsupported Qwen3.5/Gemma4 execution features fail before compute. | Pending MF.3-MF.5. MF.1/MF.2 only pin artifacts and inspect GGUF headers; they deliberately do not add model-family execution. | pending |
 
 ## Post-M3 Whisper ASR Acceptance Traceability
 
