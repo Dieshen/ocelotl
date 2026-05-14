@@ -28,6 +28,7 @@ struct BenchWhisperArgs {
     expected_tokens_path: PathBuf,
     tokenizer_path: Option<PathBuf>,
     cpu_kernel_mode: CpuKernelMode,
+    cpu_threads: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,7 +192,7 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!(
-        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized]"
+        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized] [--cpu-threads <n>]"
     );
     println!(
         "  fetch hf --repo <repo> --revision <sha> --local-dir <path> [--include <pattern> ...] [--execute]"
@@ -205,6 +206,7 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
     let mut expected_tokens_path = None;
     let mut tokenizer_path = None;
     let mut cpu_kernel_mode = CpuKernelMode::Scalar;
+    let mut cpu_threads: usize = 1;
     let mut iter = args.into_iter();
 
     while let Some(flag) = iter.next() {
@@ -218,6 +220,7 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
             "--expected-tokens-path" => expected_tokens_path = Some(PathBuf::from(value)),
             "--tokenizer-path" => tokenizer_path = Some(PathBuf::from(value)),
             "--cpu-kernel-mode" => cpu_kernel_mode = parse_cpu_kernel_mode(&value)?,
+            "--cpu-threads" => cpu_threads = parse_cpu_threads(&value)?,
             _ => {
                 return Err(format!(
                     "unsupported bench-whisper-transcribe flag {flag:?}"
@@ -233,7 +236,18 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
         expected_tokens_path: expected_tokens_path.ok_or("missing --expected-tokens-path")?,
         tokenizer_path,
         cpu_kernel_mode,
+        cpu_threads,
     })
+}
+
+fn parse_cpu_threads(value: &str) -> Result<usize, String> {
+    let parsed: usize = value
+        .parse()
+        .map_err(|_| format!("invalid --cpu-threads value {value:?}; expected a positive integer"))?;
+    if parsed == 0 {
+        return Err("--cpu-threads must be >= 1".to_string());
+    }
+    Ok(parsed)
 }
 
 fn parse_cpu_kernel_mode(value: &str) -> Result<CpuKernelMode, String> {
@@ -398,7 +412,8 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
     let expected_tokens_read_ms = expected_started.elapsed().as_millis();
 
     let tensor_started = Instant::now();
-    let kernels = CpuKernelBackend::with_mode(args.cpu_kernel_mode);
+    let kernels = CpuKernelBackend::with_mode_and_threads(args.cpu_kernel_mode, args.cpu_threads)
+        .map_err(|err| format!("failed to build CPU kernel backend - {err:?}"))?;
     let model = WhisperModel::with_kernel_backend(
         whisper_config.clone(),
         load_required_whisper_tensors(&args.model_path, &whisper_config)?,
@@ -462,6 +477,7 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
     let output = bench_whisper_output(
         matches_expected,
         args.cpu_kernel_mode,
+        args.cpu_threads,
         &generated,
         text_output.text.as_deref(),
         &timings,
@@ -478,6 +494,7 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
 fn bench_whisper_output(
     matches_expected: bool,
     cpu_kernel_mode: CpuKernelMode,
+    cpu_threads: usize,
     generated: &[TokenId],
     transcript_text: Option<&str>,
     timings: &BenchWhisperTimings,
@@ -491,6 +508,7 @@ fn bench_whisper_output(
         "text": transcript_text,
         "matches_expected": matches_expected,
         "cpu_kernel_mode": cpu_kernel_mode.as_str(),
+        "cpu_threads": cpu_threads,
         "resident_model_ms": {
             "audio_to_tokens": timings.resident_audio_to_tokens_ms(),
             "mel_to_tokens": timings.resident_mel_to_tokens_ms(),
@@ -834,11 +852,17 @@ mod tests {
         let default_args =
             parse_bench_args(base.iter().copied().map(str::to_string)).expect("default args");
         assert_eq!(default_args.cpu_kernel_mode, CpuKernelMode::Scalar);
+        assert_eq!(default_args.cpu_threads, 1);
 
         let mut optimized = base.iter().copied().map(str::to_string).collect::<Vec<_>>();
         optimized.extend(["--cpu-kernel-mode".to_string(), "optimized".to_string()]);
         let optimized_args = parse_bench_args(optimized).expect("optimized args");
         assert_eq!(optimized_args.cpu_kernel_mode, CpuKernelMode::Optimized);
+
+        let mut with_threads = base.iter().copied().map(str::to_string).collect::<Vec<_>>();
+        with_threads.extend(["--cpu-threads".to_string(), "4".to_string()]);
+        let threaded_args = parse_bench_args(with_threads).expect("threaded args");
+        assert_eq!(threaded_args.cpu_threads, 4);
 
         let mut with_tokenizer = base.iter().copied().map(str::to_string).collect::<Vec<_>>();
         with_tokenizer.extend(["--tokenizer-path".to_string(), "tokenizer.json".to_string()]);
@@ -938,6 +962,7 @@ mod tests {
         let output = bench_whisper_output(
             true,
             CpuKernelMode::Optimized,
+            4,
             &[TokenId(50257), TokenId(50362)],
             Some("example transcript"),
             &timings,
@@ -945,6 +970,7 @@ mod tests {
 
         assert_eq!(output["status"], "completed");
         assert_eq!(output["cpu_kernel_mode"], "optimized");
+        assert_eq!(output["cpu_threads"], 4);
         assert_eq!(output["elapsed_ms"], 100);
         assert_eq!(output["token_count"], 2);
         assert_eq!(output["text"], "example transcript");

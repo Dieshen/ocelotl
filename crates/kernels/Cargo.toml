@@ -16,3 +16,4 @@ cubecl-wgpu = ["cubecl", "cubecl/wgpu"]
 [dependencies]
 cubecl = { version = "0.10.0", default-features = false, optional = true }
 ocelotl-core.workspace = true
+rayon = "1.10"

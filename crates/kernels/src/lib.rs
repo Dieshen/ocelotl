@@ -72,6 +72,15 @@ pub trait KernelBackend: Debug + Send + Sync {
     fn name(&self) -> &'static str;
     fn context(&self) -> &KernelContext;
 
+    /// Borrow the backend's CPU thread pool, if any. Default `None`. CPU-side
+    /// helpers (e.g. Whisper's attention outer loop) can use this to launch a
+    /// parallel walk on the same pool the backend uses internally. GPU
+    /// backends keep the default `None` because no host-side parallelism
+    /// applies.
+    fn cpu_thread_pool(&self) -> Option<&rayon::ThreadPool> {
+        None
+    }
+
     fn matmul(
         &self,
         a: &[f32],
@@ -156,6 +165,10 @@ pub fn optimized_cpu_kernel_backend() -> SharedKernelBackend {
 pub struct CpuKernelBackend {
     context: KernelContext,
     mode: CpuKernelMode,
+    /// Optional thread pool. `None` means single-threaded execution, which is
+    /// the parity oracle the default tests rely on. A pool is built when the
+    /// caller asks for `threads >= 2` via `with_mode_and_threads`.
+    pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl Default for CpuKernelBackend {
@@ -179,11 +192,44 @@ impl CpuKernelBackend {
                 device: Device::Cpu,
             },
             mode,
+            pool: None,
         }
+    }
+
+    /// Construct a backend that runs hot kernels (currently `linear_out_by_in`
+    /// and any caller that opts in via `cpu_thread_pool()`) across `threads`
+    /// worker threads. `threads <= 1` is equivalent to `with_mode`. The pool
+    /// is built once and reused for the lifetime of this backend.
+    pub fn with_mode_and_threads(mode: CpuKernelMode, threads: usize) -> Result<Self> {
+        if threads <= 1 {
+            return Ok(Self::with_mode(mode));
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("ocelotl-cpu-{i}"))
+            .build()
+            .map_err(|err| {
+                OcelotlError::Kernel(KernelError {
+                    backend: "cpu".to_string(),
+                    message: format!("failed to build rayon thread pool: {err}"),
+                })
+            })?;
+        Ok(Self {
+            context: KernelContext {
+                device: Device::Cpu,
+            },
+            mode,
+            pool: Some(Arc::new(pool)),
+        })
     }
 
     pub fn mode(&self) -> CpuKernelMode {
         self.mode
+    }
+
+    /// Number of worker threads, or 1 if running serially.
+    pub fn num_threads(&self) -> usize {
+        self.pool.as_ref().map_or(1, |p| p.current_num_threads())
     }
 
     pub fn matmul(
@@ -211,6 +257,21 @@ impl CpuKernelBackend {
         bias: Option<&[f32]>,
         out: &mut [f32],
     ) -> Result<()> {
+        if let Some(pool) = &self.pool {
+            if rows >= PARALLEL_LINEAR_MIN_ROWS {
+                return linear_out_by_in_parallel(
+                    pool,
+                    self.mode,
+                    x,
+                    rows,
+                    in_features,
+                    weight_out_by_in,
+                    out_features,
+                    bias,
+                    out,
+                );
+            }
+        }
         match self.mode {
             CpuKernelMode::Scalar => linear_out_by_in(
                 x,
@@ -277,6 +338,10 @@ impl KernelBackend for CpuKernelBackend {
 
     fn context(&self) -> &KernelContext {
         &self.context
+    }
+
+    fn cpu_thread_pool(&self) -> Option<&rayon::ThreadPool> {
+        self.pool.as_deref()
     }
 
     fn matmul(
@@ -676,7 +741,24 @@ fn linear_out_by_in(
         bias,
         out,
     )?;
+    linear_out_by_in_compute(x, rows, in_features, weight_out_by_in, out_features, bias, out);
+    Ok(())
+}
 
+/// Compute body for the scalar tiled `linear_out_by_in`. Inputs are assumed
+/// pre-validated. Splits naturally over disjoint output-row chunks, so the
+/// parallel dispatcher can call this per chunk with its slice of `x` and `out`
+/// and the K-loop accumulation order stays identical to the serial path
+/// (parity oracle for threaded runs).
+fn linear_out_by_in_compute(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) {
     let tiled_rows = rows - (rows % 4);
     let tiled_out = out_features - (out_features % 4);
 
@@ -817,7 +899,6 @@ fn linear_out_by_in(
             out_row[out_dim] = acc;
         }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -839,7 +920,29 @@ fn linear_out_by_in_optimized(
         bias,
         out,
     )?;
+    linear_out_by_in_optimized_compute(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    );
+    Ok(())
+}
 
+/// Compute body for the optimized `linear_out_by_in`. Inputs are assumed
+/// pre-validated.
+fn linear_out_by_in_optimized_compute(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) {
     for row in 0..rows {
         let out_row = &mut out[row * out_features..(row + 1) * out_features];
         match bias {
@@ -854,6 +957,89 @@ fn linear_out_by_in_optimized(
             }
         }
     }
+}
+
+/// Below this row count, single-threaded execution beats the rayon dispatch
+/// overhead. Tuned for the Whisper encoder where M = audio_ctx (>=1500 for
+/// all classic sizes); decoder single-token decode has rows=1 and stays
+/// serial regardless of pool configuration.
+const PARALLEL_LINEAR_MIN_ROWS: usize = 32;
+
+/// Parallel dispatcher for `linear_out_by_in`. Partitions the input/output
+/// row range across the rayon pool, validates once, and calls the chosen
+/// compute helper on each chunk. Each chunk writes a disjoint slice of `out`
+/// and reads a disjoint slice of `x`, so the result is bit-identical to the
+/// serial path (no cross-thread accumulation reorder).
+#[allow(clippy::too_many_arguments)]
+fn linear_out_by_in_parallel(
+    pool: &rayon::ThreadPool,
+    mode: CpuKernelMode,
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    validate_linear_out_by_in(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )?;
+
+    let threads = pool.current_num_threads().max(1);
+    // Align chunk size to a 4-row boundary so each chunk's scalar tile loop
+    // hits its tiled fast path before falling back to the 1-row tail. The
+    // last chunk may be shorter; that is fine because the compute helpers
+    // accept any row count.
+    let tile = 4usize;
+    let tiles_total = rows.div_ceil(tile);
+    let tiles_per_chunk = tiles_total.div_ceil(threads).max(1);
+    let rows_per_chunk = tiles_per_chunk * tile;
+
+    let chunk_out_len = rows_per_chunk * out_features;
+    let chunk_x_len = rows_per_chunk * in_features;
+
+    pool.install(|| {
+        out.par_chunks_mut(chunk_out_len)
+            .enumerate()
+            .for_each(|(idx, out_chunk)| {
+                let row_start = idx * rows_per_chunk;
+                let chunk_rows = out_chunk.len() / out_features;
+                let x_start = row_start * in_features;
+                let x_chunk = &x[x_start..x_start + chunk_rows * in_features];
+                debug_assert_eq!(out_chunk.len(), chunk_rows * out_features);
+                debug_assert!(chunk_x_len >= chunk_rows * in_features);
+                match mode {
+                    CpuKernelMode::Scalar => linear_out_by_in_compute(
+                        x_chunk,
+                        chunk_rows,
+                        in_features,
+                        weight_out_by_in,
+                        out_features,
+                        bias,
+                        out_chunk,
+                    ),
+                    CpuKernelMode::Optimized => linear_out_by_in_optimized_compute(
+                        x_chunk,
+                        chunk_rows,
+                        in_features,
+                        weight_out_by_in,
+                        out_features,
+                        bias,
+                        out_chunk,
+                    ),
+                }
+            });
+    });
+
     Ok(())
 }
 
@@ -1303,6 +1489,79 @@ mod tests {
         }
 
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn threaded_linear_out_by_in_matches_serial_bit_for_bit() {
+        // Parity oracle for the rayon parallel dispatch. Each chunk writes
+        // disjoint output rows; the K-loop accumulation order inside a chunk
+        // is identical to the serial path, so the threaded output must be
+        // bit-identical to the serial output. A run that drifts here would
+        // indicate either a chunk boundary bug or that the compute helper
+        // does not match the legacy path.
+        let rows = 64usize; // > PARALLEL_LINEAR_MIN_ROWS so the pool dispatches
+        let in_features = 17;
+        let out_features = 13;
+        let x: Vec<f32> = (0..(rows * in_features))
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let w: Vec<f32> = (0..(out_features * in_features))
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let b: Vec<f32> = (0..out_features).map(|i| (i as f32) * 0.05).collect();
+
+        let mut serial = vec![0.0_f32; rows * out_features];
+        let serial_backend = CpuKernelBackend::scalar();
+        serial_backend
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut serial)
+            .expect("serial linear must succeed");
+
+        let mut threaded = vec![0.0_f32; rows * out_features];
+        let threaded_backend = CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .expect("4-thread backend must build");
+        threaded_backend
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut threaded,
+            )
+            .expect("threaded linear must succeed");
+
+        assert_eq!(
+            serial, threaded,
+            "threaded linear_out_by_in must produce bit-identical output to serial"
+        );
+    }
+
+    #[test]
+    fn threaded_linear_out_by_in_falls_back_to_serial_for_small_inputs() {
+        // Rows below PARALLEL_LINEAR_MIN_ROWS must skip the pool dispatch.
+        // We can't observe that directly, but we can confirm the small path
+        // still produces the same result as the serial backend.
+        let rows = 3usize;
+        let in_features = 5;
+        let out_features = 4;
+        let x: Vec<f32> = (0..(rows * in_features)).map(|i| (i as f32) * 0.1).collect();
+        let w: Vec<f32> = (0..(out_features * in_features))
+            .map(|i| (i as f32) * -0.07)
+            .collect();
+
+        let mut serial = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::scalar()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut serial)
+            .unwrap();
+
+        let mut threaded = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .unwrap()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut threaded)
+            .unwrap();
+
+        assert_eq!(serial, threaded);
     }
 
     #[test]
