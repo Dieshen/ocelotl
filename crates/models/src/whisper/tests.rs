@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 use ocelotl_core::{DType, TokenId};
 use ocelotl_kernels::default_kernel_backend;
 
-use super::super::{WhisperConfig, required_whisper_tensor_names};
+use super::{WhisperConfig, required_whisper_tensor_names};
 use super::WhisperModel;
 use super::primitives::{
     attention, attention_incremental_from_projected, attention_with_precomputed_kv, conv1d, gelu,

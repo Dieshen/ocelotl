@@ -11,7 +11,7 @@ use ocelotl_core::{Result, TokenId};
 use ocelotl_kernels::{KernelBackend, default_kernel_backend};
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 
-use super::super::{WhisperConfig, parse_whisper_config_json, required_whisper_tensor_names};
+use super::{WhisperConfig, parse_whisper_config_json, required_whisper_tensor_names};
 use super::state::{WhisperDecoderState, WhisperEncodedAudio};
 use super::weights::WhisperWeights;
 use super::{checked_len_product, invalid_request};
@@ -71,7 +71,7 @@ impl WhisperModel {
         })?;
         let config = parse_whisper_config_json(&raw)?;
         let manifest = inspect_safetensors(model_path)?;
-        super::super::validate_whisper_tensors(&manifest, &config, Some(model_path))?;
+        super::validate_whisper_tensors(&manifest, &config, Some(model_path))?;
         let names = required_whisper_tensor_names(&config);
         let tensors = load_safetensors_tensors_f32(model_path, &names)?;
         Self::with_kernel_backend(config, tensors, kernels)

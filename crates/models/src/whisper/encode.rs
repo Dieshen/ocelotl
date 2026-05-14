@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use ocelotl_core::Result;
 
-use super::super::WhisperConfig;
+use super::WhisperConfig;
 use super::model::{WhisperModel, validate_audio_request};
 use super::primitives::{
     add_inplace, add_positional_embedding, attention, conv_output_len, conv1d, gelu_inplace,
