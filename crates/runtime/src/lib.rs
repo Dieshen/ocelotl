@@ -1,16 +1,30 @@
 //! Request lifecycle and generation runtime.
 
 mod kv_cache;
+mod qwen;
 mod sampling;
 mod scheduler;
+mod whisper;
 mod whisper_streaming;
 
+use std::sync::Arc;
+
 pub use kv_cache::{ContiguousKvCache, PagedKvCache, PagedKvCacheAllocator, qwen2_5_kv_layout};
+pub use qwen::{
+    Qwen2_5ContiguousCacheState, Qwen2_5PagedCacheState, decode_one_token,
+    decode_one_token_with_contiguous_cache, decode_one_token_with_paged_cache, prefill,
+    prepare_qwen2_5_contiguous_cache, prepare_qwen2_5_paged_cache,
+};
 pub use sampling::greedy_sample;
 pub use scheduler::{
     ContinuousBatchScheduler, GreedyDecodeModel, QwenGreedyModel, ScheduledGenerationRequest,
     ScheduledGenerationResponse, SchedulerConfig, SchedulerEvent, SchedulerRequestState,
     generate_qwen_batch,
+};
+pub use whisper::{
+    TranscriptionRequest, TranscriptionResponse, WhisperDecodeRequest, WhisperTranscriptionRequest,
+    WhisperTranscriptionResponse, WhisperTranscriptionState, decode_whisper_transcription,
+    prepare_whisper_transcription, transcribe, transcribe_whisper,
 };
 pub use whisper_streaming::{
     ChunkedTranscriptionRequest, TranscriptionChunk, TranscriptionChunkingConfig,
@@ -18,16 +32,13 @@ pub use whisper_streaming::{
 };
 
 use ocelotl_core::{
-    GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, RuntimeError,
-    TokenId, UnsupportedError,
+    GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId,
+    UnsupportedError,
 };
 #[cfg(feature = "cubecl-wgpu")]
 use ocelotl_kernels::CubeClKernelBackend;
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
-use ocelotl_models::whisper::audio::{AudioMetadata, log_mel_spectrogram, validate_audio_metadata};
-use ocelotl_models::whisper::{WhisperEncodedAudio, WhisperModel, WhisperTinyModel};
 use ocelotl_models::{Qwen2_5Config, Qwen2_5Model, Qwen2_5Weights, tiny_synthetic_forward};
-use ocelotl_tokenizer::{WhisperDecodeMask, WhisperTokenMaskDecision};
 use serde::{Deserialize, Serialize};
 
 // Re-export the response vocabulary type so callers can
@@ -44,75 +55,6 @@ pub use ocelotl_core::GenerateResponse;
 pub struct GenerateRequest {
     pub prompt_tokens: Vec<TokenId>,
     pub options: GenerationOptions,
-}
-
-/// A Whisper transcription request after audio loading and tokenizer startup
-/// policy have already run.
-///
-/// Runtime accepts raw mono samples and decoder prompt token IDs. Text decoding
-/// is deliberately out of scope for W-ASR.6: the tokenizer crate owns Whisper
-/// special-token policy and future token-to-text behavior.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranscriptionRequest {
-    pub audio_samples: Vec<f32>,
-    pub audio_metadata: AudioMetadata,
-    pub decoder_prompt_tokens: Vec<TokenId>,
-}
-
-/// One synthetic Whisper decode step through the runtime API.
-///
-/// `tokens` is the greedy-selected next token. `logits` is returned alongside
-/// it so early ASR tests can pin the model/runtime shape before text decoding
-/// exists.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranscriptionResponse {
-    pub tokens: Vec<TokenId>,
-    pub logits: Vec<f32>,
-}
-
-/// Real Whisper transcription request for an autoregressive token loop.
-///
-/// The tokenizer layer still owns startup-token construction and timestamp
-/// masking policy. Runtime receives the already-tokenized prompt, decode mask,
-/// and stop token, then owns audio preprocessing, encoded-audio state, and the
-/// decode lifecycle.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WhisperTranscriptionRequest {
-    pub audio_samples: Vec<f32>,
-    pub audio_metadata: AudioMetadata,
-    pub decode: WhisperDecodeRequest,
-}
-
-/// Real Whisper decoder controls after tokenization and policy selection.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WhisperDecodeRequest {
-    pub decoder_prompt_tokens: Vec<TokenId>,
-    pub max_new_tokens: usize,
-    pub decode_mask: WhisperDecodeMask,
-    pub stop_token: TokenId,
-}
-
-/// Runtime-owned Whisper state that is invariant across token decode steps.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WhisperTranscriptionState {
-    encoded_audio: WhisperEncodedAudio,
-}
-
-impl WhisperTranscriptionState {
-    pub fn encoded_audio(&self) -> &WhisperEncodedAudio {
-        &self.encoded_audio
-    }
-}
-
-/// Tokens produced by a real Whisper autoregressive transcription loop.
-///
-/// `tokens` contains only newly generated tokens, not the startup prompt. The
-/// caller can concatenate `decoder_prompt_tokens + tokens` when it needs the
-/// full model sequence for parity fixtures.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WhisperTranscriptionResponse {
-    pub tokens: Vec<TokenId>,
-    pub logits: Vec<f32>,
 }
 
 /// Validate a generation request against the loaded model's metadata before
@@ -212,398 +154,6 @@ pub fn generate_one_token(
     })
 }
 
-/// Run prefill on the given model and return final-position logits.
-///
-/// This is the public M3.7 entry point. It is a thin shim over
-/// `Qwen2_5Model::prefill` that exists so callers (server code, tests,
-/// future decoder loops) reach prefill through `ocelotl_runtime::prefill`
-/// rather than reaching directly into the model crate. The shape of this
-/// API is intentionally model-typed for now: M3 targets only Qwen2.5.
-/// When a second model family lands, this will become a method on a
-/// `CausalLanguageModel` trait. Until then, generic abstraction would be
-/// premature (the M3 design doc's "keep generic abstractions minimal until
-/// a second family is implemented" line).
-///
-/// # Errors
-///
-/// Propagates `OcelotlError` from the model's prefill verbatim:
-/// - `InvalidRequest` for empty prompts, out-of-range token ids, or
-///   prompt length exceeding `context_length`.
-/// - `Kernel` for unreachable shape violations (would indicate the
-///   `Qwen2_5Model::new` length checks have a bug).
-pub fn prefill(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<Vec<f32>> {
-    model.prefill(tokens)
-}
-
-/// Run one decode step: prefill the prompt, sample the next token greedily,
-/// return that token id.
-///
-/// This is the public M3.8 entry point. It is the minimum composition of
-/// two existing public APIs:
-///
-/// 1. `runtime::prefill` (M3.7) -- final-position logits for the prompt.
-/// 2. `runtime::greedy_sample` (M1.8) -- argmax over the logits with a
-///    lowest-token-id tie-break.
-///
-/// # Why call `runtime::prefill` rather than `Qwen2_5Model::prefill` directly
-///
-/// The M3.8 brief's "Done when" line is "decode does not bypass runtime or
-/// model APIs used by prefill". Going through the runtime's own `prefill`
-/// shim keeps a single hop between the public decode API and the model:
-/// any future addition to the runtime's `prefill` (cache plumbing,
-/// tracing, request-state hooks) is automatically inherited by decode.
-/// Reaching into `Qwen2_5Model::prefill` directly here would create a
-/// second path that those hooks would silently miss.
-///
-/// # State handling (no KV cache)
-///
-/// M3 is the correctness-first reference path. This function does not
-/// reuse any prefill state across calls -- each call to `decode_one_token`
-/// pays the full O(prompt_len) prefill cost. KV-cache reuse is M5/M6
-/// work and will land as a separate API (likely `decode_with_cache`)
-/// rather than complicating this signature now. The current shape
-/// (`(&Qwen2_5Model, &[TokenId]) -> Result<TokenId>`) is intentionally
-/// thin so a future cache-aware path can be added alongside without
-/// breaking callers.
-///
-/// # Errors
-///
-/// Propagates errors from the composed APIs verbatim:
-/// - `InvalidRequest` from `runtime::prefill` for empty prompts,
-///   out-of-range token ids, or prompt length exceeding `context_length`.
-/// - `Runtime` from `greedy_sample` if the logits vector is empty
-///   (unreachable with a validly constructed model -- `vocab_size > 0`
-///   is enforced at `Qwen2_5Config::try_from`).
-pub fn decode_one_token(model: &Qwen2_5Model, tokens: &[TokenId]) -> Result<TokenId> {
-    let logits = prefill(model, tokens)?;
-    greedy_sample(&logits)
-}
-
-/// Runtime-owned contiguous Qwen2.5 cache state.
-///
-/// `last_logits` is the sampling surface for the next token. The cache stores
-/// K/V for every token already consumed by the model. Keeping both together in
-/// runtime prevents callers from mixing logits from one request with cache
-/// storage from another request.
-#[derive(Debug, Clone)]
-pub struct Qwen2_5ContiguousCacheState {
-    cache: ContiguousKvCache,
-    last_logits: Vec<f32>,
-}
-
-impl Qwen2_5ContiguousCacheState {
-    pub fn cache(&self) -> &ContiguousKvCache {
-        &self.cache
-    }
-
-    pub fn last_logits(&self) -> &[f32] {
-        &self.last_logits
-    }
-
-    pub fn is_released(&self) -> bool {
-        self.cache.is_released()
-    }
-
-    pub fn release(&mut self) {
-        self.cache.release();
-        self.last_logits.clear();
-    }
-}
-
-/// Prefill a Qwen2.5 prompt and populate a request-scoped contiguous KV cache.
-pub fn prepare_qwen2_5_contiguous_cache(
-    model: &Qwen2_5Model,
-    tokens: &[TokenId],
-) -> Result<Qwen2_5ContiguousCacheState> {
-    let mut cache = ContiguousKvCache::for_qwen2_5(model.config())?;
-    let last_logits = model.prefill_with_cache(tokens, &mut cache)?;
-    Ok(Qwen2_5ContiguousCacheState { cache, last_logits })
-}
-
-/// Greedily sample one token from cached state, append its K/V, and return it.
-pub fn decode_one_token_with_contiguous_cache(
-    model: &Qwen2_5Model,
-    state: &mut Qwen2_5ContiguousCacheState,
-) -> Result<TokenId> {
-    let token = greedy_sample(&state.last_logits)?;
-    state.last_logits = model.decode_token_with_cache(token, &mut state.cache)?;
-    Ok(token)
-}
-
-/// Runtime-owned paged Qwen2.5 cache state.
-///
-/// The cache is optional only so `release_into` can return physical pages to
-/// the allocator exactly once while leaving a visible released state behind.
-#[derive(Debug, Clone)]
-pub struct Qwen2_5PagedCacheState {
-    cache: Option<PagedKvCache>,
-    last_logits: Vec<f32>,
-}
-
-impl Qwen2_5PagedCacheState {
-    pub fn cache(&self) -> Option<&PagedKvCache> {
-        self.cache.as_ref()
-    }
-
-    pub fn last_logits(&self) -> &[f32] {
-        &self.last_logits
-    }
-
-    pub fn is_released(&self) -> bool {
-        self.cache.is_none()
-    }
-
-    pub fn release_into(&mut self, allocator: &mut PagedKvCacheAllocator) {
-        if let Some(cache) = self.cache.take() {
-            allocator.release(cache);
-        }
-        self.last_logits.clear();
-    }
-}
-
-/// Prefill a Qwen2.5 prompt and populate a request-scoped paged KV cache.
-///
-/// Allocation happens in runtime, not in the model. If prefill fails after page
-/// allocation, the pages are returned before the error escapes.
-pub fn prepare_qwen2_5_paged_cache(
-    model: &Qwen2_5Model,
-    tokens: &[TokenId],
-    allocator: &mut PagedKvCacheAllocator,
-    capacity_tokens: usize,
-) -> Result<Qwen2_5PagedCacheState> {
-    if tokens.len() > capacity_tokens {
-        return Err(invalid_request(
-            "kv_cache.capacity",
-            &format!(
-                "prompt length {} exceeds requested paged cache capacity {capacity_tokens}",
-                tokens.len()
-            ),
-        ));
-    }
-
-    let mut cache = allocator.allocate(capacity_tokens)?;
-    match model.prefill_with_cache(tokens, &mut cache) {
-        Ok(last_logits) => Ok(Qwen2_5PagedCacheState {
-            cache: Some(cache),
-            last_logits,
-        }),
-        Err(err) => {
-            allocator.release(cache);
-            Err(err)
-        }
-    }
-}
-
-/// Greedily sample one token from paged cached state, append its K/V, and return it.
-pub fn decode_one_token_with_paged_cache(
-    model: &Qwen2_5Model,
-    state: &mut Qwen2_5PagedCacheState,
-) -> Result<TokenId> {
-    let token = greedy_sample(&state.last_logits)?;
-    let cache = state
-        .cache
-        .as_mut()
-        .ok_or_else(|| runtime_error("paged Qwen2.5 cache state has been released"))?;
-    state.last_logits = model.decode_token_with_cache(token, cache)?;
-    Ok(token)
-}
-
-/// Run one synthetic Whisper transcription step through the runtime boundary.
-///
-/// W-ASR.6 keeps this intentionally narrow: runtime validates request-owned
-/// audio shape, calls the Whisper log-mel reference path, reaches the
-/// `WhisperTinyModel::forward` public model API, and greedily selects one next
-/// token. Multi-token decode, timestamp policy, and token-to-text decoding are
-/// future tokenizer/runtime work.
-pub fn transcribe(
-    model: &WhisperTinyModel,
-    request: &TranscriptionRequest,
-) -> Result<TranscriptionResponse> {
-    validate_transcription_request(request)?;
-    let mel = log_mel_spectrogram(&request.audio_samples, request.audio_metadata)?;
-    let logits = model.forward(&mel, &request.decoder_prompt_tokens)?;
-    let token = greedy_sample(&logits)?;
-
-    Ok(TranscriptionResponse {
-        tokens: vec![token],
-        logits,
-    })
-}
-
-/// Prepare real Whisper audio state once for a transcription request.
-///
-/// This is the W-ASR.21 public runtime seam: audio validation and log-mel
-/// preprocessing happen once, `WhisperModel::encode_audio_features` produces
-/// encoded audio once, and the returned state can be reused by every token
-/// decode step for that audio window.
-pub fn prepare_whisper_transcription(
-    model: &WhisperModel,
-    request: &WhisperTranscriptionRequest,
-) -> Result<WhisperTranscriptionState> {
-    validate_whisper_transcription_request(request)?;
-    let mel = log_mel_spectrogram(&request.audio_samples, request.audio_metadata)?;
-    let encoded_audio = model.encode_audio_features(&mel.values, mel.frames)?;
-    Ok(WhisperTranscriptionState { encoded_audio })
-}
-
-/// Decode real Whisper tokens from a prepared encoded-audio state.
-///
-/// This is the W-ASR.22 runtime path: callers can hold
-/// `WhisperTranscriptionState` and avoid recomputing the encoder for each
-/// generated token. W-ASR.27 also keeps a decoder state inside this loop so
-/// decoder self-attention K/V grows one token at a time instead of recomputing
-/// the full decoder prefix for every generated token.
-pub fn decode_whisper_transcription(
-    model: &WhisperModel,
-    state: &WhisperTranscriptionState,
-    request: &WhisperDecodeRequest,
-) -> Result<WhisperTranscriptionResponse> {
-    validate_whisper_decode_request(model, request)?;
-
-    let mut decoder_state = model
-        .prepare_decoder_state_from_audio(state.encoded_audio(), &request.decoder_prompt_tokens)?;
-    let mut tokens = Vec::with_capacity(request.max_new_tokens);
-    let mut logits = Vec::new();
-
-    for _ in 0..request.max_new_tokens {
-        logits = decoder_state.next_token_logits().to_vec();
-        let next = masked_greedy_sample(&logits, request.decode_mask)?;
-        tokens.push(next);
-        if next == request.stop_token {
-            break;
-        }
-        if tokens.len() < request.max_new_tokens {
-            model.append_decoder_token_from_audio(
-                state.encoded_audio(),
-                &mut decoder_state,
-                next,
-            )?;
-        }
-    }
-
-    Ok(WhisperTranscriptionResponse { tokens, logits })
-}
-
-/// Run real Whisper transcription through the runtime boundary.
-///
-/// This convenience wrapper composes `prepare_whisper_transcription` and
-/// `decode_whisper_transcription`, so the public path gets encoded-audio reuse
-/// even when the caller does not manage the state directly.
-pub fn transcribe_whisper(
-    model: &WhisperModel,
-    request: &WhisperTranscriptionRequest,
-) -> Result<WhisperTranscriptionResponse> {
-    validate_whisper_decode_request(model, &request.decode)?;
-    let state = prepare_whisper_transcription(model, request)?;
-    decode_whisper_transcription(model, &state, &request.decode)
-}
-
-fn validate_transcription_request(request: &TranscriptionRequest) -> Result<()> {
-    if request.audio_samples.is_empty() {
-        return Err(OcelotlError::InvalidRequest(InvalidRequestError {
-            field: "audio_samples".to_string(),
-            message: "must contain at least one sample".to_string(),
-        }));
-    }
-
-    validate_audio_metadata(request.audio_metadata)
-}
-
-fn validate_whisper_transcription_request(request: &WhisperTranscriptionRequest) -> Result<()> {
-    if request.audio_samples.is_empty() {
-        return Err(invalid_request(
-            "audio_samples",
-            "must contain at least one sample",
-        ));
-    }
-
-    validate_audio_metadata(request.audio_metadata)
-}
-
-fn validate_whisper_decode_request(
-    model: &WhisperModel,
-    request: &WhisperDecodeRequest,
-) -> Result<()> {
-    if request.decoder_prompt_tokens.is_empty() {
-        return Err(invalid_request(
-            "decoder_prompt_tokens",
-            "must contain at least one token",
-        ));
-    }
-    if request.max_new_tokens == 0 {
-        return Err(invalid_request(
-            "max_new_tokens",
-            "must be greater than zero",
-        ));
-    }
-
-    let total = request
-        .decoder_prompt_tokens
-        .len()
-        .checked_add(request.max_new_tokens)
-        .ok_or_else(|| {
-            invalid_request(
-                "decoder_context_length",
-                "decoder_prompt_tokens + max_new_tokens overflows usize",
-            )
-        })?;
-    if total > model.config().text_context_length {
-        return Err(invalid_request(
-            "decoder_context_length",
-            &format!(
-                "decoder_prompt_tokens ({}) + max_new_tokens ({}) = {} exceeds text_context_length ({})",
-                request.decoder_prompt_tokens.len(),
-                request.max_new_tokens,
-                total,
-                model.config().text_context_length,
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
-fn masked_greedy_sample(logits: &[f32], mask: WhisperDecodeMask) -> Result<TokenId> {
-    let mut best = None;
-    for (idx, &logit) in logits.iter().enumerate() {
-        let token = TokenId(u32::try_from(idx).map_err(|_| {
-            OcelotlError::Runtime(RuntimeError {
-                message: format!("logit index {idx} does not fit in TokenId"),
-            })
-        })?);
-        if mask.mask_token(token) == WhisperTokenMaskDecision::Suppress {
-            continue;
-        }
-        if best.is_none_or(|(_, best_logit)| logit > best_logit) {
-            best = Some((idx, logit));
-        }
-    }
-
-    let (idx, _) = best.ok_or_else(|| {
-        OcelotlError::Runtime(RuntimeError {
-            message: "Whisper decode mask suppressed every logit".to_string(),
-        })
-    })?;
-    Ok(TokenId(u32::try_from(idx).map_err(|_| {
-        OcelotlError::Runtime(RuntimeError {
-            message: format!("logit index {idx} does not fit in TokenId"),
-        })
-    })?))
-}
-
-fn invalid_request(field: &str, message: &str) -> OcelotlError {
-    OcelotlError::InvalidRequest(InvalidRequestError {
-        field: field.to_string(),
-        message: message.to_string(),
-    })
-}
-
-fn runtime_error(message: impl Into<String>) -> OcelotlError {
-    OcelotlError::Runtime(RuntimeError {
-        message: message.into(),
-    })
-}
-
 pub struct Runtime<B: KernelBackend = CpuKernelBackend> {
     backend: B,
 }
@@ -626,7 +176,7 @@ impl Runtime<CpuKernelBackend> {
         config: Qwen2_5Config,
         weights: Qwen2_5Weights,
     ) -> Result<Qwen2_5Model> {
-        Qwen2_5Model::with_cpu_kernel_backend(config, weights, self.backend.clone())
+        Qwen2_5Model::with_kernel_backend(config, weights, Arc::new(self.backend.clone()))
     }
 }
 
@@ -643,7 +193,7 @@ impl Runtime<CubeClKernelBackend> {
         config: Qwen2_5Config,
         weights: Qwen2_5Weights,
     ) -> Result<Qwen2_5Model> {
-        Qwen2_5Model::with_cubecl_wgpu_backend(config, weights, self.backend.clone())
+        Qwen2_5Model::with_kernel_backend(config, weights, Arc::new(self.backend.clone()))
     }
 }
 
@@ -769,10 +319,7 @@ mod tests {
             .qwen2_5_model(cfg, weights)
             .expect("runtime should construct Qwen model");
 
-        assert_eq!(
-            model.kernel_backend().mode(),
-            ocelotl_kernels::CpuKernelMode::Optimized
-        );
+        assert_eq!(model.kernel_backend().name(), "cpu");
         assert_eq!(
             model.execution_backend().context().device,
             ocelotl_core::Device::Cpu

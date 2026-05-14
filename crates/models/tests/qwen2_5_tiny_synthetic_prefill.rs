@@ -219,13 +219,15 @@ fn prefill_matches_pinned_fixture_within_tolerance() {
 #[test]
 #[ignore = "requires a CubeCL WGPU-capable local runtime"]
 fn cubecl_wgpu_prefill_matches_cpu_reference_within_tolerance() {
+    use std::sync::Arc;
+
     let cfg = tiny_config();
     let cpu =
         Qwen2_5Model::new(cfg.clone(), tiny_weights(&cfg)).expect("CPU tiny model must construct");
-    let cubecl = Qwen2_5Model::with_cubecl_wgpu_backend(
+    let cubecl = Qwen2_5Model::with_kernel_backend(
         cfg.clone(),
         tiny_weights(&cfg),
-        ocelotl_kernels::CubeClKernelBackend::new_gpu(0),
+        Arc::new(ocelotl_kernels::CubeClKernelBackend::new_gpu(0)),
     )
     .expect("CubeCL tiny model must construct");
 

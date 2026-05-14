@@ -26,6 +26,8 @@
 //!    `debug_assert!`. We do not extract a shared validation helper until ≥3
 //!    kernels share the same pattern.
 
+use std::{fmt::Debug, sync::Arc};
+
 pub mod rope;
 pub use rope::rope_apply_inplace;
 
@@ -66,9 +68,88 @@ pub struct KernelContext {
     pub device: Device,
 }
 
-pub trait KernelBackend: Send + Sync {
+pub trait KernelBackend: Debug + Send + Sync {
     fn name(&self) -> &'static str;
     fn context(&self) -> &KernelContext;
+
+    fn matmul(
+        &self,
+        a: &[f32],
+        a_shape: (usize, usize),
+        b: &[f32],
+        b_shape: (usize, usize),
+        out: &mut [f32],
+    ) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_out_by_in(
+        &self,
+        x: &[f32],
+        rows: usize,
+        in_features: usize,
+        weight_out_by_in: &[f32],
+        out_features: usize,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<()>;
+
+    fn rope_apply_inplace(
+        &self,
+        x: &mut [f32],
+        head_dim: usize,
+        position: usize,
+        theta: f32,
+    ) -> Result<()>;
+
+    fn rmsnorm(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        weight: &[f32],
+        epsilon: f32,
+        out: &mut [f32],
+    ) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_gated_silu(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+        gate_w: &[f32],
+        up_w: &[f32],
+        down_w: &[f32],
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<()>;
+
+    fn vec_add(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()>;
+}
+
+pub type SharedKernelBackend = Arc<dyn KernelBackend>;
+
+pub fn default_kernel_backend() -> SharedKernelBackend {
+    Arc::new(CpuKernelBackend::default())
+}
+
+pub fn optimized_cpu_kernel_backend() -> SharedKernelBackend {
+    Arc::new(CpuKernelBackend::optimized())
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +277,119 @@ impl KernelBackend for CpuKernelBackend {
 
     fn context(&self) -> &KernelContext {
         &self.context
+    }
+
+    fn matmul(
+        &self,
+        a: &[f32],
+        a_shape: (usize, usize),
+        b: &[f32],
+        b_shape: (usize, usize),
+        out: &mut [f32],
+    ) -> Result<()> {
+        CpuKernelBackend::matmul(self, a, a_shape, b, b_shape, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_out_by_in(
+        &self,
+        x: &[f32],
+        rows: usize,
+        in_features: usize,
+        weight_out_by_in: &[f32],
+        out_features: usize,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        CpuKernelBackend::linear_out_by_in(
+            self,
+            x,
+            rows,
+            in_features,
+            weight_out_by_in,
+            out_features,
+            bias,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        CpuKernelBackend::scaled_dot_product_attention(
+            self,
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            out,
+        )
+    }
+
+    fn rope_apply_inplace(
+        &self,
+        x: &mut [f32],
+        head_dim: usize,
+        position: usize,
+        theta: f32,
+    ) -> Result<()> {
+        rope_apply_inplace(x, head_dim, position, theta)
+    }
+
+    fn rmsnorm(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        weight: &[f32],
+        epsilon: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        rmsnorm::rmsnorm(x, rows, hidden, weight, epsilon, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_gated_silu(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+        gate_w: &[f32],
+        up_w: &[f32],
+        down_w: &[f32],
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        mlp::mlp_gated_silu(
+            x,
+            rows,
+            hidden,
+            intermediate,
+            gate_w,
+            up_w,
+            down_w,
+            gate_buf,
+            up_buf,
+            out,
+        )
+    }
+
+    fn vec_add(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()> {
+        vec_add(a, b, out)
     }
 }
 

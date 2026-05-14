@@ -121,3 +121,21 @@ The loader exposes two parsing entry points for model metadata:
 Both functions return `OcelotlError::Unsupported` when the architecture or
 dtype is outside the loader's allow-list, and `OcelotlError::InvalidModel`
 when required fields are missing or internally inconsistent.
+
+## Family Local Loaders
+
+Model-family crates may expose local convenience constructors such as
+`Qwen2_5Model::load_from_dir` or `WhisperModel::load_from_dir`, but those
+constructors do not own file-format parsing. They compose loader APIs:
+
+1. Read/parse model metadata through the appropriate loader or model-family
+   config parser.
+2. Inspect the artifact header with `ocelotl-loader`.
+3. Validate required tensor names, shapes, and dtypes before compute.
+4. Load tensor values through `ocelotl-loader`.
+5. Map those loaded tensors into model-family weight structs and kernel-ready
+   layouts.
+
+This keeps app-facing code from hand-assembling weights while preserving the
+crate boundary: loader owns artifact I/O and validation; models own family
+semantics and tensor layout adaptation.

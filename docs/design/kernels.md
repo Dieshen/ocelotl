@@ -51,13 +51,14 @@ The local execution proof uses `1e-5` tolerance against
 ## M4 Model/Runtime Path
 
 M4 wires the first GPU-backed kernel into the Qwen2.5 model path without
-claiming full-model GPU execution. `Qwen2_5KernelBackend::CubeClWgpu` advertises
-a CubeCL GPU execution backend and routes RoPE through CubeCL WGPU. Every other
-operation still goes through the CPU fallback backend.
+claiming full-model GPU execution. The selected `KernelBackend` advertises a
+CubeCL GPU execution backend and routes RoPE through CubeCL WGPU. Every other
+operation still goes through the kernel crate's CPU reference fallback.
 
 This split is deliberate:
 
-- It proves the model/runtime dispatch seam can select a non-CPU backend.
+- It proves the runtime/kernel dispatch seam can select a non-CPU backend
+  without making model-family code name concrete backends.
 - It preserves CPU as the parity oracle and default implementation.
 - It avoids forcing matmul or attention through an immature GPU abstraction
   before Ocelotl has explicit device-buffer and dtype layout contracts.

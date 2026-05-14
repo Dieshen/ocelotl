@@ -353,9 +353,33 @@ default-on; local artifacts = opt-in.
 
 ## 8. How To Fetch
 
-The project does not ship a fetch script. Each contributor runs the command
-manually so that the pinned SHA is visible at the call site (matching the
-regeneration discipline in `docs/validation/fixtures.md` § Regeneration).
+Artifact downloads are explicit. Model constructors such as
+`Qwen2_5Model::load_from_dir` and `WhisperModel::load_from_dir` never reach the
+network; they only load local files that already exist.
+
+The CLI ships a small planning helper around the official `huggingface-cli`.
+It prints the command by default and only downloads when `--execute` is passed,
+so the pinned SHA stays visible at the call site (matching the regeneration
+discipline in `docs/validation/fixtures.md` § Regeneration).
+
+Planning command:
+
+```powershell
+target/release/ocelotl.exe fetch hf `
+    --repo Qwen/Qwen2.5-0.5B-Instruct `
+    --revision <SHA> `
+    --local-dir local-artifacts/qwen2_5_0_5b_instruct
+```
+
+Execution command:
+
+```powershell
+target/release/ocelotl.exe fetch hf `
+    --repo Qwen/Qwen2.5-0.5B-Instruct `
+    --revision <SHA> `
+    --local-dir local-artifacts/qwen2_5_0_5b_instruct `
+    --execute
+```
 
 Recommended command, using the official `huggingface-cli`:
 

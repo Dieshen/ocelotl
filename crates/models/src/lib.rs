@@ -14,20 +14,12 @@ pub mod qwen;
 pub mod whisper;
 pub use gemma::{Gemma4Config, Gemma4Quantization};
 pub use qwen::{
-    Qwen2_5Config, Qwen2_5KernelBackend, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights,
-    Qwen3_5Config, parse_qwen3_5_config_json, required_tensor_names, transpose_2d,
-    validate_qwen2_5_tensors,
+    Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, Qwen3_5Config,
+    parse_qwen3_5_config_json, required_tensor_names, transpose_2d, validate_qwen2_5_tensors,
 };
 
-use ocelotl_core::{
-    GenerationOptions, InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId,
-};
+use ocelotl_core::{InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId};
 use ocelotl_kernels::matmul;
-
-pub trait CausalLanguageModel: Send + Sync {
-    fn info(&self) -> &ModelMetadata;
-    fn generate(&self, prompt: &[u32], options: &GenerationOptions) -> Result<Vec<u32>>;
-}
 
 /// A scale factor for the deterministic synthetic forward.
 ///

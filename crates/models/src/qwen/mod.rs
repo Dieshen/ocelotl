@@ -11,8 +11,6 @@ pub mod qwen2_5_tensors;
 pub mod qwen3_5;
 
 pub use qwen2_5::Qwen2_5Config;
-pub use qwen2_5_model::{
-    Qwen2_5KernelBackend, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
-};
+pub use qwen2_5_model::{Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d};
 pub use qwen2_5_tensors::{required_tensor_names, validate_qwen2_5_tensors};
 pub use qwen3_5::{Qwen3_5Config, parse_qwen3_5_config_json};

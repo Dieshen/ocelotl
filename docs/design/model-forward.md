@@ -9,7 +9,7 @@ models own architecture-specific math and tensor layout expectations.
 - Validate model metadata against implementation assumptions.
 - Apply model-specific operations such as RoPE, RMSNorm, gated MLPs, and logits
   transforms.
-- Expose clear kernel requirements to `ocelotl-kernels`.
+- Call low-level compute through the `ocelotl-kernels::KernelBackend` contract.
 
 ## Initial Shape
 
@@ -50,5 +50,22 @@ Unsupported behavior should fail at model construction time where possible.
 
 ## Non-Responsibilities
 
-Model code should not parse files, own HTTP APIs, or make global scheduling
-choices. It should not silently change tokenizer behavior.
+Model code should not parse file formats, own HTTP APIs, download artifacts, or
+make global scheduling choices. It should not silently change tokenizer
+behavior. It should not name concrete backend implementations such as CPU,
+CubeCL, or future GPU providers in model-family APIs; runtime, CLI, or callers
+select those backends and pass the kernel contract into the model.
+
+Family-level local loaders such as `Qwen2_5Model::load_from_dir` and
+`WhisperModel::load_from_dir` are allowed only as composition helpers: they call
+`ocelotl-loader` for file inspection/value loading, then perform
+model-family-specific tensor-name mapping, layout conversion, and construction.
+They must stay local-only and must not hide network access behind model
+construction.
+
+App-facing ergonomics belong in the top-level `ocelotl` crate. The initial
+facade stays deliberately small: `ocelotl::ChatModel` exposes local loading,
+message accumulation, message inspection, and text generation by composing
+loader, tokenizer, model, runtime, and kernel contracts. That facade must not
+move chat/session behavior into `ocelotl-models`, and it must still use
+explicit local artifacts.

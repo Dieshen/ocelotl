@@ -133,9 +133,9 @@ against previously captured GPU output.
   `ocelotl_kernels::rope_apply_inplace` at `1e-5`.
 - **Qwen prefill parity, opt-in local execution**:
   `crates/models/tests/qwen2_5_tiny_synthetic_prefill.rs::cubecl_wgpu_prefill_matches_cpu_reference_within_tolerance`
-  constructs a Qwen model with `Qwen2_5KernelBackend::CubeClWgpu`, runs the M3
-  tiny prompt, and compares logits against the CPU model at the existing M3
-  `1e-4` tolerance.
+  constructs a Qwen model with a CubeCL `KernelBackend`, runs the M3 tiny
+  prompt, and compares logits against the CPU model at the existing M3 `1e-4`
+  tolerance.
 - **Qwen decode parity, opt-in local execution**:
   `crates/runtime/tests/qwen2_5_tiny_synthetic_decode.rs::cubecl_wgpu_decode_one_token_matches_cpu_reference`
   constructs the CubeCL-backed model through `Runtime::cubecl_wgpu(0)` and

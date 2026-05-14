@@ -149,18 +149,14 @@ implicit global layout assumptions.
 ## Model Boundary
 
 `ocelotl-models` owns architecture semantics. It consumes verified metadata and
-kernel traits.
+kernel traits. Keep the concrete family types first (`Qwen2_5Model`,
+`WhisperModel`, future Gemma types); do not introduce a shared text-generation
+trait until at least two real text families need the same runtime call shape.
 
-```rust
-pub trait CausalLanguageModel: Send + Sync {
-    fn info(&self) -> &ModelInfo;
-    fn validate_runtime(&self, config: &RuntimeConfig) -> ocelotl_core::Result<()>;
-    fn prefill(&self, ctx: PrefillContext<'_>) -> ocelotl_core::Result<LogitsHandle>;
-    fn decode(&self, ctx: DecodeContext<'_>) -> ocelotl_core::Result<LogitsHandle>;
-}
-```
-
-The model should not allocate scheduler state or parse files.
+The model should not allocate scheduler state or hide downloads. Local
+family-level load helpers may compose `ocelotl-loader` with family-specific
+tensor mapping, but file format parsing and network fetches stay outside the
+model crate.
 
 ## Runtime Boundary
 

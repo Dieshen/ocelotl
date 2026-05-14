@@ -72,6 +72,125 @@ impl KernelBackend for CubeClKernelBackend {
     fn context(&self) -> &KernelContext {
         &self.context
     }
+
+    fn matmul(
+        &self,
+        a: &[f32],
+        a_shape: (usize, usize),
+        b: &[f32],
+        b_shape: (usize, usize),
+        out: &mut [f32],
+    ) -> Result<()> {
+        crate::matmul(a, a_shape, b, b_shape, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_out_by_in(
+        &self,
+        x: &[f32],
+        rows: usize,
+        in_features: usize,
+        weight_out_by_in: &[f32],
+        out_features: usize,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        crate::linear_out_by_in(
+            x,
+            rows,
+            in_features,
+            weight_out_by_in,
+            out_features,
+            bias,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        crate::attention::scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            out,
+        )
+    }
+
+    fn rope_apply_inplace(
+        &self,
+        x: &mut [f32],
+        head_dim: usize,
+        position: usize,
+        theta: f32,
+    ) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            return rope_apply_inplace_wgpu(x, head_dim, position, theta);
+        }
+
+        #[cfg(not(feature = "cubecl-wgpu"))]
+        {
+            crate::rope_apply_inplace(x, head_dim, position, theta)
+        }
+    }
+
+    fn rmsnorm(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        weight: &[f32],
+        epsilon: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        crate::rmsnorm::rmsnorm(x, rows, hidden, weight, epsilon, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_gated_silu(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+        gate_w: &[f32],
+        up_w: &[f32],
+        down_w: &[f32],
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        crate::mlp::mlp_gated_silu(
+            x,
+            rows,
+            hidden,
+            intermediate,
+            gate_w,
+            up_w,
+            down_w,
+            gate_buf,
+            up_buf,
+            out,
+        )
+    }
+
+    fn vec_add(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()> {
+        crate::vec_add(a, b, out)
+    }
 }
 
 /// Apply RoPE through CubeCL.

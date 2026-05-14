@@ -6,12 +6,16 @@
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
+    path::Path,
+    sync::Arc,
     time::Instant,
 };
 
 use ocelotl_core::{DType, InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId};
-use ocelotl_kernels::{CpuKernelBackend, softmax};
-use ocelotl_loader::{LoadedTensor, SupportedDtype};
+use ocelotl_kernels::{KernelBackend, default_kernel_backend, softmax};
+use ocelotl_loader::{
+    LoadedTensor, SupportedDtype, inspect_safetensors, load_safetensors_tensors_f32,
+};
 
 use super::{WhisperConfig, required_whisper_tensor_names};
 
@@ -97,7 +101,7 @@ impl WhisperWeights {
 pub struct WhisperModel {
     config: WhisperConfig,
     weights: WhisperWeights,
-    kernels: CpuKernelBackend,
+    kernels: Arc<dyn KernelBackend>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,14 +162,67 @@ impl WhisperDecoderState {
 }
 
 impl WhisperModel {
-    pub fn new(config: WhisperConfig, tensors: Vec<LoadedTensor>) -> Result<Self> {
-        Self::with_cpu_kernel_backend(config, tensors, CpuKernelBackend::default())
+    /// Load a local Whisper artifact directory.
+    ///
+    /// This reads `config.json` and `model.safetensors` from `dir`, delegates
+    /// file inspection/value loading to `ocelotl-loader`, and never downloads
+    /// artifacts.
+    pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        Self::load_from_dir_with_kernel_backend(dir, default_kernel_backend())
     }
 
-    pub fn with_cpu_kernel_backend(
+    /// Load a local Whisper artifact directory with an explicit kernel backend.
+    pub fn load_from_dir_with_kernel_backend<P: AsRef<Path>>(
+        dir: P,
+        kernels: Arc<dyn KernelBackend>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        Self::load_from_paths_with_kernel_backend(
+            dir.join("config.json"),
+            dir.join("model.safetensors"),
+            kernels,
+        )
+    }
+
+    /// Load a local Whisper config/model pair from explicit paths.
+    pub fn load_from_paths<P: AsRef<Path>, Q: AsRef<Path>>(
+        config_path: P,
+        model_path: Q,
+    ) -> Result<Self> {
+        Self::load_from_paths_with_kernel_backend(config_path, model_path, default_kernel_backend())
+    }
+
+    /// Load a local Whisper config/model pair from explicit paths with an
+    /// explicit kernel backend.
+    pub fn load_from_paths_with_kernel_backend<P: AsRef<Path>, Q: AsRef<Path>>(
+        config_path: P,
+        model_path: Q,
+        kernels: Arc<dyn KernelBackend>,
+    ) -> Result<Self> {
+        let config_path = config_path.as_ref();
+        let model_path = model_path.as_ref();
+        let raw = std::fs::read_to_string(config_path).map_err(|source| {
+            OcelotlError::Io(ocelotl_core::IoError {
+                path: Some(config_path.to_path_buf()),
+                source,
+            })
+        })?;
+        let config = super::parse_whisper_config_json(&raw)?;
+        let manifest = inspect_safetensors(model_path)?;
+        super::validate_whisper_tensors(&manifest, &config, Some(model_path))?;
+        let names = required_whisper_tensor_names(&config);
+        let tensors = load_safetensors_tensors_f32(model_path, &names)?;
+        Self::with_kernel_backend(config, tensors, kernels)
+    }
+
+    pub fn new(config: WhisperConfig, tensors: Vec<LoadedTensor>) -> Result<Self> {
+        Self::with_kernel_backend(config, tensors, default_kernel_backend())
+    }
+
+    pub fn with_kernel_backend(
         config: WhisperConfig,
         tensors: Vec<LoadedTensor>,
-        kernels: CpuKernelBackend,
+        kernels: Arc<dyn KernelBackend>,
     ) -> Result<Self> {
         let config = config.validate()?;
         let weights = WhisperWeights::from_loaded_tensors(&config, tensors)?;
@@ -180,8 +237,8 @@ impl WhisperModel {
         &self.config
     }
 
-    pub fn kernel_backend(&self) -> &CpuKernelBackend {
-        &self.kernels
+    pub fn kernel_backend(&self) -> &dyn KernelBackend {
+        self.kernels.as_ref()
     }
 
     pub fn forward_next_token_logits(
@@ -358,7 +415,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let attn = attention(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &attn_ln,
                 seq,
                 self.config.audio_state_size,
@@ -384,7 +441,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let mlp = mlp_gelu(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &mlp_ln,
                 seq,
                 self.config.audio_state_size,
@@ -440,7 +497,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let q = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &attn_ln,
                 seq,
                 text_state,
@@ -449,7 +506,7 @@ impl WhisperModel {
                 Some(self.weights.get(&format!("{prefix}.attn.query.bias"))),
             )?;
             let key = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &attn_ln,
                 seq,
                 text_state,
@@ -458,7 +515,7 @@ impl WhisperModel {
                 None,
             )?;
             let value = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &attn_ln,
                 seq,
                 text_state,
@@ -467,7 +524,7 @@ impl WhisperModel {
                 Some(self.weights.get(&format!("{prefix}.attn.value.bias"))),
             )?;
             let self_attn = attention_from_projected(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &q,
                 seq,
                 &key,
@@ -492,7 +549,7 @@ impl WhisperModel {
             )?;
             let cross_cache = &audio.cross_attention[layer];
             let cross_attn = attention_with_precomputed_kv(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &cross_ln,
                 seq,
                 text_state,
@@ -518,7 +575,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let mlp = mlp_gelu(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &mlp_ln,
                 seq,
                 text_state,
@@ -571,7 +628,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let q = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &attn_ln,
                 1,
                 text_state,
@@ -580,7 +637,7 @@ impl WhisperModel {
                 Some(self.weights.get(&format!("{prefix}.attn.query.bias"))),
             )?;
             let key = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &attn_ln,
                 1,
                 text_state,
@@ -589,7 +646,7 @@ impl WhisperModel {
                 None,
             )?;
             let value = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &attn_ln,
                 1,
                 text_state,
@@ -599,7 +656,7 @@ impl WhisperModel {
             )?;
             let cache = &state.self_attention[layer];
             let self_attn = attention_incremental_from_projected(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &q,
                 &key,
                 &value,
@@ -624,7 +681,7 @@ impl WhisperModel {
             )?;
             let cross_cache = &audio.cross_attention[layer];
             let cross_attn = attention_with_precomputed_kv(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &cross_ln,
                 1,
                 text_state,
@@ -650,7 +707,7 @@ impl WhisperModel {
                 LAYER_NORM_EPS,
             )?;
             let mlp = mlp_gelu(
-                &self.kernels,
+                self.kernels.as_ref(),
                 &mlp_ln,
                 1,
                 text_state,
@@ -690,7 +747,7 @@ impl WhisperModel {
         };
 
         linear(
-            &self.kernels,
+            self.kernels.as_ref(),
             last,
             1,
             state,
@@ -710,7 +767,7 @@ impl WhisperModel {
         for layer in 0..self.config.text_layers {
             let prefix = format!("decoder.blocks.{layer}.cross_attn");
             let key = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 encoded_audio,
                 audio_seq,
                 state,
@@ -719,7 +776,7 @@ impl WhisperModel {
                 None,
             )?;
             let value = linear(
-                &self.kernels,
+                self.kernels.as_ref(),
                 encoded_audio,
                 audio_seq,
                 state,
@@ -866,7 +923,7 @@ fn layer_norm(
 
 #[allow(clippy::too_many_arguments)]
 fn mlp_gelu(
-    kernels: &CpuKernelBackend,
+    kernels: &dyn KernelBackend,
     x: &[f32],
     rows: usize,
     hidden: usize,
@@ -883,7 +940,7 @@ fn mlp_gelu(
 
 #[allow(clippy::too_many_arguments)]
 fn attention(
-    kernels: &CpuKernelBackend,
+    kernels: &dyn KernelBackend,
     x: &[f32],
     q_seq: usize,
     state: usize,
@@ -927,7 +984,7 @@ fn attention(
 
 #[allow(clippy::too_many_arguments)]
 fn attention_with_precomputed_kv(
-    kernels: &CpuKernelBackend,
+    kernels: &dyn KernelBackend,
     x: &[f32],
     q_seq: usize,
     state: usize,
@@ -949,7 +1006,7 @@ fn attention_with_precomputed_kv(
 
 #[allow(clippy::too_many_arguments)]
 fn attention_from_projected(
-    kernels: &CpuKernelBackend,
+    kernels: &dyn KernelBackend,
     q: &[f32],
     q_seq: usize,
     k: &[f32],
@@ -1050,7 +1107,7 @@ fn dot_unrolled_4(a: &[f32], b: &[f32]) -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn attention_incremental_from_projected(
-    kernels: &CpuKernelBackend,
+    kernels: &dyn KernelBackend,
     q: &[f32],
     new_k: &[f32],
     new_v: &[f32],
@@ -1144,7 +1201,7 @@ fn attention_incremental_from_projected(
 }
 
 fn linear(
-    kernels: &CpuKernelBackend,
+    kernels: &dyn KernelBackend,
     x: &[f32],
     rows: usize,
     in_features: usize,
@@ -1578,6 +1635,7 @@ fn invalid_request(field: &str, message: &str) -> OcelotlError {
 mod tests {
     use super::*;
     use ocelotl_core::DType;
+    use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 
     #[test]
     fn conv1d_applies_padding_and_stride() {
@@ -1608,9 +1666,20 @@ mod tests {
         let fc1_b = [0.0_f32, 0.0];
         let fc2_w = [1.0_f32, 0.0, 0.0, 1.0];
         let fc2_b = [0.0_f32, 0.0];
-        let kernels = CpuKernelBackend::default();
+        let kernels = default_kernel_backend();
 
-        let out = mlp_gelu(&kernels, &x, 1, 2, 2, &fc1_w, &fc1_b, &fc2_w, &fc2_b).expect("mlp");
+        let out = mlp_gelu(
+            kernels.as_ref(),
+            &x,
+            1,
+            2,
+            2,
+            &fc1_w,
+            &fc1_b,
+            &fc2_w,
+            &fc2_b,
+        )
+        .expect("mlp");
 
         assert_close(&out, &[0.841_344_7, 0.0], 1.0e-6);
     }
@@ -1626,9 +1695,21 @@ mod tests {
         let x = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
-        let kernels = CpuKernelBackend::default();
+        let kernels = default_kernel_backend();
         let out = attention(
-            &kernels, &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None,
+            kernels.as_ref(),
+            &x,
+            3,
+            1,
+            1,
+            &zero,
+            &zero,
+            &zero,
+            &identity,
+            &zero,
+            &identity,
+            &zero,
+            None,
             false,
         )
         .expect("encoder self attention");
@@ -1641,9 +1722,21 @@ mod tests {
         let x = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
-        let kernels = CpuKernelBackend::default();
+        let kernels = default_kernel_backend();
         let out = attention(
-            &kernels, &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None,
+            kernels.as_ref(),
+            &x,
+            3,
+            1,
+            1,
+            &zero,
+            &zero,
+            &zero,
+            &identity,
+            &zero,
+            &identity,
+            &zero,
+            None,
             true,
         )
         .expect("decoder self attention");
@@ -1656,14 +1749,26 @@ mod tests {
         let x = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
-        let kernels = CpuKernelBackend::default();
+        let kernels = default_kernel_backend();
         let full = attention(
-            &kernels, &x, 3, 1, 1, &zero, &zero, &zero, &identity, &zero, &identity, &zero, None,
+            kernels.as_ref(),
+            &x,
+            3,
+            1,
+            1,
+            &zero,
+            &zero,
+            &zero,
+            &identity,
+            &zero,
+            &identity,
+            &zero,
+            None,
             true,
         )
         .expect("full causal self attention");
         let incremental = attention_incremental_from_projected(
-            &kernels,
+            kernels.as_ref(),
             &[0.0],
             &[0.0],
             &[7.0],
@@ -1686,9 +1791,9 @@ mod tests {
         let audio = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
-        let kernels = CpuKernelBackend::default();
+        let kernels = default_kernel_backend();
         let out = attention(
-            &kernels,
+            kernels.as_ref(),
             &text,
             2,
             1,
@@ -1791,15 +1896,45 @@ mod tests {
     }
 
     #[test]
+    fn load_from_dir_builds_whisper_model_from_local_files_without_downloads() {
+        let cfg = tiny_config();
+        let dir = tmp_dir("load_from_dir");
+        write_whisper_config(&dir.join("config.json"), &cfg);
+        write_safetensors_f32(
+            &dir.join("model.safetensors"),
+            &synthetic_weight_tensors(&cfg),
+        );
+
+        let loaded = WhisperModel::load_from_dir(&dir)
+            .expect("local Whisper directory must load through family helper");
+        let expected = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("model");
+        let mel = vec![0.0_f32; 4 * cfg.mel_bins];
+        let tokens = [TokenId(0), TokenId(2)];
+
+        assert_eq!(loaded.config(), &cfg);
+        assert_close(
+            &loaded
+                .forward_next_token_logits(&mel, 4, &tokens)
+                .expect("loaded model logits"),
+            &expected
+                .forward_next_token_logits(&mel, 4, &tokens)
+                .expect("expected model logits"),
+            0.0,
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn precomputed_cross_attention_matches_projected_cross_attention() {
         let text = [1.0_f32, 1.0];
         let audio = [1.0_f32, 2.0, 7.0];
         let identity = [1.0_f32];
         let zero = [0.0_f32];
-        let kernels = CpuKernelBackend::default();
+        let kernels = default_kernel_backend();
 
         let projected = attention(
-            &kernels,
+            kernels.as_ref(),
             &text,
             2,
             1,
@@ -1816,7 +1951,19 @@ mod tests {
         )
         .expect("projected cross attention");
         let precomputed = attention_with_precomputed_kv(
-            &kernels, &text, 2, 1, 1, &zero, &zero, &audio, &audio, 3, &identity, &zero, false,
+            kernels.as_ref(),
+            &text,
+            2,
+            1,
+            1,
+            &zero,
+            &zero,
+            &audio,
+            &audio,
+            3,
+            &identity,
+            &zero,
+            false,
         )
         .expect("precomputed cross attention");
 
@@ -1893,19 +2040,16 @@ mod tests {
         let cfg = tiny_config();
         let scalar =
             WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("scalar model");
-        let optimized = WhisperModel::with_cpu_kernel_backend(
+        let optimized = WhisperModel::with_kernel_backend(
             cfg.clone(),
             tiny_weight_tensors(&cfg),
-            CpuKernelBackend::optimized(),
+            ocelotl_kernels::optimized_cpu_kernel_backend(),
         )
         .expect("optimized model");
         let mel = vec![0.0_f32; 4 * cfg.mel_bins];
         let tokens = [TokenId(0), TokenId(2)];
 
-        assert_eq!(
-            optimized.kernel_backend().mode(),
-            ocelotl_kernels::CpuKernelMode::Optimized
-        );
+        assert_eq!(optimized.kernel_backend().name(), "cpu");
         let scalar_logits = scalar
             .forward_next_token_logits(&mel, 4, &tokens)
             .expect("scalar logits");
@@ -1989,6 +2133,82 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ocelotl_whisper_{}_{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn write_whisper_config(path: &std::path::Path, cfg: &super::super::WhisperConfig) {
+        let dtype = match cfg.dtype {
+            DType::F32 => "float32",
+            DType::F16 => "float16",
+            DType::BF16 => "bfloat16",
+            DType::Q4 | DType::Q8 => panic!("test config uses unsupported Whisper dtype"),
+        };
+        let raw = format!(
+            r#"{{
+              "model_type": "whisper",
+              "vocab_size": {vocab_size},
+              "num_mel_bins": {mel_bins},
+              "d_model": {state},
+              "encoder_layers": {audio_layers},
+              "encoder_attention_heads": {audio_heads},
+              "encoder_ffn_dim": {audio_ffn},
+              "decoder_layers": {text_layers},
+              "decoder_attention_heads": {text_heads},
+              "decoder_ffn_dim": {text_ffn},
+              "max_source_positions": {audio_ctx},
+              "max_target_positions": {text_ctx},
+              "torch_dtype": "{dtype}",
+              "tie_word_embeddings": {tie_word_embeddings}
+            }}"#,
+            vocab_size = cfg.vocab_size,
+            mel_bins = cfg.mel_bins,
+            state = cfg.audio_state_size,
+            audio_layers = cfg.audio_layers,
+            audio_heads = cfg.audio_attention_heads,
+            audio_ffn = cfg.audio_ffn_size,
+            text_layers = cfg.text_layers,
+            text_heads = cfg.text_attention_heads,
+            text_ffn = cfg.text_ffn_size,
+            audio_ctx = cfg.audio_context_length,
+            text_ctx = cfg.text_context_length,
+            tie_word_embeddings = cfg.tie_word_embeddings,
+        );
+        fs::write(path, raw).expect("write Whisper config");
+    }
+
+    fn write_safetensors_f32(path: &std::path::Path, tensors: &[ocelotl_loader::LoadedTensor]) {
+        let mut header = BTreeMap::new();
+        let mut data = Vec::new();
+        for tensor in tensors {
+            let begin = data.len();
+            for value in &tensor.values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            let end = data.len();
+            header.insert(
+                tensor.name.clone(),
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": tensor.shape,
+                    "data_offsets": [begin, end],
+                }),
+            );
+        }
+
+        let header_json = serde_json::to_string(&header).expect("serialize safetensors header");
+        let mut file = fs::File::create(path).expect("create safetensors");
+        file.write_all(&(header_json.len() as u64).to_le_bytes())
+            .expect("write header length");
+        file.write_all(header_json.as_bytes())
+            .expect("write header");
+        file.write_all(&data).expect("write tensor data");
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

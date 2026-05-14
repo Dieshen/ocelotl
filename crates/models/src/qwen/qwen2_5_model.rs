@@ -54,17 +54,23 @@
 //! M1.7 / M3.3-3.6 boundary contract; M4+ is when a typed tensor view
 //! becomes worth its overhead.
 
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    path::Path,
+    sync::Arc,
+};
+
 use ocelotl_core::{
     DType, InvalidModelError, InvalidRequestError, KvCacheLayout, KvCacheStore, OcelotlError,
     Result, TokenId,
 };
-#[cfg(feature = "cubecl-wgpu")]
-use ocelotl_kernels::CubeClKernelBackend;
-use ocelotl_kernels::{
-    CpuKernelBackend, KernelBackend, mlp::mlp_gated_silu, rmsnorm::rmsnorm, vec_add,
+use ocelotl_kernels::{KernelBackend, default_kernel_backend};
+use ocelotl_loader::{
+    LoadedTensor, SupportedDtype, inspect_safetensors, load_safetensors_tensors_f32,
+    parse_hf_config,
 };
 
-use super::Qwen2_5Config;
+use super::{Qwen2_5Config, required_tensor_names, validate_qwen2_5_tensors};
 
 /// Per-layer weight bundle. All tensors stored as contiguous row-major
 /// `Vec<f32>` (HF layout). The model layer transposes weights as needed
@@ -125,107 +131,158 @@ pub struct Qwen2_5Weights {
     pub tie_word_embeddings: bool,
 }
 
-/// Kernel backend selection for the Qwen2.5 model path.
-///
-/// CPU remains the reference backend for every operation. The M4 CubeCL path is
-/// intentionally partial: RoPE is executed through CubeCL WGPU, while matmul,
-/// attention, RMSNorm, MLP, and residual work continue to use the CPU fallback.
-/// This proves the model/runtime dispatch boundary without claiming full-model
-/// GPU execution.
-#[derive(Debug, Clone)]
-pub enum Qwen2_5KernelBackend {
-    Cpu(CpuKernelBackend),
-    #[cfg(feature = "cubecl-wgpu")]
-    CubeClWgpu {
-        cubecl: CubeClKernelBackend,
-        cpu_fallback: CpuKernelBackend,
-    },
-}
+impl Qwen2_5Weights {
+    /// Build model-family weights from loader-owned safetensors tensor values.
+    ///
+    /// This is the model-specific artifact adaptation boundary: `ocelotl-loader`
+    /// parses and validates the file format, while this method maps Qwen2.5 HF
+    /// tensor names into the layout expected by the Qwen forward path.
+    pub fn from_loaded_tensors(
+        config: &Qwen2_5Config,
+        tensors: Vec<LoadedTensor>,
+        tie_word_embeddings: bool,
+    ) -> Result<Self> {
+        validate_config_for_model(config)?;
 
-impl Default for Qwen2_5KernelBackend {
-    fn default() -> Self {
-        Self::Cpu(CpuKernelBackend::default())
-    }
-}
-
-impl Qwen2_5KernelBackend {
-    pub fn cpu(kernels: CpuKernelBackend) -> Self {
-        Self::Cpu(kernels)
-    }
-
-    #[cfg(feature = "cubecl-wgpu")]
-    pub fn cubecl_wgpu(cubecl: CubeClKernelBackend) -> Self {
-        Self::CubeClWgpu {
-            cubecl,
-            cpu_fallback: CpuKernelBackend::default(),
-        }
-    }
-
-    pub fn cpu_backend(&self) -> &CpuKernelBackend {
-        match self {
-            Self::Cpu(cpu) => cpu,
-            #[cfg(feature = "cubecl-wgpu")]
-            Self::CubeClWgpu { cpu_fallback, .. } => cpu_fallback,
-        }
-    }
-
-    pub fn execution_backend(&self) -> &dyn KernelBackend {
-        match self {
-            Self::Cpu(cpu) => cpu,
-            #[cfg(feature = "cubecl-wgpu")]
-            Self::CubeClWgpu { cubecl, .. } => cubecl,
-        }
-    }
-
-    fn matmul(
-        &self,
-        a: &[f32],
-        a_shape: (usize, usize),
-        b: &[f32],
-        b_shape: (usize, usize),
-        out: &mut [f32],
-    ) -> Result<()> {
-        self.cpu_backend().matmul(a, a_shape, b, b_shape, out)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn scaled_dot_product_attention(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        out: &mut [f32],
-    ) -> Result<()> {
-        self.cpu_backend().scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            out,
-        )
-    }
-
-    fn rope_apply_inplace(
-        &self,
-        x: &mut [f32],
-        head_dim: usize,
-        position: usize,
-        theta: f32,
-    ) -> Result<()> {
-        match self {
-            Self::Cpu(_) => ocelotl_kernels::rope_apply_inplace(x, head_dim, position, theta),
-            #[cfg(feature = "cubecl-wgpu")]
-            Self::CubeClWgpu { cubecl, .. } => {
-                cubecl.rope_apply_inplace(x, head_dim, position, theta)
+        let mut by_name = BTreeMap::new();
+        for tensor in tensors {
+            match by_name.entry(tensor.name.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(tensor);
+                }
+                Entry::Occupied(_) => {
+                    return Err(invalid_model(
+                        &tensor.name,
+                        "duplicate Qwen2.5 tensor supplied",
+                    ));
+                }
             }
         }
+
+        let h = config.hidden_size;
+        let v = config.vocab_size;
+        let q_out = checked_len_product(
+            "num_attention_heads*head_dim",
+            &[config.num_attention_heads, config.head_dim],
+        )?;
+        let kv_out = checked_len_product(
+            "num_key_value_heads*head_dim",
+            &[config.num_key_value_heads, config.head_dim],
+        )?;
+        let i_size = config.intermediate_size;
+
+        let embed_tokens = take_tensor_values(
+            &mut by_name,
+            "model.embed_tokens.weight",
+            &[v, h],
+            &config.dtype,
+        )?;
+        let final_norm_w =
+            take_tensor_values(&mut by_name, "model.norm.weight", &[h], &config.dtype)?;
+        let lm_head_w = if tie_word_embeddings {
+            transpose_2d(&embed_tokens, v, h)
+        } else {
+            let lm_head =
+                take_tensor_values(&mut by_name, "lm_head.weight", &[v, h], &config.dtype)?;
+            transpose_2d(&lm_head, v, h)
+        };
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer in 0..config.num_hidden_layers {
+            let layer_prefix = format!("model.layers.{layer}");
+            let tensor_name = |suffix: &str| format!("{layer_prefix}.{suffix}");
+
+            let q_proj_w = take_tensor_values(
+                &mut by_name,
+                &tensor_name("self_attn.q_proj.weight"),
+                &[q_out, h],
+                &config.dtype,
+            )?;
+            let k_proj_w = take_tensor_values(
+                &mut by_name,
+                &tensor_name("self_attn.k_proj.weight"),
+                &[kv_out, h],
+                &config.dtype,
+            )?;
+            let v_proj_w = take_tensor_values(
+                &mut by_name,
+                &tensor_name("self_attn.v_proj.weight"),
+                &[kv_out, h],
+                &config.dtype,
+            )?;
+            let o_proj_w = take_tensor_values(
+                &mut by_name,
+                &tensor_name("self_attn.o_proj.weight"),
+                &[h, q_out],
+                &config.dtype,
+            )?;
+            let gate_proj_w = take_tensor_values(
+                &mut by_name,
+                &tensor_name("mlp.gate_proj.weight"),
+                &[i_size, h],
+                &config.dtype,
+            )?;
+            let up_proj_w = take_tensor_values(
+                &mut by_name,
+                &tensor_name("mlp.up_proj.weight"),
+                &[i_size, h],
+                &config.dtype,
+            )?;
+            let down_proj_w = take_tensor_values(
+                &mut by_name,
+                &tensor_name("mlp.down_proj.weight"),
+                &[h, i_size],
+                &config.dtype,
+            )?;
+
+            layers.push(Qwen2_5LayerWeights {
+                q_proj_w: transpose_2d(&q_proj_w, q_out, h),
+                q_proj_b: take_tensor_values(
+                    &mut by_name,
+                    &tensor_name("self_attn.q_proj.bias"),
+                    &[q_out],
+                    &config.dtype,
+                )?,
+                k_proj_w: transpose_2d(&k_proj_w, kv_out, h),
+                k_proj_b: take_tensor_values(
+                    &mut by_name,
+                    &tensor_name("self_attn.k_proj.bias"),
+                    &[kv_out],
+                    &config.dtype,
+                )?,
+                v_proj_w: transpose_2d(&v_proj_w, kv_out, h),
+                v_proj_b: take_tensor_values(
+                    &mut by_name,
+                    &tensor_name("self_attn.v_proj.bias"),
+                    &[kv_out],
+                    &config.dtype,
+                )?,
+                o_proj_w: transpose_2d(&o_proj_w, h, q_out),
+                input_layernorm_w: take_tensor_values(
+                    &mut by_name,
+                    &tensor_name("input_layernorm.weight"),
+                    &[h],
+                    &config.dtype,
+                )?,
+                post_attention_layernorm_w: take_tensor_values(
+                    &mut by_name,
+                    &tensor_name("post_attention_layernorm.weight"),
+                    &[h],
+                    &config.dtype,
+                )?,
+                gate_proj_w: transpose_2d(&gate_proj_w, i_size, h),
+                up_proj_w: transpose_2d(&up_proj_w, i_size, h),
+                down_proj_w: transpose_2d(&down_proj_w, h, i_size),
+            });
+        }
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            final_norm_w,
+            lm_head_w,
+            tie_word_embeddings,
+        })
     }
 }
 
@@ -234,10 +291,68 @@ impl Qwen2_5KernelBackend {
 pub struct Qwen2_5Model {
     config: Qwen2_5Config,
     weights: Qwen2_5Weights,
-    kernels: Qwen2_5KernelBackend,
+    kernels: Arc<dyn KernelBackend>,
 }
 
 impl Qwen2_5Model {
+    /// Load a local HF-style Qwen2.5 artifact directory.
+    ///
+    /// This is intentionally local-only: it reads `config.json` and
+    /// `model.safetensors` from `dir`, delegates file parsing to
+    /// `ocelotl-loader`, and never downloads artifacts.
+    pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        Self::load_from_dir_with_kernel_backend(dir, default_kernel_backend())
+    }
+
+    /// Load a local HF-style Qwen2.5 artifact directory with explicit kernel
+    /// backend selection.
+    pub fn load_from_dir_with_kernel_backend<P: AsRef<Path>>(
+        dir: P,
+        kernels: Arc<dyn KernelBackend>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        Self::load_from_paths_with_kernel_backend(
+            dir.join("config.json"),
+            dir.join("model.safetensors"),
+            kernels,
+        )
+    }
+
+    /// Load a local HF-style Qwen2.5 config/model pair from explicit paths.
+    pub fn load_from_paths<P: AsRef<Path>, Q: AsRef<Path>>(
+        config_path: P,
+        model_path: Q,
+    ) -> Result<Self> {
+        Self::load_from_paths_with_kernel_backend(config_path, model_path, default_kernel_backend())
+    }
+
+    /// Load a local HF-style Qwen2.5 config/model pair from explicit paths
+    /// with backend selection.
+    pub fn load_from_paths_with_kernel_backend<P: AsRef<Path>, Q: AsRef<Path>>(
+        config_path: P,
+        model_path: Q,
+        kernels: Arc<dyn KernelBackend>,
+    ) -> Result<Self> {
+        let config_path = config_path.as_ref();
+        let model_path = model_path.as_ref();
+
+        let info = parse_hf_config(config_path)?;
+        let config = Qwen2_5Config::try_from(&info.metadata)?;
+        let manifest = inspect_safetensors(model_path)?;
+        validate_qwen2_5_tensors(
+            &manifest,
+            &config,
+            info.tie_word_embeddings,
+            Some(model_path),
+        )?;
+
+        let names = required_tensor_names(&config, info.tie_word_embeddings);
+        let tensors = load_safetensors_tensors_f32(model_path, &names)?;
+        let weights =
+            Qwen2_5Weights::from_loaded_tensors(&config, tensors, info.tie_word_embeddings)?;
+        Self::with_kernel_backend(config, weights, kernels)
+    }
+
     /// Construct a model from validated config and weights.
     ///
     /// Returns `OcelotlError::InvalidModel` if any weight tensor's length
@@ -245,27 +360,14 @@ impl Qwen2_5Model {
     /// before the kernel boundary; downstream forward code can assume
     /// every length is correct.
     pub fn new(config: Qwen2_5Config, weights: Qwen2_5Weights) -> Result<Self> {
-        Self::with_cpu_kernel_backend(config, weights, CpuKernelBackend::default())
+        Self::with_kernel_backend(config, weights, default_kernel_backend())
     }
 
-    /// Construct a model with an explicit CPU kernel backend.
-    ///
-    /// `Qwen2_5Model::new` uses the scalar CPU reference backend. This
-    /// constructor lets callers opt into the optimized CPU backend while
-    /// preserving the same model-level validation and public `prefill` API.
-    pub fn with_cpu_kernel_backend(
-        config: Qwen2_5Config,
-        weights: Qwen2_5Weights,
-        kernels: CpuKernelBackend,
-    ) -> Result<Self> {
-        Self::with_kernel_backend(config, weights, Qwen2_5KernelBackend::cpu(kernels))
-    }
-
-    /// Construct a model with an explicit Qwen kernel backend selection.
+    /// Construct a model with an explicit kernel backend.
     pub fn with_kernel_backend(
         config: Qwen2_5Config,
         weights: Qwen2_5Weights,
-        kernels: Qwen2_5KernelBackend,
+        kernels: Arc<dyn KernelBackend>,
     ) -> Result<Self> {
         validate_config_for_model(&config)?;
         let h = config.hidden_size;
@@ -373,39 +475,19 @@ impl Qwen2_5Model {
         })
     }
 
-    /// Construct a model whose RoPE calls execute through CubeCL WGPU.
-    ///
-    /// Other M4 operations still run through the CPU fallback; CPU remains the
-    /// reference path for matmul, attention, normalization, MLP, and logits.
-    #[cfg(feature = "cubecl-wgpu")]
-    pub fn with_cubecl_wgpu_backend(
-        config: Qwen2_5Config,
-        weights: Qwen2_5Weights,
-        kernels: CubeClKernelBackend,
-    ) -> Result<Self> {
-        Self::with_kernel_backend(config, weights, Qwen2_5KernelBackend::cubecl_wgpu(kernels))
-    }
-
     /// Borrow the validated configuration.
     pub fn config(&self) -> &Qwen2_5Config {
         &self.config
     }
 
-    /// Borrow the CPU kernel backend selected for this model instance.
-    pub fn kernel_backend(&self) -> &CpuKernelBackend {
-        self.kernels.cpu_backend()
+    /// Borrow the kernel backend selected for this model instance.
+    pub fn kernel_backend(&self) -> &dyn KernelBackend {
+        self.kernels.as_ref()
     }
 
     /// Borrow the active execution backend.
-    ///
-    /// For the M4 CubeCL path this advertises the GPU backend even though only
-    /// RoPE executes on CubeCL and the remaining operations use CPU fallback.
     pub fn execution_backend(&self) -> &dyn KernelBackend {
-        self.kernels.execution_backend()
-    }
-
-    pub fn qwen_kernel_backend(&self) -> &Qwen2_5KernelBackend {
-        &self.kernels
+        self.kernels.as_ref()
     }
 
     /// Run prefill over the prompt and return the logits at the final
@@ -521,7 +603,7 @@ impl Qwen2_5Model {
             residual_buf.copy_from_slice(&hidden);
 
             // Pre-attention RMSNorm.
-            rmsnorm(
+            self.kernels.rmsnorm(
                 &hidden,
                 seq,
                 h,
@@ -608,13 +690,13 @@ impl Qwen2_5Model {
             )?;
 
             // Residual: hidden = residual + o_buf.
-            vec_add(&residual_buf, &o_buf, &mut hidden)?;
+            self.kernels.vec_add(&residual_buf, &o_buf, &mut hidden)?;
 
             // Save residual before MLP.
             residual_buf.copy_from_slice(&hidden);
 
             // Post-attention RMSNorm.
-            rmsnorm(
+            self.kernels.rmsnorm(
                 &hidden,
                 seq,
                 h,
@@ -624,7 +706,7 @@ impl Qwen2_5Model {
             )?;
 
             // MLP: out = down(silu(gate(x)) * up(x)).
-            mlp_gated_silu(
+            self.kernels.mlp_gated_silu(
                 &norm_buf,
                 seq,
                 h,
@@ -638,11 +720,11 @@ impl Qwen2_5Model {
             )?;
 
             // Residual: hidden = residual + mlp_out.
-            vec_add(&residual_buf, &mlp_out, &mut hidden)?;
+            self.kernels.vec_add(&residual_buf, &mlp_out, &mut hidden)?;
         }
 
         // Final RMSNorm over the full sequence.
-        rmsnorm(
+        self.kernels.rmsnorm(
             &hidden,
             seq,
             h,
@@ -728,7 +810,8 @@ impl Qwen2_5Model {
 
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             residual_buf.copy_from_slice(&hidden);
-            rmsnorm(&hidden, 1, h, &layer.input_layernorm_w, eps, &mut norm_buf)?;
+            self.kernels
+                .rmsnorm(&hidden, 1, h, &layer.input_layernorm_w, eps, &mut norm_buf)?;
 
             self.kernels
                 .matmul(&norm_buf, (1, h), &layer.q_proj_w, (h, q_out), &mut q_buf)?;
@@ -773,10 +856,10 @@ impl Qwen2_5Model {
                 &mut o_buf,
             )?;
 
-            vec_add(&residual_buf, &o_buf, &mut hidden)?;
+            self.kernels.vec_add(&residual_buf, &o_buf, &mut hidden)?;
             residual_buf.copy_from_slice(&hidden);
 
-            rmsnorm(
+            self.kernels.rmsnorm(
                 &hidden,
                 1,
                 h,
@@ -784,7 +867,7 @@ impl Qwen2_5Model {
                 eps,
                 &mut norm_buf,
             )?;
-            mlp_gated_silu(
+            self.kernels.mlp_gated_silu(
                 &norm_buf,
                 1,
                 h,
@@ -796,10 +879,10 @@ impl Qwen2_5Model {
                 &mut up_buf,
                 &mut mlp_out,
             )?;
-            vec_add(&residual_buf, &mlp_out, &mut hidden)?;
+            self.kernels.vec_add(&residual_buf, &mlp_out, &mut hidden)?;
         }
 
-        rmsnorm(
+        self.kernels.rmsnorm(
             &hidden,
             1,
             h,
@@ -987,10 +1070,190 @@ fn invalid_model(field: &str, message: &str) -> OcelotlError {
     })
 }
 
+fn take_tensor_values(
+    by_name: &mut BTreeMap<String, LoadedTensor>,
+    name: &str,
+    expected_shape: &[usize],
+    expected_dtype: &DType,
+) -> Result<Vec<f32>> {
+    let tensor = by_name
+        .remove(name)
+        .ok_or_else(|| invalid_model(name, "required Qwen2.5 tensor is missing"))?;
+    if tensor.shape != expected_shape {
+        return Err(invalid_model(
+            name,
+            &format!(
+                "tensor `{name}` has shape {:?}, expected {:?}",
+                tensor.shape, expected_shape
+            ),
+        ));
+    }
+    if !supported_dtype_matches(tensor.dtype, expected_dtype) {
+        return Err(invalid_model(
+            name,
+            &format!(
+                "tensor `{name}` has dtype {:?}, expected {:?}",
+                tensor.dtype, expected_dtype
+            ),
+        ));
+    }
+    let expected_len = checked_len_product(name, expected_shape)?;
+    if tensor.values.len() != expected_len {
+        return Err(invalid_model(
+            name,
+            &format!(
+                "tensor `{name}` has {} values, expected {expected_len}",
+                tensor.values.len()
+            ),
+        ));
+    }
+    Ok(tensor.values)
+}
+
+fn supported_dtype_matches(actual: SupportedDtype, expected: &DType) -> bool {
+    matches!(
+        (actual, expected),
+        (SupportedDtype::F32, DType::F32)
+            | (SupportedDtype::F16, DType::F16)
+            | (SupportedDtype::BF16, DType::BF16)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ocelotl_core::DType;
+    use ocelotl_loader::{LoadedTensor, SupportedDtype};
+    use std::{collections::BTreeMap, fs, io::Write, path::PathBuf, sync::Arc};
+
+    #[derive(Debug)]
+    struct TestGpuKernelBackend {
+        context: ocelotl_kernels::KernelContext,
+    }
+
+    impl TestGpuKernelBackend {
+        fn new() -> Self {
+            Self {
+                context: ocelotl_kernels::KernelContext {
+                    device: ocelotl_core::Device::Gpu { ordinal: 7 },
+                },
+            }
+        }
+    }
+
+    impl ocelotl_kernels::KernelBackend for TestGpuKernelBackend {
+        fn name(&self) -> &'static str {
+            "test-gpu"
+        }
+
+        fn context(&self) -> &ocelotl_kernels::KernelContext {
+            &self.context
+        }
+
+        fn matmul(
+            &self,
+            _a: &[f32],
+            _a_shape: (usize, usize),
+            _b: &[f32],
+            _b_shape: (usize, usize),
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(test_gpu_kernel_error(
+                "matmul not implemented in test backend",
+            ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn linear_out_by_in(
+            &self,
+            _x: &[f32],
+            _rows: usize,
+            _in_features: usize,
+            _weight_out_by_in: &[f32],
+            _out_features: usize,
+            _bias: Option<&[f32]>,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(test_gpu_kernel_error(
+                "linear_out_by_in not implemented in test backend",
+            ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn scaled_dot_product_attention(
+            &self,
+            _q: &[f32],
+            _k: &[f32],
+            _v: &[f32],
+            _seq_len: usize,
+            _num_q_heads: usize,
+            _num_kv_heads: usize,
+            _head_dim: usize,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(test_gpu_kernel_error(
+                "scaled_dot_product_attention not implemented in test backend",
+            ))
+        }
+
+        fn rope_apply_inplace(
+            &self,
+            _x: &mut [f32],
+            _head_dim: usize,
+            _position: usize,
+            _theta: f32,
+        ) -> Result<()> {
+            Err(test_gpu_kernel_error(
+                "rope_apply_inplace not implemented in test backend",
+            ))
+        }
+
+        fn rmsnorm(
+            &self,
+            _x: &[f32],
+            _rows: usize,
+            _hidden: usize,
+            _weight: &[f32],
+            _epsilon: f32,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(test_gpu_kernel_error(
+                "rmsnorm not implemented in test backend",
+            ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn mlp_gated_silu(
+            &self,
+            _x: &[f32],
+            _rows: usize,
+            _hidden: usize,
+            _intermediate: usize,
+            _gate_w: &[f32],
+            _up_w: &[f32],
+            _down_w: &[f32],
+            _gate_buf: &mut [f32],
+            _up_buf: &mut [f32],
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(test_gpu_kernel_error(
+                "mlp_gated_silu not implemented in test backend",
+            ))
+        }
+
+        fn vec_add(&self, _a: &[f32], _b: &[f32], _out: &mut [f32]) -> Result<()> {
+            Err(test_gpu_kernel_error(
+                "vec_add not implemented in test backend",
+            ))
+        }
+    }
+
+    fn test_gpu_kernel_error(message: &str) -> OcelotlError {
+        OcelotlError::Kernel(ocelotl_core::KernelError {
+            backend: "test-gpu".to_string(),
+            message: message.to_string(),
+        })
+    }
 
     /// A tiny config that satisfies every Qwen2_5Config invariant
     /// (head_dim * num_attention_heads == hidden_size, GQA divisibility,
@@ -1072,6 +1335,228 @@ mod tests {
         }
     }
 
+    fn loaded_tensor(name: impl Into<String>, shape: Vec<usize>, values: Vec<f32>) -> LoadedTensor {
+        LoadedTensor {
+            name: name.into(),
+            shape,
+            dtype: SupportedDtype::F32,
+            values,
+        }
+    }
+
+    fn tiny_loaded_tensors_from_weights(
+        cfg: &Qwen2_5Config,
+        weights: &Qwen2_5Weights,
+    ) -> Vec<LoadedTensor> {
+        let h = cfg.hidden_size;
+        let v = cfg.vocab_size;
+        let q_out = cfg.num_attention_heads * cfg.head_dim;
+        let kv_out = cfg.num_key_value_heads * cfg.head_dim;
+        let i_size = cfg.intermediate_size;
+
+        let mut tensors = Vec::new();
+        for (layer_idx, layer) in weights.layers.iter().enumerate() {
+            let prefix = format!("model.layers.{layer_idx}");
+            tensors.push(loaded_tensor(
+                format!("{prefix}.self_attn.q_proj.weight"),
+                vec![q_out, h],
+                transpose_2d(&layer.q_proj_w, h, q_out),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.self_attn.q_proj.bias"),
+                vec![q_out],
+                layer.q_proj_b.clone(),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.self_attn.k_proj.weight"),
+                vec![kv_out, h],
+                transpose_2d(&layer.k_proj_w, h, kv_out),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.self_attn.k_proj.bias"),
+                vec![kv_out],
+                layer.k_proj_b.clone(),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.self_attn.v_proj.weight"),
+                vec![kv_out, h],
+                transpose_2d(&layer.v_proj_w, h, kv_out),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.self_attn.v_proj.bias"),
+                vec![kv_out],
+                layer.v_proj_b.clone(),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.self_attn.o_proj.weight"),
+                vec![h, q_out],
+                transpose_2d(&layer.o_proj_w, q_out, h),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.mlp.gate_proj.weight"),
+                vec![i_size, h],
+                transpose_2d(&layer.gate_proj_w, h, i_size),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.mlp.up_proj.weight"),
+                vec![i_size, h],
+                transpose_2d(&layer.up_proj_w, h, i_size),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.mlp.down_proj.weight"),
+                vec![h, i_size],
+                transpose_2d(&layer.down_proj_w, i_size, h),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.input_layernorm.weight"),
+                vec![h],
+                layer.input_layernorm_w.clone(),
+            ));
+            tensors.push(loaded_tensor(
+                format!("{prefix}.post_attention_layernorm.weight"),
+                vec![h],
+                layer.post_attention_layernorm_w.clone(),
+            ));
+        }
+        tensors.push(loaded_tensor(
+            "model.embed_tokens.weight",
+            vec![v, h],
+            weights.embed_tokens.clone(),
+        ));
+        tensors.push(loaded_tensor(
+            "model.norm.weight",
+            vec![h],
+            weights.final_norm_w.clone(),
+        ));
+        if !weights.tie_word_embeddings {
+            tensors.push(loaded_tensor(
+                "lm_head.weight",
+                vec![v, h],
+                transpose_2d(&weights.lm_head_w, h, v),
+            ));
+        }
+        tensors
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ocelotl_qwen2_5_{}_{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn write_qwen_config(path: &std::path::Path, cfg: &Qwen2_5Config, tie_word_embeddings: bool) {
+        let dtype = match cfg.dtype {
+            DType::F32 => "float32",
+            DType::F16 => "float16",
+            DType::BF16 => "bfloat16",
+            DType::Q4 | DType::Q8 => panic!("test config uses unsupported HF dtype"),
+        };
+        let raw = format!(
+            r#"{{
+              "model_type": "qwen2",
+              "vocab_size": {vocab_size},
+              "hidden_size": {hidden_size},
+              "intermediate_size": {intermediate_size},
+              "num_hidden_layers": {num_hidden_layers},
+              "num_attention_heads": {num_attention_heads},
+              "num_key_value_heads": {num_key_value_heads},
+              "max_position_embeddings": {context_length},
+              "rope_theta": {rope_theta},
+              "rms_norm_eps": {rms_norm_eps},
+              "torch_dtype": "{dtype}",
+              "tie_word_embeddings": {tie_word_embeddings}
+            }}"#,
+            vocab_size = cfg.vocab_size,
+            hidden_size = cfg.hidden_size,
+            intermediate_size = cfg.intermediate_size,
+            num_hidden_layers = cfg.num_hidden_layers,
+            num_attention_heads = cfg.num_attention_heads,
+            num_key_value_heads = cfg.num_key_value_heads,
+            context_length = cfg.context_length,
+            rope_theta = cfg.rope_theta,
+            rms_norm_eps = cfg.rms_norm_eps,
+        );
+        fs::write(path, raw).expect("write config");
+    }
+
+    fn write_safetensors_f32(path: &std::path::Path, tensors: &[LoadedTensor]) {
+        let mut header = BTreeMap::new();
+        let mut data = Vec::new();
+        for tensor in tensors {
+            let begin = data.len();
+            for value in &tensor.values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            let end = data.len();
+            header.insert(
+                tensor.name.clone(),
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": tensor.shape,
+                    "data_offsets": [begin, end],
+                }),
+            );
+        }
+
+        let header_json = serde_json::to_string(&header).expect("serialize safetensors header");
+        let mut file = fs::File::create(path).expect("create safetensors");
+        file.write_all(&(header_json.len() as u64).to_le_bytes())
+            .expect("write header length");
+        file.write_all(header_json.as_bytes())
+            .expect("write header");
+        file.write_all(&data).expect("write tensor data");
+    }
+
+    #[test]
+    fn from_loaded_tensors_maps_hf_layouts_into_qwen_weights() {
+        let cfg = tiny_config();
+        let expected = tiny_weights(&cfg);
+        let loaded = tiny_loaded_tensors_from_weights(&cfg, &expected);
+
+        let actual =
+            Qwen2_5Weights::from_loaded_tensors(&cfg, loaded, expected.tie_word_embeddings)
+                .expect("loaded tensors must map into Qwen2.5 weights");
+
+        assert_eq!(actual.embed_tokens, expected.embed_tokens);
+        assert_eq!(actual.final_norm_w, expected.final_norm_w);
+        assert_eq!(actual.lm_head_w, expected.lm_head_w);
+        assert_eq!(actual.tie_word_embeddings, expected.tie_word_embeddings);
+        assert_eq!(actual.layers.len(), expected.layers.len());
+        assert_eq!(actual.layers[0].q_proj_w, expected.layers[0].q_proj_w);
+        assert_eq!(actual.layers[0].k_proj_w, expected.layers[0].k_proj_w);
+        assert_eq!(actual.layers[0].v_proj_w, expected.layers[0].v_proj_w);
+        assert_eq!(actual.layers[0].o_proj_w, expected.layers[0].o_proj_w);
+        assert_eq!(actual.layers[0].gate_proj_w, expected.layers[0].gate_proj_w);
+        assert_eq!(actual.layers[0].up_proj_w, expected.layers[0].up_proj_w);
+        assert_eq!(actual.layers[0].down_proj_w, expected.layers[0].down_proj_w);
+    }
+
+    #[test]
+    fn load_from_dir_builds_qwen_model_from_local_files_without_downloads() {
+        let cfg = tiny_config();
+        let weights = tiny_weights(&cfg);
+        let dir = tmp_dir("load_from_dir");
+        write_qwen_config(&dir.join("config.json"), &cfg, weights.tie_word_embeddings);
+        write_safetensors_f32(
+            &dir.join("model.safetensors"),
+            &tiny_loaded_tensors_from_weights(&cfg, &weights),
+        );
+
+        let loaded = Qwen2_5Model::load_from_dir(&dir)
+            .expect("local Qwen2.5 directory must load through family helper");
+        let expected = Qwen2_5Model::new(cfg.clone(), weights).expect("expected model");
+
+        assert_eq!(loaded.config(), &cfg);
+        assert_eq!(
+            loaded.prefill(&[TokenId(3), TokenId(7)]).unwrap(),
+            expected.prefill(&[TokenId(3), TokenId(7)]).unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn prefill_returns_one_logit_per_vocab_entry_for_single_token_prompt() {
         // Smallest meaningful prefill contract: returns a Vec<f32> of
@@ -1108,17 +1593,14 @@ mod tests {
     fn optimized_cpu_backend_preserves_prefill_logits() {
         let cfg = tiny_config();
         let scalar = Qwen2_5Model::new(cfg.clone(), tiny_weights(&cfg)).unwrap();
-        let optimized = Qwen2_5Model::with_cpu_kernel_backend(
+        let optimized = Qwen2_5Model::with_kernel_backend(
             cfg.clone(),
             tiny_weights(&cfg),
-            CpuKernelBackend::optimized(),
+            ocelotl_kernels::optimized_cpu_kernel_backend(),
         )
         .unwrap();
 
-        assert_eq!(
-            optimized.kernel_backend().mode(),
-            ocelotl_kernels::CpuKernelMode::Optimized
-        );
+        assert_eq!(optimized.kernel_backend().name(), "cpu");
         let scalar_logits = scalar
             .prefill(&[TokenId(3), TokenId(7), TokenId(11)])
             .unwrap();
@@ -1151,26 +1633,22 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
     #[test]
-    fn cubecl_wgpu_model_advertises_gpu_execution_backend_without_launch() {
+    fn model_accepts_non_cpu_kernel_backend_without_naming_concrete_backend() {
         let cfg = tiny_config();
-        let model = Qwen2_5Model::with_cubecl_wgpu_backend(
+        let model = Qwen2_5Model::with_kernel_backend(
             cfg.clone(),
             tiny_weights(&cfg),
-            ocelotl_kernels::CubeClKernelBackend::new_gpu(0),
+            Arc::new(TestGpuKernelBackend::new()),
         )
         .unwrap();
 
-        assert_eq!(model.execution_backend().name(), "cubecl");
+        assert_eq!(model.execution_backend().name(), "test-gpu");
         assert_eq!(
             model.execution_backend().context().device,
-            ocelotl_core::Device::Gpu { ordinal: 0 }
+            ocelotl_core::Device::Gpu { ordinal: 7 }
         );
-        assert_eq!(
-            model.kernel_backend().mode(),
-            ocelotl_kernels::CpuKernelMode::Scalar
-        );
+        assert_eq!(model.kernel_backend().name(), "test-gpu");
     }
 
     #[test]

@@ -1,5 +1,8 @@
-use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ocelotl_core::TokenId;
 use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode};
@@ -25,6 +28,15 @@ struct BenchWhisperArgs {
     expected_tokens_path: PathBuf,
     tokenizer_path: Option<PathBuf>,
     cpu_kernel_mode: CpuKernelMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchHfArgs {
+    repo: String,
+    revision: String,
+    local_dir: PathBuf,
+    include: Vec<String>,
+    execute: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +165,13 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("bench-whisper-transcribe") => run_bench_whisper_transcribe(parse_bench_args(args)?),
+        Some("fetch") => match args.next().as_deref() {
+            Some("hf") => run_fetch_hf(parse_fetch_hf_args(args)?),
+            Some(other) => Err(format!(
+                "unsupported fetch target {other:?}; supported targets: hf"
+            )),
+            None => Err("missing fetch target; expected `ocelotl fetch hf ...`".to_string()),
+        },
         Some("--help") | Some("-h") => {
             print_help();
             Ok(())
@@ -173,6 +192,9 @@ fn print_help() {
     println!("Commands:");
     println!(
         "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized]"
+    );
+    println!(
+        "  fetch hf --repo <repo> --revision <sha> --local-dir <path> [--include <pattern> ...] [--execute]"
     );
 }
 
@@ -221,6 +243,101 @@ fn parse_cpu_kernel_mode(value: &str) -> Result<CpuKernelMode, String> {
         other => Err(format!(
             "unsupported --cpu-kernel-mode {other:?}; supported values: scalar, optimized"
         )),
+    }
+}
+
+fn parse_fetch_hf_args(args: impl IntoIterator<Item = String>) -> Result<FetchHfArgs, String> {
+    let mut repo = None;
+    let mut revision = None;
+    let mut local_dir = None;
+    let mut include = Vec::new();
+    let mut execute = false;
+    let mut iter = args.into_iter();
+
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--repo" => repo = Some(next_arg(&mut iter, "--repo")?),
+            "--revision" => revision = Some(next_arg(&mut iter, "--revision")?),
+            "--local-dir" => local_dir = Some(PathBuf::from(next_arg(&mut iter, "--local-dir")?)),
+            "--include" => include.push(next_arg(&mut iter, "--include")?),
+            "--execute" => execute = true,
+            _ => return Err(format!("unsupported fetch hf flag {flag:?}")),
+        }
+    }
+
+    Ok(FetchHfArgs {
+        repo: repo.ok_or("missing --repo")?,
+        revision: revision.ok_or("missing --revision")?,
+        local_dir: local_dir.ok_or("missing --local-dir")?,
+        include,
+        execute,
+    })
+}
+
+fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    iter.next()
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+fn run_fetch_hf(args: FetchHfArgs) -> Result<(), String> {
+    let command_args = huggingface_cli_args(&args);
+    if !args.execute {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "planned",
+                "execute": false,
+                "command": command_line("huggingface-cli", &command_args),
+                "note": "pass --execute to run the explicit artifact fetch"
+            })
+        );
+        return Ok(());
+    }
+
+    let status = std::process::Command::new("huggingface-cli")
+        .args(&command_args)
+        .status()
+        .map_err(|err| format!("failed to run huggingface-cli: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("huggingface-cli exited with status {status}"))
+    }
+}
+
+fn huggingface_cli_args(args: &FetchHfArgs) -> Vec<String> {
+    let mut command = vec![
+        "download".to_string(),
+        args.repo.clone(),
+        "--revision".to_string(),
+        args.revision.clone(),
+        "--local-dir".to_string(),
+        args.local_dir.display().to_string(),
+        "--local-dir-use-symlinks".to_string(),
+        "False".to_string(),
+    ];
+    if !args.include.is_empty() {
+        command.push("--include".to_string());
+        command.extend(args.include.iter().cloned());
+    }
+    command
+}
+
+fn command_line(program: &str, args: &[String]) -> String {
+    std::iter::once(program.to_string())
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    if arg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '\\' | ':'))
+    {
+        arg.to_string()
+    } else {
+        format!("\"{}\"", arg.replace('"', "\\\""))
     }
 }
 
@@ -282,10 +399,10 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
 
     let tensor_started = Instant::now();
     let kernels = CpuKernelBackend::with_mode(args.cpu_kernel_mode);
-    let model = WhisperModel::with_cpu_kernel_backend(
+    let model = WhisperModel::with_kernel_backend(
         whisper_config.clone(),
         load_required_whisper_tensors(&args.model_path, &whisper_config)?,
-        kernels,
+        Arc::new(kernels),
     )
     .map_err(|err| format!("failed to construct Whisper model - {err:?}"))?;
     let tensor_load_model_ms = tensor_started.elapsed().as_millis();
@@ -730,6 +847,71 @@ mod tests {
             tokenizer_args.tokenizer_path,
             Some(PathBuf::from("tokenizer.json"))
         );
+    }
+
+    #[test]
+    fn fetch_hf_args_require_pinned_revision_and_plan_command() {
+        let args = parse_fetch_hf_args(
+            [
+                "--repo",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--revision",
+                "7ae557604adf67be50417f59c2c2f167def9a775",
+                "--local-dir",
+                "local-artifacts/qwen2_5_0_5b_instruct",
+                "--include",
+                "config.json",
+                "--include",
+                "model.safetensors",
+            ]
+            .iter()
+            .copied()
+            .map(str::to_string),
+        )
+        .expect("fetch args");
+
+        assert!(!args.execute);
+        assert_eq!(args.repo, "Qwen/Qwen2.5-0.5B-Instruct");
+        assert_eq!(args.revision, "7ae557604adf67be50417f59c2c2f167def9a775");
+        assert_eq!(
+            args.local_dir,
+            PathBuf::from("local-artifacts/qwen2_5_0_5b_instruct")
+        );
+        assert_eq!(args.include, vec!["config.json", "model.safetensors"]);
+        assert_eq!(
+            huggingface_cli_args(&args),
+            vec![
+                "download",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--revision",
+                "7ae557604adf67be50417f59c2c2f167def9a775",
+                "--local-dir",
+                "local-artifacts/qwen2_5_0_5b_instruct",
+                "--local-dir-use-symlinks",
+                "False",
+                "--include",
+                "config.json",
+                "model.safetensors",
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_hf_args_reject_missing_revision() {
+        let err = parse_fetch_hf_args(
+            [
+                "--repo",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--local-dir",
+                "local-artifacts/qwen2_5_0_5b_instruct",
+            ]
+            .iter()
+            .copied()
+            .map(str::to_string),
+        )
+        .expect_err("unpinned fetch must be rejected");
+
+        assert_eq!(err, "missing --revision");
     }
 
     #[test]
