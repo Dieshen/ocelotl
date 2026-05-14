@@ -1,9 +1,12 @@
+//! Generic continuous-batch scheduler.
+//!
+//! Family-specific adapters (e.g. `QwenGreedyModel`, `generate_qwen_batch`)
+//! live in the matching family module (`crate::qwen`), not here. Keep this
+//! file generic over `GreedyDecodeModel`.
+
 use std::collections::VecDeque;
 
 use ocelotl_core::{InvalidRequestError, OcelotlError, Result, RuntimeError, TokenId};
-use ocelotl_models::Qwen2_5Model;
-
-use crate::decode_one_token;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
@@ -75,22 +78,6 @@ pub struct SchedulerEvent {
 
 pub trait GreedyDecodeModel {
     fn decode_one(&self, prompt_tokens: &[TokenId]) -> Result<TokenId>;
-}
-
-pub struct QwenGreedyModel<'a> {
-    model: &'a Qwen2_5Model,
-}
-
-impl<'a> QwenGreedyModel<'a> {
-    pub fn new(model: &'a Qwen2_5Model) -> Self {
-        Self { model }
-    }
-}
-
-impl GreedyDecodeModel for QwenGreedyModel<'_> {
-    fn decode_one(&self, prompt_tokens: &[TokenId]) -> Result<TokenId> {
-        decode_one_token(self.model, prompt_tokens)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -297,18 +284,6 @@ impl ContinuousBatchScheduler {
     }
 }
 
-pub fn generate_qwen_batch(
-    model: &Qwen2_5Model,
-    requests: Vec<ScheduledGenerationRequest>,
-    config: SchedulerConfig,
-) -> Result<Vec<ScheduledGenerationResponse>> {
-    let mut scheduler = ContinuousBatchScheduler::new(config);
-    for request in requests {
-        scheduler.submit(request)?;
-    }
-    scheduler.run_to_completion(&QwenGreedyModel::new(model))
-}
-
 fn runtime_err(message: impl Into<String>) -> OcelotlError {
     OcelotlError::Runtime(RuntimeError {
         message: message.into(),
@@ -317,9 +292,6 @@ fn runtime_err(message: impl Into<String>) -> OcelotlError {
 
 #[cfg(test)]
 mod tests {
-    use ocelotl_core::DType;
-    use ocelotl_models::{Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Weights, transpose_2d};
-
     use super::*;
 
     #[derive(Debug)]
@@ -339,50 +311,6 @@ mod tests {
             prompt_tokens: prompt.iter().copied().map(TokenId).collect(),
             max_new_tokens,
         }
-    }
-
-    fn tiny_qwen_model() -> Qwen2_5Model {
-        let cfg = Qwen2_5Config {
-            vocab_size: 8,
-            num_hidden_layers: 1,
-            hidden_size: 4,
-            intermediate_size: 8,
-            num_attention_heads: 2,
-            num_key_value_heads: 1,
-            head_dim: 2,
-            context_length: 16,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            dtype: DType::F32,
-        };
-        let h = cfg.hidden_size;
-        let v = cfg.vocab_size;
-        let q_out = cfg.num_attention_heads * cfg.head_dim;
-        let kv_out = cfg.num_key_value_heads * cfg.head_dim;
-        let i_size = cfg.intermediate_size;
-        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32) * 0.01).collect();
-        let lm_head_w = transpose_2d(&embed, v, h);
-        let weights = Qwen2_5Weights {
-            embed_tokens: embed,
-            layers: vec![Qwen2_5LayerWeights {
-                q_proj_w: vec![0.01; h * q_out],
-                q_proj_b: vec![0.0; q_out],
-                k_proj_w: vec![0.01; h * kv_out],
-                k_proj_b: vec![0.0; kv_out],
-                v_proj_w: vec![0.01; h * kv_out],
-                v_proj_b: vec![0.0; kv_out],
-                o_proj_w: vec![0.01; q_out * h],
-                input_layernorm_w: vec![1.0; h],
-                post_attention_layernorm_w: vec![1.0; h],
-                gate_proj_w: vec![0.01; h * i_size],
-                up_proj_w: vec![0.01; h * i_size],
-                down_proj_w: vec![0.01; i_size * h],
-            }],
-            final_norm_w: vec![1.0; h],
-            lm_head_w,
-            tie_word_embeddings: true,
-        };
-        Qwen2_5Model::new(cfg, weights).expect("tiny model must construct")
     }
 
     #[test]
@@ -505,23 +433,5 @@ mod tests {
         assert_eq!(emitted[0], 1);
         assert_eq!(emitted[1], 2);
         assert!(emitted[2..].iter().all(|id| *id == 1));
-    }
-
-    #[test]
-    fn qwen_batched_generation_matches_unbatched_decode() {
-        let model = tiny_qwen_model();
-        let requests = vec![request(1, &[1, 2], 1), request(2, &[2, 3], 1)];
-        let expected: Vec<_> = requests
-            .iter()
-            .map(|req| ScheduledGenerationResponse {
-                request_id: req.request_id,
-                tokens: vec![decode_one_token(&model, &req.prompt_tokens).unwrap()],
-            })
-            .collect();
-
-        let actual = generate_qwen_batch(&model, requests, SchedulerConfig { max_queue_len: 4 })
-            .expect("batched generation must succeed");
-
-        assert_eq!(actual, expected);
     }
 }

@@ -1,12 +1,29 @@
 //! Qwen-family runtime entry points.
+//!
+//! Public surface for callers:
+//! - `prefill`, `decode_one_token` — stateless shims over `Qwen2_5Model`.
+//! - `prepare_qwen2_5_contiguous_cache`, `decode_one_token_with_contiguous_cache`,
+//!   `prepare_qwen2_5_paged_cache`, `decode_one_token_with_paged_cache` —
+//!   cache-aware decode loops.
+//! - `generate_qwen_batch`, `QwenGreedyModel` — batched generation via the
+//!   generic scheduler.
+//! - `qwen2_5_kv_layout` — Qwen-shaped KV cache layout constructor (re-exported
+//!   from the generic `kv_cache` module for callers that want the family-named
+//!   path).
 
 use ocelotl_core::{InvalidRequestError, OcelotlError, Result, RuntimeError, TokenId};
-use ocelotl_models::Qwen2_5Model;
+use ocelotl_models::qwen::Qwen2_5Model;
 
 use crate::{
     greedy_sample,
     kv_cache::{ContiguousKvCache, PagedKvCache, PagedKvCacheAllocator},
+    scheduler::{
+        ContinuousBatchScheduler, GreedyDecodeModel, ScheduledGenerationRequest,
+        ScheduledGenerationResponse, SchedulerConfig,
+    },
 };
+
+pub use crate::kv_cache::qwen2_5_kv_layout;
 
 /// Run prefill on the given model and return final-position logits.
 ///
@@ -215,4 +232,116 @@ fn runtime_error(message: impl Into<String>) -> OcelotlError {
     OcelotlError::Runtime(RuntimeError {
         message: message.into(),
     })
+}
+
+/// Adapter that lets the generic `ContinuousBatchScheduler` drive a Qwen2.5
+/// model through the family's `decode_one_token` shim. Kept here (rather than
+/// in `scheduler.rs`) so the scheduler stays generic over model families and
+/// every Qwen-specific name lives in this module.
+pub struct QwenGreedyModel<'a> {
+    model: &'a Qwen2_5Model,
+}
+
+impl<'a> QwenGreedyModel<'a> {
+    pub fn new(model: &'a Qwen2_5Model) -> Self {
+        Self { model }
+    }
+}
+
+impl GreedyDecodeModel for QwenGreedyModel<'_> {
+    fn decode_one(&self, prompt_tokens: &[TokenId]) -> Result<TokenId> {
+        decode_one_token(self.model, prompt_tokens)
+    }
+}
+
+/// Run a batch of generation requests against a Qwen2.5 model through the
+/// generic `ContinuousBatchScheduler`.
+pub fn generate_qwen_batch(
+    model: &Qwen2_5Model,
+    requests: Vec<ScheduledGenerationRequest>,
+    config: SchedulerConfig,
+) -> Result<Vec<ScheduledGenerationResponse>> {
+    let mut scheduler = ContinuousBatchScheduler::new(config);
+    for request in requests {
+        scheduler.submit(request)?;
+    }
+    scheduler.run_to_completion(&QwenGreedyModel::new(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use ocelotl_core::DType;
+    use ocelotl_models::qwen::{Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Weights, transpose_2d};
+
+    use super::*;
+
+    fn request(id: u64, prompt: &[u32], max_new_tokens: usize) -> ScheduledGenerationRequest {
+        ScheduledGenerationRequest {
+            request_id: id,
+            prompt_tokens: prompt.iter().copied().map(TokenId).collect(),
+            max_new_tokens,
+        }
+    }
+
+    fn tiny_qwen_model() -> Qwen2_5Model {
+        let cfg = Qwen2_5Config {
+            vocab_size: 8,
+            num_hidden_layers: 1,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            context_length: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            dtype: DType::F32,
+        };
+        let h = cfg.hidden_size;
+        let v = cfg.vocab_size;
+        let q_out = cfg.num_attention_heads * cfg.head_dim;
+        let kv_out = cfg.num_key_value_heads * cfg.head_dim;
+        let i_size = cfg.intermediate_size;
+        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32) * 0.01).collect();
+        let lm_head_w = transpose_2d(&embed, v, h);
+        let weights = Qwen2_5Weights {
+            embed_tokens: embed,
+            layers: vec![Qwen2_5LayerWeights {
+                q_proj_w: vec![0.01; h * q_out],
+                q_proj_b: vec![0.0; q_out],
+                k_proj_w: vec![0.01; h * kv_out],
+                k_proj_b: vec![0.0; kv_out],
+                v_proj_w: vec![0.01; h * kv_out],
+                v_proj_b: vec![0.0; kv_out],
+                o_proj_w: vec![0.01; q_out * h],
+                input_layernorm_w: vec![1.0; h],
+                post_attention_layernorm_w: vec![1.0; h],
+                gate_proj_w: vec![0.01; h * i_size],
+                up_proj_w: vec![0.01; h * i_size],
+                down_proj_w: vec![0.01; i_size * h],
+            }],
+            final_norm_w: vec![1.0; h],
+            lm_head_w,
+            tie_word_embeddings: true,
+        };
+        Qwen2_5Model::new(cfg, weights).expect("tiny model must construct")
+    }
+
+    #[test]
+    fn qwen_batched_generation_matches_unbatched_decode() {
+        let model = tiny_qwen_model();
+        let requests = vec![request(1, &[1, 2], 1), request(2, &[2, 3], 1)];
+        let expected: Vec<_> = requests
+            .iter()
+            .map(|req| ScheduledGenerationResponse {
+                request_id: req.request_id,
+                tokens: vec![decode_one_token(&model, &req.prompt_tokens).unwrap()],
+            })
+            .collect();
+
+        let actual = generate_qwen_batch(&model, requests, SchedulerConfig { max_queue_len: 4 })
+            .expect("batched generation must succeed");
+
+        assert_eq!(actual, expected);
+    }
 }

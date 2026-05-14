@@ -55,7 +55,7 @@
 //! commit alongside the impl change.
 
 use ocelotl_core::{DType, TokenId};
-use ocelotl_models::{
+use ocelotl_models::qwen::{
     Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
 };
 

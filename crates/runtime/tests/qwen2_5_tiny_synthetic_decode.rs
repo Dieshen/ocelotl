@@ -39,10 +39,10 @@
 //! `test-support` feature) is worth doing once a third caller appears.
 
 use ocelotl_core::{DType, OcelotlError, TokenId};
-use ocelotl_models::{
+use ocelotl_models::qwen::{
     Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
 };
-use ocelotl_runtime::decode_one_token;
+use ocelotl_runtime::qwen::decode_one_token;
 
 /// The TokenId M3.8 pins for the M3.7 prompt `[3, 7, 11]` on this tiny
 /// synthetic Qwen2.5 model. Derived from the M3.7 fixture: the largest

@@ -1,6 +1,6 @@
 use ocelotl_core::{OcelotlError, TokenId};
 use ocelotl_models::whisper::audio::AudioMetadata;
-use ocelotl_runtime::{
+use ocelotl_runtime::whisper::{
     ChunkedTranscriptionRequest, TranscriptionChunkingConfig, plan_transcription_chunks,
 };
 

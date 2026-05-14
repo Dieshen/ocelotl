@@ -4,7 +4,7 @@ use ocelotl_models::whisper::audio::{
     AudioMetadata, WHISPER_FFT_SIZE, WHISPER_MEL_BINS, log_mel_spectrogram,
 };
 use ocelotl_models::whisper::{WhisperConfig, WhisperModel, required_whisper_tensor_names};
-use ocelotl_runtime::{
+use ocelotl_runtime::whisper::{
     WhisperDecodeRequest, WhisperTranscriptionRequest, decode_whisper_transcription,
     prepare_whisper_transcription, transcribe_whisper,
 };

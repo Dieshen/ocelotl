@@ -1,34 +1,30 @@
 //! Request lifecycle and generation runtime.
+//!
+//! Family-specific entry points live in submodules and are intentionally NOT
+//! re-exported at the crate root. Call sites use the family namespace
+//! explicitly:
+//!
+//! - `ocelotl_runtime::qwen::prefill`, `decode_one_token`, cache helpers,
+//!   `generate_qwen_batch`, `QwenGreedyModel`, `qwen2_5_kv_layout`.
+//! - `ocelotl_runtime::whisper::transcribe`, `prepare_whisper_transcription`,
+//!   `plan_transcription_chunks`, etc.
+//!
+//! Generic primitives (`greedy_sample`, KV cache structs, scheduler) live at
+//! the crate root.
 
 mod kv_cache;
-mod qwen;
+pub mod qwen;
 mod sampling;
 mod scheduler;
-mod whisper;
-mod whisper_streaming;
+pub mod whisper;
 
 use std::sync::Arc;
 
-pub use kv_cache::{ContiguousKvCache, PagedKvCache, PagedKvCacheAllocator, qwen2_5_kv_layout};
-pub use qwen::{
-    Qwen2_5ContiguousCacheState, Qwen2_5PagedCacheState, decode_one_token,
-    decode_one_token_with_contiguous_cache, decode_one_token_with_paged_cache, prefill,
-    prepare_qwen2_5_contiguous_cache, prepare_qwen2_5_paged_cache,
-};
+pub use kv_cache::{ContiguousKvCache, PagedKvCache, PagedKvCacheAllocator};
 pub use sampling::greedy_sample;
 pub use scheduler::{
-    ContinuousBatchScheduler, GreedyDecodeModel, QwenGreedyModel, ScheduledGenerationRequest,
+    ContinuousBatchScheduler, GreedyDecodeModel, ScheduledGenerationRequest,
     ScheduledGenerationResponse, SchedulerConfig, SchedulerEvent, SchedulerRequestState,
-    generate_qwen_batch,
-};
-pub use whisper::{
-    TranscriptionRequest, TranscriptionResponse, WhisperDecodeRequest, WhisperTranscriptionRequest,
-    WhisperTranscriptionResponse, WhisperTranscriptionState, decode_whisper_transcription,
-    prepare_whisper_transcription, transcribe, transcribe_whisper,
-};
-pub use whisper_streaming::{
-    ChunkedTranscriptionRequest, TranscriptionChunk, TranscriptionChunkingConfig,
-    plan_transcription_chunks,
 };
 
 use ocelotl_core::{
@@ -38,7 +34,8 @@ use ocelotl_core::{
 #[cfg(feature = "cubecl-wgpu")]
 use ocelotl_kernels::CubeClKernelBackend;
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
-use ocelotl_models::{Qwen2_5Config, Qwen2_5Model, Qwen2_5Weights, tiny_synthetic_forward};
+use ocelotl_models::qwen::{Qwen2_5Config, Qwen2_5Model, Qwen2_5Weights};
+use ocelotl_models::tiny_synthetic_forward;
 use serde::{Deserialize, Serialize};
 
 // Re-export the response vocabulary type so callers can
@@ -223,6 +220,14 @@ mod tests {
     use super::*;
     use ocelotl_core::{DType, KvCacheStore};
 
+    // Pull in family-specific entry points the tests exercise. They live in
+    // submodules now; importing them once here keeps every test below readable.
+    use super::qwen::{
+        decode_one_token, decode_one_token_with_contiguous_cache,
+        decode_one_token_with_paged_cache, prefill, prepare_qwen2_5_contiguous_cache,
+        prepare_qwen2_5_paged_cache, qwen2_5_kv_layout,
+    };
+
     /// Build a model metadata fixture with a controllable context length.
     /// Other fields are placeholders — validation only inspects context_length.
     fn make_model(context_length: usize) -> ModelMetadata {
@@ -254,7 +259,7 @@ mod tests {
     }
 
     fn tiny_qwen_config_and_weights() -> (Qwen2_5Config, Qwen2_5Weights) {
-        use ocelotl_models::{Qwen2_5LayerWeights, transpose_2d};
+        use ocelotl_models::qwen::{Qwen2_5LayerWeights, transpose_2d};
 
         let cfg = Qwen2_5Config {
             vocab_size: 8,
@@ -515,7 +520,7 @@ mod tests {
         // crate doesn't own model fixtures; the goal of this test is to
         // pin the API shape, not to re-validate prefill numerics (that's
         // pinned in the models crate's tiny-synthetic integration test).
-        use ocelotl_models::{
+        use ocelotl_models::qwen::{
             Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
         };
         let cfg = Qwen2_5Config {
@@ -575,7 +580,7 @@ mod tests {
         // failures verbatim. An empty prompt is InvalidRequest at the
         // model boundary (Qwen2_5Model::prefill); the runtime wrapper
         // must not swallow or remap it.
-        use ocelotl_models::{
+        use ocelotl_models::qwen::{
             Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
         };
         let cfg = Qwen2_5Config {
@@ -636,8 +641,8 @@ mod tests {
     /// Kept inline rather than extracted to a helper to keep these tests
     /// self-contained: the runtime crate doesn't own model fixtures, and a
     /// helper would only have the two callers in this module.
-    fn tiny_model_for_decode() -> ocelotl_models::Qwen2_5Model {
-        use ocelotl_models::{
+    fn tiny_model_for_decode() -> ocelotl_models::qwen::Qwen2_5Model {
+        use ocelotl_models::qwen::{
             Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, transpose_2d,
         };
         let cfg = Qwen2_5Config {

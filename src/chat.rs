@@ -10,7 +10,7 @@ use ocelotl_core::{
     GenerationOptions, InvalidModelError, InvalidRequestError, IoError, OcelotlError, Result,
     TokenId, TokenizerError, UnsupportedError,
 };
-use ocelotl_models::Qwen2_5Model;
+use ocelotl_models::qwen::Qwen2_5Model;
 use ocelotl_tokenizer::{ChatMessage, ChatTemplate, JsonTokenizer, Tokenizer};
 use serde::Deserialize;
 
@@ -96,7 +96,7 @@ impl ChatModel {
         let mut generated = Vec::with_capacity(options.max_new_tokens);
 
         for _ in 0..options.max_new_tokens {
-            let next = ocelotl_runtime::decode_one_token(&self.model, &prompt_tokens)?;
+            let next = ocelotl_runtime::qwen::decode_one_token(&self.model, &prompt_tokens)?;
             generated.push(next);
             prompt_tokens.push(next);
         }
@@ -159,7 +159,7 @@ mod tests {
     use std::path::PathBuf;
 
     use ocelotl_core::DType;
-    use ocelotl_models::{Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Weights};
+    use ocelotl_models::qwen::{Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Weights};
 
     use super::*;
 

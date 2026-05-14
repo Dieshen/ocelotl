@@ -1,7 +1,7 @@
 use ocelotl_core::{OcelotlError, TokenId};
 use ocelotl_models::whisper::audio::{AudioMetadata, WHISPER_FFT_SIZE, WHISPER_MEL_BINS};
 use ocelotl_models::whisper::{WhisperTinyConfig, WhisperTinyModel, WhisperTinyWeights};
-use ocelotl_runtime::{TranscriptionRequest, transcribe};
+use ocelotl_runtime::whisper::{TranscriptionRequest, transcribe};
 
 #[test]
 fn transcribe_rejects_empty_audio_before_preprocessing_or_model_compute() {

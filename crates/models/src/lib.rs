@@ -12,11 +12,14 @@
 pub mod gemma;
 pub mod qwen;
 pub mod whisper;
-pub use gemma::{Gemma4Config, Gemma4Quantization};
-pub use qwen::{
-    Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, Qwen3_5Config,
-    parse_qwen3_5_config_json, required_tensor_names, transpose_2d, validate_qwen2_5_tensors,
-};
+
+// Family-specific types are intentionally NOT re-exported at the crate root.
+// Call sites use the family namespace explicitly:
+//   ocelotl_models::qwen::Qwen2_5Model
+//   ocelotl_models::gemma::Gemma4Config
+//   ocelotl_models::whisper::WhisperModel
+// This makes the layering visible at every use site and keeps the crate root
+// from filling up as new families land.
 
 use ocelotl_core::{InvalidRequestError, ModelMetadata, OcelotlError, Result, TokenId};
 use ocelotl_kernels::matmul;

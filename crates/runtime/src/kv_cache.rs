@@ -4,7 +4,7 @@ use ocelotl_core::{
     DType, Device, KvCacheLayout, KvCacheStore, OcelotlError, PagedKvCacheLayout, Result,
     RuntimeError,
 };
-use ocelotl_models::Qwen2_5Config;
+use ocelotl_models::qwen::Qwen2_5Config;
 
 #[derive(Debug, Clone)]
 pub struct ContiguousKvCache {
