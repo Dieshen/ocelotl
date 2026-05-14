@@ -16,6 +16,7 @@ cubecl-wgpu = ["ocelotl-kernels/cubecl-wgpu"]
 ocelotl-core.workspace = true
 ocelotl-kernels.workspace = true
 ocelotl-loader.workspace = true
+rayon = "1.10"
 serde.workspace = true
 serde_json.workspace = true
 

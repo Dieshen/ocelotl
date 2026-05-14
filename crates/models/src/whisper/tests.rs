@@ -391,6 +391,107 @@ fn decoder_state_append_matches_full_context_logits() {
 }
 
 #[test]
+fn threaded_attention_matches_serial_bit_for_bit() {
+    // Parity oracle for the rayon parallel dispatch inside
+    // attention_from_projected. Run the same projected-attention call once
+    // through a single-thread CPU backend and once through a 4-thread
+    // backend; both must produce bit-identical context outputs because
+    // each Q row writes a disjoint slice and the per-row K-loop ordering
+    // is preserved across the parallel split.
+    let q_seq = 64usize; // > PARALLEL_ATTENTION_MIN_Q so the pool dispatches
+    let kv_seq = 64usize;
+    let heads = 4usize;
+    let head_dim = 8usize;
+    let state = heads * head_dim;
+    let q: Vec<f32> = (0..(q_seq * state))
+        .map(|i| ((i as f32) * 0.011).sin())
+        .collect();
+    let k: Vec<f32> = (0..(kv_seq * state))
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let v: Vec<f32> = (0..(kv_seq * state))
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let out_w: Vec<f32> = (0..(state * state)).map(|i| (i as f32) * 0.001).collect();
+    let out_b: Vec<f32> = vec![0.05_f32; state];
+
+    let serial_backend = ocelotl_kernels::CpuKernelBackend::scalar();
+    let threaded_backend = ocelotl_kernels::CpuKernelBackend::with_mode_and_threads(
+        ocelotl_kernels::CpuKernelMode::Scalar,
+        4,
+    )
+    .expect("4-thread backend must build");
+
+    let serial_out = super::primitives::attention_from_projected(
+        &serial_backend,
+        &q,
+        q_seq,
+        &k,
+        &v,
+        kv_seq,
+        state,
+        heads,
+        &out_w,
+        &out_b,
+        false,
+    )
+    .expect("serial attention must succeed");
+
+    let threaded_out = super::primitives::attention_from_projected(
+        &threaded_backend,
+        &q,
+        q_seq,
+        &k,
+        &v,
+        kv_seq,
+        state,
+        heads,
+        &out_w,
+        &out_b,
+        false,
+    )
+    .expect("threaded attention must succeed");
+
+    assert_eq!(
+        serial_out, threaded_out,
+        "threaded attention_from_projected must produce bit-identical output to serial"
+    );
+
+    // Also verify the causal path is parity-clean. Causal masking affects
+    // the visible kv range per row but does not affect the per-row K-loop
+    // ordering, so the parallel split should still be bit-exact.
+    let serial_causal = super::primitives::attention_from_projected(
+        &serial_backend,
+        &q,
+        q_seq,
+        &k,
+        &v,
+        kv_seq,
+        state,
+        heads,
+        &out_w,
+        &out_b,
+        true,
+    )
+    .expect("serial causal attention must succeed");
+    let threaded_causal = super::primitives::attention_from_projected(
+        &threaded_backend,
+        &q,
+        q_seq,
+        &k,
+        &v,
+        kv_seq,
+        state,
+        heads,
+        &out_w,
+        &out_b,
+        true,
+    )
+    .expect("threaded causal attention must succeed");
+    assert_eq!(serial_causal, threaded_causal);
+}
+
+#[test]
 fn decoder_state_append_rejects_context_overflow_before_compute() {
     let cfg = tiny_config();
     let model = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("model");

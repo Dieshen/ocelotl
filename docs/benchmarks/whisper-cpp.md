@@ -700,3 +700,62 @@ remaining gap:
    (`unsafe`) but biggest remaining tile-level win.
 3. **Native F16/BF16 weight matmul** to halve DRAM traffic. Roadmap P1.1,
    requires a typed-weight-block design doc first.
+
+## W-ASR.39 Multi-Threaded Whisper Attention Q-Row Loop
+
+Following W-ASR.38, `whisper/primitives.rs::attention_from_projected` now
+also uses `kernels.cpu_thread_pool()` to parallelize its outer Q-row loop
+when `q_seq >= 32`. The Q range is split into one chunk per worker thread;
+each chunk owns a single `scores` scratch buffer that is reused across all
+rows it processes (the serial path's allocation discipline applied per
+worker). The first iteration of this work used per-row scratch allocation
+and regressed tiny.en/base.en because the allocator overhead exceeded the
+parallel gain at small `state` values; the committed version allocates
+scratch once per worker chunk and is faster across every size.
+
+Disjoint context-row writes plus identical per-row K-loop order keep the
+result bit-identical to the serial path. The parity unit test
+`threaded_attention_matches_serial_bit_for_bit` pins that invariant for
+both causal and non-causal attention.
+
+Fresh local release runs on 2026-05-14, scalar mode, `t=4`, exact-token
+parity in every cell:
+
+| Size      | W-ASR.38 t=4 total | W-ASR.39 t=4 total | Change      | vs whisper.cpp greedy   |
+| --------- | ------------------ | ------------------ | ----------- | ----------------------- |
+| tiny.en   | `1,013 ms`         | `996 ms`           | `~1.7%`     | `~3.03x` (was `~3.08x`) |
+| base.en   | `1,398 ms`         | `1,245 ms`         | ~11% faster | `~1.87x` (was `~2.10x`) |
+| small.en  | `4,076 ms`         | `3,373 ms`         | ~17% faster | `~1.43x` (was `~1.72x`) |
+| medium.en | `11,646 ms`        | `9,382 ms`         | ~19% faster | `~1.24x` (was `~1.54x`) |
+| large-v2  | `20,430 ms`        | `16,435 ms`        | ~20% faster | `~1.08x` (was `~1.35x`) |
+
+Encoder-stage detail:
+
+| Size      | W-ASR.38 t=4 encoder | W-ASR.39 t=4 encoder | encoder change |
+| --------- | -------------------- | -------------------- | -------------- |
+| tiny.en   | `607 ms`             | `593 ms`             | `~2%`          |
+| base.en   | `1,181 ms`           | `1,026 ms`           | ~13% faster    |
+| small.en  | `3,382 ms`           | `2,718 ms`           | ~20% faster    |
+| medium.en | `9,433 ms`           | `7,383 ms`           | ~22% faster    |
+| large-v2  | `16,294 ms`          | `12,365 ms`          | ~24% faster    |
+
+base/small/medium/large all comfortably clear the `<=2x` mark; large-v2 is
+within `~1.08x` of greedy whisper.cpp, which is the closest a Whisper run
+has been on this benchmark. tiny.en is essentially unchanged because the
+encoder's attention shapes are small enough that the parallel split adds
+overhead without proportional compute to spread.
+
+The next CPU work options, in order of remaining likely impact:
+
+1. **AVX2 SIMD opt-in** for the `linear_out_by_in_compute` tile inner loop
+   behind a new `CpuKernelMode::Avx2`. Roadmap P0.4. Highest remaining
+   single-host gain but introduces `unsafe` and a target-feature gate.
+2. **Native F16/BF16 weight matmul** to halve DRAM traffic. Roadmap P1.1,
+   requires a typed-weight-block design doc first.
+3. **Bigger register tile (4x8 + K-unroll)** in
+   `linear_out_by_in_compute`. Roadmap P0.1b. Cheap probe; register
+   pressure may or may not produce a win at f32 on 16-XMM-register hosts.
+4. **Tiny-specific shape-aware fallback** (avoid parallel dispatch on
+   matmuls and attentions where per-call serial cost is small enough that
+   rayon overhead dominates). Would close tiny.en's `~3x` gap without
+   touching the bigger sizes.

@@ -230,6 +230,12 @@ pub(super) fn attention_with_precomputed_kv(
     )
 }
 
+/// Below this Q-sequence length, rayon dispatch overhead exceeds the
+/// per-row compute cost. Encoder self-attention hits q_seq = audio_ctx
+/// (>=1500 for all classic Whisper sizes) and always parallelizes; full-
+/// context decoder attention has short q_seq and stays serial.
+const PARALLEL_ATTENTION_MIN_Q: usize = 32;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attention_from_projected(
     kernels: &dyn KernelBackend,
@@ -273,44 +279,108 @@ pub(super) fn attention_from_projected(
             &format!("expected length {kv_expected}, got {}", v.len()),
         ));
     }
+    if causal && q_seq > kv_seq {
+        return Err(invalid_request(
+            "attention.causal",
+            "causal self-attention query length exceeds key length",
+        ));
+    }
 
     let head_dim = state / heads;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let mut context = vec![0.0_f32; q_seq * state];
-    let mut scores = vec![0.0_f32; kv_seq];
 
-    for qi in 0..q_seq {
-        for head in 0..heads {
-            let visible = if causal { qi + 1 } else { kv_seq };
-            if visible > kv_seq {
-                return Err(invalid_request(
-                    "attention.causal",
-                    "causal self-attention query length exceeds key length",
-                ));
-            }
-            let q_base = qi * state + head * head_dim;
-            let q_row = &q[q_base..q_base + head_dim];
-            for (ki, score) in scores.iter_mut().enumerate().take(visible) {
-                let k_base = ki * state + head * head_dim;
-                let k_row = &k[k_base..k_base + head_dim];
-                let acc = dot_unrolled_4(q_row, k_row);
-                *score = acc * scale;
-            }
-            softmax(&mut scores[..visible]);
-            let context_base = qi * state + head * head_dim;
-            for dim in 0..head_dim {
-                context[context_base + dim] = 0.0;
-            }
-            for (ki, &p) in scores.iter().enumerate().take(visible) {
-                let v_base = ki * state + head * head_dim;
-                for dim in 0..head_dim {
-                    context[context_base + dim] += p * v[v_base + dim];
-                }
+    // Parallel dispatch when a pool is available and the workload is large
+    // enough to amortize rayon overhead. The Q range is split into one
+    // chunk per worker thread; each chunk owns a single `scores` scratch
+    // buffer that is reused across all rows it processes, which is the
+    // serial path's allocation discipline applied per worker. Disjoint
+    // context-row writes plus identical per-row K-loop order keep the
+    // result bit-identical to the serial path.
+    match kernels.cpu_thread_pool() {
+        Some(pool) if q_seq >= PARALLEL_ATTENTION_MIN_Q => {
+            use rayon::prelude::*;
+            let threads = pool.current_num_threads().max(1);
+            let rows_per_chunk = q_seq.div_ceil(threads);
+            let chunk_len = rows_per_chunk * state;
+            pool.install(|| {
+                context
+                    .par_chunks_mut(chunk_len)
+                    .enumerate()
+                    .for_each(|(idx, ctx_chunk)| {
+                        let row_start = idx * rows_per_chunk;
+                        let chunk_rows = ctx_chunk.len() / state;
+                        let mut scores = vec![0.0_f32; kv_seq];
+                        for local_row in 0..chunk_rows {
+                            let qi = row_start + local_row;
+                            let ctx_row =
+                                &mut ctx_chunk[local_row * state..(local_row + 1) * state];
+                            compute_attention_row_with_scratch(
+                                qi, q, k, v, kv_seq, state, heads, head_dim, scale, causal,
+                                ctx_row, &mut scores,
+                            );
+                        }
+                    });
+            });
+        }
+        _ => {
+            let mut scores = vec![0.0_f32; kv_seq];
+            for qi in 0..q_seq {
+                let ctx_row = &mut context[qi * state..(qi + 1) * state];
+                compute_attention_row_with_scratch(
+                    qi, q, k, v, kv_seq, state, heads, head_dim, scale, causal, ctx_row,
+                    &mut scores,
+                );
             }
         }
     }
 
     linear(kernels, &context, q_seq, state, out_w, state, Some(out_b))
+}
+
+/// Per-Q-row attention body that borrows its `scores` scratch from the
+/// caller. Used by both serial and parallel paths so the scratch buffer is
+/// reused across rows without reallocation; the parallel path allocates one
+/// scratch per worker chunk.
+#[allow(clippy::too_many_arguments)]
+fn compute_attention_row_with_scratch(
+    qi: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    kv_seq: usize,
+    state: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
+    ctx_row: &mut [f32],
+    scores: &mut [f32],
+) {
+    debug_assert_eq!(ctx_row.len(), state);
+    debug_assert_eq!(scores.len(), kv_seq);
+    for head in 0..heads {
+        let visible = if causal { qi + 1 } else { kv_seq };
+        let q_base = qi * state + head * head_dim;
+        let q_row = &q[q_base..q_base + head_dim];
+        for (ki, score) in scores.iter_mut().enumerate().take(visible) {
+            let k_base = ki * state + head * head_dim;
+            let k_row = &k[k_base..k_base + head_dim];
+            let acc = dot_unrolled_4(q_row, k_row);
+            *score = acc * scale;
+        }
+        softmax(&mut scores[..visible]);
+        let context_base = head * head_dim;
+        for dim in 0..head_dim {
+            ctx_row[context_base + dim] = 0.0;
+        }
+        for (ki, &p) in scores.iter().enumerate().take(visible) {
+            let v_base = ki * state + head * head_dim;
+            for dim in 0..head_dim {
+                ctx_row[context_base + dim] += p * v[v_base + dim];
+            }
+        }
+    }
 }
 
 fn dot_unrolled_4(a: &[f32], b: &[f32]) -> f32 {
