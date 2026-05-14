@@ -759,3 +759,72 @@ The next CPU work options, in order of remaining likely impact:
    matmuls and attentions where per-call serial cost is small enough that
    rayon overhead dominates). Would close tiny.en's `~3x` gap without
    touching the bigger sizes.
+
+## W-ASR.40 AVX2 + FMA `linear_out_by_in`
+
+New `CpuKernelMode::Avx2` variant. Runtime feature detection in
+`CpuKernelBackend::with_mode_and_threads` rejects the mode with a typed
+Kernel error on hosts that do not advertise both `avx2` and `fma`.
+`crates/kernels/src/cpu_avx2.rs` holds the project's single `unsafe`
+boundary: one `#[target_feature(enable = "avx2,fma")]` function plus a
+horizontal-sum helper.
+
+The tile keeps the existing 4 row × 4 output shape but replaces each f32
+accumulator with a `__m256` (8-lane FMA in the K direction). 16 vector
+accumulators fit comfortably in 16 YMM registers on Skylake+. After the
+SIMD K-loop the accumulators horizontally reduce to scalar and the K, out,
+and row tails fall back to scalar Rust. Scalar mode remains the project
+parity oracle; `avx2_linear_out_by_in_matches_scalar_within_tolerance`
+pins the AVX2 output to within `1e-4` (relative or absolute) of scalar.
+AVX2 + threads composes cleanly: each rayon chunk runs the AVX2 compute
+body on its disjoint output rows, and
+`avx2_linear_out_by_in_threaded_matches_serial_avx2_within_tolerance`
+confirms the parallel AVX2 output is bit-identical to serial AVX2.
+
+The benchmark hook accepts `--cpu-kernel-mode avx2`. Fresh local release
+runs on 2026-05-14, `avx2 --cpu-threads 4`, exact-token parity in every
+cell:
+
+| Size      | W-ASR.39 t=4 (scalar) | W-ASR.40 t=4 (avx2) | Change      | vs whisper.cpp greedy           |
+| --------- | --------------------- | ------------------- | ----------- | ------------------------------- |
+| tiny.en   | `996 ms`              | `832 ms`            | ~20% faster | `~2.53x` (was `~3.03x`)         |
+| base.en   | `1,245 ms`            | `899 ms`            | ~39% faster | `~1.35x` (was `~1.87x`)         |
+| small.en  | `3,373 ms`            | `2,232 ms`          | ~51% faster | `~0.94x` — **beats whisper.cpp** |
+| medium.en | `9,382 ms`            | `8,029 ms`          | ~17% faster | `~1.06x` (was `~1.24x`)         |
+| large-v2  | `16,435 ms`           | `10,306 ms`         | ~59% faster | `~0.68x` — **beats whisper.cpp** |
+
+Encoder-stage detail (the dominant work):
+
+| Size      | W-ASR.39 t=4 encoder | W-ASR.40 t=4 encoder | encoder speedup |
+| --------- | -------------------- | -------------------- | --------------- |
+| tiny.en   | `593 ms`             | `390 ms`             | `~1.52x`        |
+| base.en   | `1,026 ms`           | `684 ms`             | `~1.50x`        |
+| small.en  | `2,718 ms`           | `1,577 ms`           | `~1.72x`        |
+| medium.en | `7,383 ms`           | `5,680 ms`           | `~1.30x`        |
+| large-v2  | `12,365 ms`          | `6,804 ms`           | `~1.82x`        |
+
+This clears the original W-ASR.24 CPU-competitive claim gate on every
+size and **overtakes** greedy whisper.cpp on small.en and large-v2.
+The remaining gap on medium.en (~1.06x) appears bandwidth-bound rather
+than compute-bound: medium has `n_audio_state = 1024` and the encoder
+matmul tile reads weight rows that no longer fit in L2 the way large-v2's
+do (large-v2 has fewer, larger matmuls per layer with better cache
+reuse). Tiny.en at `~2.53x` is still constrained by per-call dispatch
+overhead — the matmul tiles are small enough that even AVX2's FMA
+throughput cannot fully amortize the rayon scope and horizontal-sum
+costs.
+
+The remaining roadmap levers are all secondary to where we now are:
+
+1. **P1.1 Native F16/BF16 weight matmul** — would halve DRAM traffic and
+   compound with AVX2 to push medium.en past whisper.cpp and tighten
+   tiny.en. Multi-day cross-crate refactor; needs a typed-weight-block
+   design note first.
+2. **AVX2 attention path** (Q·K, V·KQ in `whisper/primitives.rs`).
+   Currently scalar; AVX2-vectorizing those loops would tighten medium
+   and large further. Smaller diff than P1.1.
+3. **Bigger register tile (4x8 with K-unroll)** as P0.1b — probably
+   marginal on x86_64 because 16 YMM registers fit the current 4x4 tile
+   exactly; going wider risks register spilling.
+4. **AVX-512** — narrower host coverage; only worth it if a clear
+   target platform emerges.

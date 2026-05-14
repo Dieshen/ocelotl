@@ -34,6 +34,8 @@ pub use rope::rope_apply_inplace;
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
 pub mod attention;
+#[cfg(target_arch = "x86_64")]
+mod cpu_avx2;
 #[cfg(feature = "cubecl")]
 pub mod cubecl_backend;
 #[cfg(feature = "cubecl-wgpu")]
@@ -52,6 +54,12 @@ pub enum CpuKernelMode {
     /// CPU loops with cache-friendlier accumulation order for hot matrix work.
     /// This path stays safe Rust and keeps the same slice/shape contract.
     Optimized,
+    /// AVX2 + FMA path for `linear_out_by_in` only (other kernels still use
+    /// the scalar implementation). x86_64-only at runtime; constructing a
+    /// backend in this mode on a non-AVX2 CPU returns a typed Kernel error.
+    /// Scalar mode remains the parity oracle — AVX2 output is validated
+    /// against Scalar within a pinned tolerance on every test run.
+    Avx2,
 }
 
 impl CpuKernelMode {
@@ -59,6 +67,7 @@ impl CpuKernelMode {
         match self {
             Self::Scalar => "scalar",
             Self::Optimized => "optimized",
+            Self::Avx2 => "avx2",
         }
     }
 }
@@ -187,6 +196,9 @@ impl CpuKernelBackend {
     }
 
     pub fn with_mode(mode: CpuKernelMode) -> Self {
+        // Infallible variant used by tests and defaults. For modes that
+        // require runtime feature detection (Avx2), prefer
+        // `with_mode_checked`.
         Self {
             context: KernelContext {
                 device: Device::Cpu,
@@ -196,11 +208,19 @@ impl CpuKernelBackend {
         }
     }
 
+    /// Fallible counterpart to `with_mode` that validates host-CPU support
+    /// for the requested mode. Currently only `Avx2` requires this check.
+    pub fn with_mode_checked(mode: CpuKernelMode) -> Result<Self> {
+        validate_mode_supported(mode)?;
+        Ok(Self::with_mode(mode))
+    }
+
     /// Construct a backend that runs hot kernels (currently `linear_out_by_in`
     /// and any caller that opts in via `cpu_thread_pool()`) across `threads`
-    /// worker threads. `threads <= 1` is equivalent to `with_mode`. The pool
-    /// is built once and reused for the lifetime of this backend.
+    /// worker threads. `threads <= 1` is equivalent to `with_mode_checked`.
+    /// The pool is built once and reused for the lifetime of this backend.
     pub fn with_mode_and_threads(mode: CpuKernelMode, threads: usize) -> Result<Self> {
+        validate_mode_supported(mode)?;
         if threads <= 1 {
             return Ok(Self::with_mode(mode));
         }
@@ -243,6 +263,11 @@ impl CpuKernelBackend {
         match self.mode {
             CpuKernelMode::Scalar => matmul(a, a_shape, b, b_shape, out),
             CpuKernelMode::Optimized => matmul_optimized(a, a_shape, b, b_shape, out),
+            // matmul is used by the Qwen-shaped GEMM; AVX2 today only
+            // accelerates `linear_out_by_in` (the [out, in] Whisper weight
+            // layout). Other matmul callers fall back to the optimized
+            // scalar path until AVX2 covers them.
+            CpuKernelMode::Avx2 => matmul_optimized(a, a_shape, b, b_shape, out),
         }
     }
 
@@ -291,6 +316,15 @@ impl CpuKernelBackend {
                 bias,
                 out,
             ),
+            CpuKernelMode::Avx2 => linear_out_by_in_avx2(
+                x,
+                rows,
+                in_features,
+                weight_out_by_in,
+                out_features,
+                bias,
+                out,
+            ),
         }
     }
 
@@ -317,16 +351,22 @@ impl CpuKernelBackend {
                 head_dim,
                 out,
             ),
-            CpuKernelMode::Optimized => attention::scaled_dot_product_attention_optimized(
-                q,
-                k,
-                v,
-                seq_len,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                out,
-            ),
+            CpuKernelMode::Optimized | CpuKernelMode::Avx2 => {
+                // Same fallback rationale as matmul: this kernel is only
+                // exercised by the Qwen path right now. AVX2 currently
+                // accelerates the Whisper-shaped `linear_out_by_in`; the
+                // Qwen-shaped attention falls back to optimized scalar.
+                attention::scaled_dot_product_attention_optimized(
+                    q,
+                    k,
+                    v,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    out,
+                )
+            }
         }
     }
 }
@@ -932,6 +972,64 @@ fn linear_out_by_in_optimized(
     Ok(())
 }
 
+/// AVX2 + FMA implementation of `linear_out_by_in`. Validates the shape
+/// contract once, then dispatches to the `unsafe` AVX2 compute body. The
+/// host's AVX2 + FMA support must already be validated by
+/// `validate_mode_supported` at backend construction.
+#[cfg(target_arch = "x86_64")]
+fn linear_out_by_in_avx2(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    validate_linear_out_by_in(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )?;
+    // SAFETY: feature support was checked at backend construction; shape
+    // contract was just validated.
+    unsafe {
+        cpu_avx2::linear_out_by_in_compute_avx2(
+            x,
+            rows,
+            in_features,
+            weight_out_by_in,
+            out_features,
+            bias,
+            out,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn linear_out_by_in_avx2(
+    _x: &[f32],
+    _rows: usize,
+    _in_features: usize,
+    _weight_out_by_in: &[f32],
+    _out_features: usize,
+    _bias: Option<&[f32]>,
+    _out: &mut [f32],
+) -> Result<()> {
+    // Unreachable: validate_mode_supported rejects Avx2 on non-x86_64 at
+    // backend construction. Kept as a typed error so the dispatch arm
+    // type-checks on all targets.
+    Err(OcelotlError::Kernel(KernelError {
+        backend: "cpu".to_string(),
+        message: "CpuKernelMode::Avx2 is x86_64-only".to_string(),
+    }))
+}
+
 /// Compute body for the optimized `linear_out_by_in`. Inputs are assumed
 /// pre-validated.
 fn linear_out_by_in_optimized_compute(
@@ -964,6 +1062,39 @@ fn linear_out_by_in_optimized_compute(
 /// all classic sizes); decoder single-token decode has rows=1 and stays
 /// serial regardless of pool configuration.
 const PARALLEL_LINEAR_MIN_ROWS: usize = 32;
+
+/// Validate that the host CPU supports the requested mode. AVX2 needs both
+/// the `avx2` and `fma` x86_64 features at runtime; the scalar/optimized
+/// modes have no host requirements.
+fn validate_mode_supported(mode: CpuKernelMode) -> Result<()> {
+    match mode {
+        CpuKernelMode::Scalar | CpuKernelMode::Optimized => Ok(()),
+        CpuKernelMode::Avx2 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avx2")
+                    && std::is_x86_feature_detected!("fma")
+                {
+                    Ok(())
+                } else {
+                    Err(OcelotlError::Kernel(KernelError {
+                        backend: "cpu".to_string(),
+                        message: "CpuKernelMode::Avx2 requires runtime avx2 + fma support; this host advertises neither or only one"
+                            .to_string(),
+                    }))
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                Err(OcelotlError::Kernel(KernelError {
+                    backend: "cpu".to_string(),
+                    message: "CpuKernelMode::Avx2 is x86_64-only; rebuild with a Scalar or Optimized mode on this target"
+                        .to_string(),
+                }))
+            }
+        }
+    }
+}
 
 /// Parallel dispatcher for `linear_out_by_in`. Partitions the input/output
 /// row range across the rayon pool, validates once, and calls the chosen
@@ -1036,6 +1167,33 @@ fn linear_out_by_in_parallel(
                         bias,
                         out_chunk,
                     ),
+                    CpuKernelMode::Avx2 => {
+                        // SAFETY: the backend was constructed via
+                        // `with_mode_and_threads` which calls
+                        // `validate_mode_supported(Avx2)` and only succeeds
+                        // when the host advertises avx2 + fma. Shape
+                        // contract is upheld by the earlier
+                        // `validate_linear_out_by_in` call on the full
+                        // buffer; chunk slices preserve it.
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            cpu_avx2::linear_out_by_in_compute_avx2(
+                                x_chunk,
+                                chunk_rows,
+                                in_features,
+                                weight_out_by_in,
+                                out_features,
+                                bias,
+                                out_chunk,
+                            );
+                        }
+                        // On non-x86_64 hosts `validate_mode_supported`
+                        // already rejected this mode at construction, so
+                        // this arm is unreachable. Keep an explicit panic
+                        // to avoid pulling in a no-op fallback.
+                        #[cfg(not(target_arch = "x86_64"))]
+                        unreachable!("Avx2 mode rejected at construction on non-x86_64");
+                    }
                 }
             });
     });
@@ -1534,6 +1692,101 @@ mod tests {
         assert_eq!(
             serial, threaded,
             "threaded linear_out_by_in must produce bit-identical output to serial"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_linear_out_by_in_matches_scalar_within_tolerance() {
+        // Parity oracle for the AVX2 + FMA path. The output is not bit-
+        // identical to Scalar because FMA fuses one multiply and one add
+        // into a single rounded operation; the scalar path does two
+        // roundings. The relative error must stay tight on Whisper-sized
+        // matmuls.
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            // Host doesn't support AVX2+FMA; skip rather than fail. The
+            // backend constructor would return a typed error in this case.
+            return;
+        }
+        let rows = 64usize;
+        let in_features = 200; // not a multiple of 8, exercise K-tail
+        let out_features = 33; // not a multiple of 4, exercise out-tail
+        let x: Vec<f32> = (0..(rows * in_features))
+            .map(|i| ((i as f32) * 0.011).sin())
+            .collect();
+        let w: Vec<f32> = (0..(out_features * in_features))
+            .map(|i| ((i as f32) * 0.017).cos())
+            .collect();
+        let b: Vec<f32> = (0..out_features).map(|i| (i as f32) * 0.05).collect();
+
+        let mut scalar = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::scalar()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut scalar)
+            .expect("scalar must succeed");
+
+        let mut avx2 = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_checked(CpuKernelMode::Avx2)
+            .expect("AVX2 backend must build on host that advertises avx2+fma")
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut avx2)
+            .expect("AVX2 must succeed");
+
+        // Tolerance: 1e-4 relative or absolute. FMA fuses a multiply and
+        // add into one rounding (vs scalar's two roundings) and the SIMD
+        // path also accumulates into 8 partial-sum lanes that are reduced
+        // after the K-loop, so order-of-addition differs. The drift is
+        // bounded and tiny on Whisper-sized matmuls; Whisper exact-token
+        // parity (much coarser, only argmax order matters) is still
+        // preserved end-to-end and is pinned by the bench hook's
+        // `matches_expected` field.
+        for (idx, (a, s)) in avx2.iter().zip(scalar.iter()).enumerate() {
+            let abs = (a - s).abs();
+            let rel = if s.abs() > 1e-6 {
+                abs / s.abs()
+            } else {
+                abs
+            };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "AVX2 output drifted at idx {idx}: scalar={s} avx2={a} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_linear_out_by_in_threaded_matches_serial_avx2_within_tolerance() {
+        // Compose AVX2 + threads. Each chunk runs the AVX2 compute body on
+        // disjoint output rows; the result should match the single-thread
+        // AVX2 output bit-for-bit because the per-row K-loop accumulation
+        // order is identical between serial and parallel AVX2.
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let rows = 96usize;
+        let in_features = 256;
+        let out_features = 64;
+        let x: Vec<f32> = (0..(rows * in_features))
+            .map(|i| ((i as f32) * 0.007).sin())
+            .collect();
+        let w: Vec<f32> = (0..(out_features * in_features))
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+
+        let mut serial = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_checked(CpuKernelMode::Avx2)
+            .unwrap()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut serial)
+            .unwrap();
+
+        let mut threaded = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Avx2, 4)
+            .unwrap()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut threaded)
+            .unwrap();
+
+        assert_eq!(
+            serial, threaded,
+            "AVX2 + threads must match AVX2 serial bit-for-bit"
         );
     }
 

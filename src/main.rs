@@ -192,7 +192,7 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!(
-        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized] [--cpu-threads <n>]"
+        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized|avx2] [--cpu-threads <n>]"
     );
     println!(
         "  fetch hf --repo <repo> --revision <sha> --local-dir <path> [--include <pattern> ...] [--execute]"
@@ -254,8 +254,9 @@ fn parse_cpu_kernel_mode(value: &str) -> Result<CpuKernelMode, String> {
     match value {
         "scalar" => Ok(CpuKernelMode::Scalar),
         "optimized" => Ok(CpuKernelMode::Optimized),
+        "avx2" => Ok(CpuKernelMode::Avx2),
         other => Err(format!(
-            "unsupported --cpu-kernel-mode {other:?}; supported values: scalar, optimized"
+            "unsupported --cpu-kernel-mode {other:?}; supported values: scalar, optimized, avx2"
         )),
     }
 }
