@@ -9,4 +9,5 @@ description = "Server integration layer for Ocelotl."
 readme = "../../README.md"
 
 [dependencies]
+ocelotl-core.workspace = true
 ocelotl-runtime.workspace = true

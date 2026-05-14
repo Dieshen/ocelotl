@@ -11,7 +11,7 @@ pub use streaming::{
     plan_transcription_chunks,
 };
 pub use transcribe::{
-    TranscriptionRequest, TranscriptionResponse, WhisperDecodeRequest, WhisperTranscriptionRequest,
-    WhisperTranscriptionResponse, WhisperTranscriptionState, decode_whisper_transcription,
-    prepare_whisper_transcription, transcribe, transcribe_whisper,
+    WhisperDecodeRequest, WhisperTranscriptionRequest, WhisperTranscriptionResponse,
+    WhisperTranscriptionState, decode_whisper_transcription, prepare_whisper_transcription,
+    transcribe_whisper,
 };

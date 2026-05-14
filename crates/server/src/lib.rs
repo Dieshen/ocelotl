@@ -1,6 +1,7 @@
 //! Server integration layer.
 
-pub use ocelotl_runtime::{GenerateRequest, GenerateResponse, Runtime};
+pub use ocelotl_core::GenerateResponse;
+pub use ocelotl_runtime::Runtime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
