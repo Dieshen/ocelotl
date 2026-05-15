@@ -373,6 +373,54 @@ impl KernelBackend for CubeClKernelBackend {
         out.write_from_host_slice(&out_buf)
     }
 
+    /// Device-resident encoder self-attention. When every operand is a
+    /// `WgpuDeviceBuffer`, launch the fused cube kernel against the
+    /// existing handles — no host bounce, no scalar fallback. When the
+    /// adapter is missing or any operand is not on the WGPU runtime, fall
+    /// back to the trait default (readback → scalar → writeback).
+    ///
+    /// GW.4-5A: the fused kernel keeps the entire encoder forward on
+    /// device. Decoder paths still bounce through host because their
+    /// kernels (causal mask, KV cache, cross-attention) are different
+    /// shapes and were not in this dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_encoder_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        crate::validate_attention_encoder_shapes(q, k, v, seq, n_head, head_dim, output)?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(k),
+                extract_wgpu_buf(v),
+                extract_wgpu_buf(output),
+            ) {
+                return run_attention_encoder_d_wgpu(
+                    q_buf, k_buf, v_buf, seq, n_head, head_dim, scale, out_buf,
+                );
+            }
+        }
+        // Default: readback + host scalar + writeback. Keeps the path
+        // correct on hosts without a usable WGPU adapter.
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
+        crate::attention_encoder_scalar(
+            &q_host, &k_host, &v_host, seq, n_head, head_dim, scale, &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
+
     /// Device-resident `x += pe[start_pos..start_pos + rows]`. When both
     /// operands are `WgpuDeviceBuffer`s, launch the cube kernel against
     /// the existing handles.
@@ -797,6 +845,209 @@ fn add_positional_embedding_out_f32(
         terminate!();
     }
     output[i] = x_in[i] + pe[pe_offset_elems + i];
+}
+
+// ---------------------------------------------------------------------------
+// GW.4-5A: fused encoder self-attention kernel.
+//
+// The cube kernel maps one thread to one `(query_row, head)` pair and does
+// the entire `(scaled-dot → softmax → P·V)` chain into device registers and
+// a shared-memory scratch slab. Layout follows the host primitive: `[seq,
+// state]` row-major with `state == n_head * head_dim`; within each row,
+// head H occupies the `head_dim` cells starting at `head * head_dim`.
+//
+// Scratch placement: per-thread scores would be `seq` f32s, which at
+// Whisper-small's `seq = 1500` is 6 KB per thread. CubeCL 0.10 does not
+// expose a clean per-thread register-array of comptime size, so we put the
+// scores into `SharedMemory<f32>` of size `WORKGROUP_SIZE * seq` and index
+// each thread's slot by `UNIT_POS`. Workgroup size is `ENC_ATTN_WG`; at
+// `WORKGROUP_SIZE = 4` and seq = 1500 the slab is 24 KB, which fits within
+// the WGPU/DX12 shared-memory budget on the local adapter. Smaller seqs
+// (the parity test uses seq = 8) use the same workgroup size with a much
+// smaller slab.
+// ---------------------------------------------------------------------------
+
+/// Threads per workgroup for the encoder attention kernel. Bound by shared
+/// memory: each thread holds a `seq`-long score buffer, so `ENC_ATTN_WG *
+/// seq * 4 bytes` must fit in the workgroup's shared memory budget. At
+/// `ENC_ATTN_WG = 4` and seq = 1500 the slab is 24 KB. The launch grid
+/// fans the remaining (`seq * n_head`) threads across as many workgroups
+/// as it needs.
+const ENC_ATTN_WG: u32 = 4;
+
+/// Fused encoder self-attention. One thread per `(query_row, head)` pair.
+///
+/// Layout (matches `attention_encoder_scalar` and the host primitive):
+///   q, k, v, output: `[seq, n_head, head_dim]` flattened row-major, where
+///   row stride is `n_head * head_dim` and the head H slice of row R lives
+///   at `R * n_head * head_dim + H * head_dim`.
+///
+/// Per `(query_row, head)`:
+///   1. Scaled dot product `Q[query_row, head, :] · K[:, head, :]^T` into a
+///      shared-memory scores buffer (one slot per thread in the workgroup).
+///   2. Numerically stable softmax across all `seq` keys: subtract row
+///      max, exp, sum, divide.
+///   3. Accumulate `P · V[:, head, :]` into `head_dim` register
+///      accumulators and write the row's head slice once at the end.
+#[cube(launch_unchecked)]
+fn attention_encoder_f32(
+    q: &Array<f32>,
+    k: &Array<f32>,
+    v: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] seq: usize,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    #[comptime] wg_size: usize,
+    scale: f32,
+) {
+    // Cast each u32 launch builtin to usize once so the rest of the body
+    // unifies with the usize comptime constants — same trick the tiled
+    // linear kernel uses for CUBE_POS_X/Y. The casts trip clippy's
+    // `unnecessary_cast` because the macro expansion presents the
+    // builtins as usize at the surface level, but the underlying type
+    // before macro expansion is u32 and the casts are load-bearing.
+    #[allow(clippy::unnecessary_cast)]
+    let pos = ABSOLUTE_POS as usize;
+    let total = seq * n_head;
+    // Tail bounds check: launch grid rounds up to whole workgroups.
+    if pos >= total {
+        terminate!();
+    }
+
+    let query_row = pos / n_head;
+    let head = pos - query_row * n_head;
+    let state = n_head * head_dim;
+
+    // Shared-memory scratch: `wg_size` rows of `seq` floats each. The thread
+    // at intra-workgroup position `UNIT_POS` owns row `UNIT_POS`. This is
+    // the design call from the GW.4-5A spec — register arrays of comptime
+    // size aren't a clean shape in CubeCL 0.10, so we put the scores into
+    // shared memory and pay the indirection per access.
+    let mut scores = SharedMemory::<f32>::new(wg_size * seq);
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let lane_base = lane * seq;
+
+    let q_base = query_row * state + head * head_dim;
+
+    // Pass 1: scaled dot products. Seed `row_max` with the j == 0 score so
+    // we never compare against a sentinel — `f32::NEG_INFINITY` as a
+    // cube-typed initial value is awkward in 0.10, and any finite
+    // sentinel risks being smaller than a real score on pathological
+    // inputs. The j == 0 branch and the `scaled > row_max` branch
+    // intentionally do the same store; we could split with an explicit
+    // pre-loop iteration but keeping a single 0..seq loop unifies the
+    // memory-access pattern across all heads.
+    let mut row_max = f32::new(0.0);
+    for j in 0..seq {
+        let k_base = j * state + head * head_dim;
+        let mut acc = f32::new(0.0);
+        for d in 0..head_dim {
+            acc += q[q_base + d] * k[k_base + d];
+        }
+        let scaled = acc * scale;
+        scores[lane_base + j] = scaled;
+        if j == 0 || scaled > row_max {
+            row_max = scaled;
+        }
+    }
+
+    // Pass 2: numerically stable softmax — exp(score - max), sum, divide.
+    let mut denom = f32::new(0.0);
+    for j in 0..seq {
+        let e = f32::exp(scores[lane_base + j] - row_max);
+        scores[lane_base + j] = e;
+        denom += e;
+    }
+    let inv_denom = f32::new(1.0) / denom;
+    for j in 0..seq {
+        scores[lane_base + j] = scores[lane_base + j] * inv_denom;
+    }
+
+    // Pass 3: P · V into a register accumulator per output dim. Whisper
+    // head_dim is small (64 at tiny, 64 at small, 64 at medium, 64 at
+    // large-v2 — Whisper keeps head_dim fixed at 64 and varies n_head),
+    // so the inner-loop arithmetic stays in registers.
+    let out_base = q_base;
+    for d in 0..head_dim {
+        let mut ctx = f32::new(0.0);
+        for j in 0..seq {
+            let v_base = j * state + head * head_dim;
+            ctx += scores[lane_base + j] * v[v_base + d];
+        }
+        output[out_base + d] = ctx;
+    }
+}
+
+/// Launch helper for the fused encoder-attention kernel. Validates buffer
+/// lengths (the kernel can't), allocates a fresh output handle, runs the
+/// kernel, and swaps the handle into `out_buf` so subsequent device reads
+/// pick up the result without a host bounce.
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_encoder_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    k: &WgpuDeviceBuffer,
+    v: &WgpuDeviceBuffer,
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head
+        .checked_mul(head_dim)
+        .ok_or_else(|| cubecl_wgpu_err("attention_encoder_d n_head*head_dim overflowed usize"))?;
+    let expected = seq
+        .checked_mul(state)
+        .ok_or_else(|| cubecl_wgpu_err("attention_encoder_d seq*state overflowed usize"))?;
+    for (label, len) in [
+        ("q", q.len_f32()),
+        ("k", k.len_f32()),
+        ("v", v.len_f32()),
+        ("out", out.len_f32()),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_encoder_d {label} len {len} != seq*state {expected}"
+            )));
+        }
+    }
+
+    let total = u32::try_from(seq * n_head).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_encoder_d thread count {} exceeds CubeCL u32 launch limit",
+            seq * n_head
+        ))
+    })?;
+    let workgroup_count = total.div_ceil(ENC_ATTN_WG).max(1);
+
+    let client = q.client();
+    let out_handle = client.empty(expected * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_encoder_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(ENC_ATTN_WG),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(k.clone_handle(), k.len_f32()),
+            ArrayArg::from_raw_parts(v.clone_handle(), v.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), expected),
+            seq,
+            n_head,
+            head_dim,
+            ENC_ATTN_WG as usize,
+            scale,
+        );
+    }
+
+    *out
+        .handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
 }
 
 /// Apply RoPE through CubeCL.
@@ -1978,6 +2229,66 @@ mod tests {
             assert!(
                 (got - want).abs() <= 1.0e-5,
                 "idx {idx}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// GW.4-5A parity gate: the fused encoder-attention kernel must match
+    /// the scalar reference within `1e-4` rel/abs on a small but
+    /// non-trivial shape that exercises the head/seq indexing, the
+    /// softmax stability path, and the P·V accumulation. The shape
+    /// (seq=8, n_head=2, head_dim=4) keeps the shared-memory slab tiny
+    /// (8 floats per thread × 4 threads/workgroup = 128 bytes) so it is
+    /// also viable on adapters with very small shared-memory budgets.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_encoder_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_encoder_d_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let seq = 8usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let k: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.019).cos()).collect();
+        let v: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.023).sin()).collect();
+
+        let mut expected = vec![0.0_f32; seq * state];
+        crate::attention_encoder_scalar(
+            &q,
+            &k,
+            &v,
+            seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_encoder_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("device attention_encoder_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU attention drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
             );
         }
     }

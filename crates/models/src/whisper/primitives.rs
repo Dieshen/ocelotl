@@ -940,6 +940,53 @@ pub(super) fn add_positional_embedding_d(
     kernels.add_positional_embedding_d(x, rows, cols, pe, pe_rows, start_pos)
 }
 
+/// Device-resident Whisper encoder self-attention. Encoder-only: no
+/// causal mask, no GQA, all of `q`/`k`/`v` are `[seq, state]` row-major
+/// where `state == n_head * head_dim`. Computes the same math as
+/// `attention_body_host` with `causal == false` but keeps everything on
+/// device — no host bounce between Q/K/V projections and the out
+/// projection.
+///
+/// Decoder paths (causal self-attention with KV cache, cross-attention)
+/// stay on host for now — their shapes and scratch patterns are different
+/// enough that a fused kernel was deferred until the encoder bottleneck
+/// closes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attention_encoder_d(
+    kernels: &dyn KernelBackend,
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    v: &DeviceTensor,
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    output: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(invalid_model("attention.heads", "must be > 0"));
+    }
+    if head_dim == 0 {
+        return Err(invalid_model("attention.head_dim", "must be > 0"));
+    }
+    let state = checked_len_product("attention.state", &[n_head, head_dim])?;
+    let expected = checked_len_product("attention.q", &[seq, state])?;
+    for (label, len) in [
+        ("attention.q", q.len()),
+        ("attention.k", k.len()),
+        ("attention.v", v.len()),
+        ("attention.out", output.len()),
+    ] {
+        if len != expected {
+            return Err(invalid_request(
+                label,
+                &format!("expected length {expected}, got {len}"),
+            ));
+        }
+    }
+    kernels.attention_encoder_d(q, k, v, seq, n_head, head_dim, scale, output)
+}
+
 /// Device-resident `mlp_gelu`: `linear_d → gelu_inplace_d → linear_d`.
 /// `hidden_act` is a caller-supplied scratch of length `rows * ffn`; `out`
 /// is the `rows * hidden` projection back to model width. Both are reused

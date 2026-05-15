@@ -12,9 +12,13 @@
 //! GW.4-2B: the per-layer linear, layer-norm, GELU MLP, and residual-add
 //! ops are now device-resident `*_d` calls over `DeviceTensor` scratch.
 //! Conv1d and the positional-embedding add stay on host (one-shot cold
-//! path, two conv1d calls per 30 s window). The only intra-layer host
-//! bounce is the scalar attention body — search `to_host_owned()` /
-//! `attention_body_host(` in this file to grep every bounce.
+//! path, two conv1d calls per 30 s window).
+//!
+//! GW.4-5A: the self-attention body now stays on device too via the fused
+//! `attention_encoder_d` kernel. The encoder forward has zero per-layer
+//! host bounces; the only `to_host_owned` is the single readback of the
+//! encoder output for the `WhisperEncodedAudio.values` field at the end
+//! of `encode_audio_features_with_timings`.
 
 use std::time::Instant;
 
@@ -24,7 +28,7 @@ use ocelotl_kernels::DeviceTensor;
 use super::WhisperConfig;
 use super::model::{WhisperModel, validate_audio_request};
 use super::primitives::{
-    add_inplace_d, add_positional_embedding, attention_body_host, conv_output_len, conv1d,
+    add_inplace_d, add_positional_embedding, attention_encoder_d, conv_output_len, conv1d,
     gelu_inplace, layer_norm_d, linear_d, mlp_gelu_d,
 };
 use super::state::{WhisperAudioEncodeTimings, WhisperCrossAttentionCache, WhisperEncodedAudio};
@@ -166,10 +170,32 @@ fn encode_audio(
     // the saved host↔device transfers.
     let state = config.audio_state_size;
     let ffn = config.audio_ffn_size;
+    let n_head = config.audio_attention_heads;
+    if n_head == 0 {
+        return Err(invalid_model(
+            "config.audio_attention_heads",
+            "must be > 0",
+        ));
+    }
+    if state % n_head != 0 {
+        return Err(invalid_model(
+            "config.audio_state_size",
+            &format!(
+                "audio_state_size {state} must be divisible by audio_attention_heads {n_head}"
+            ),
+        ));
+    }
+    let head_dim = state / n_head;
+    let attn_scale = 1.0_f32 / (head_dim as f32).sqrt();
     let attn_ln_d = kernels.alloc(seq * state)?;
     let q_proj_d = kernels.alloc(seq * state)?;
     let k_proj_d = kernels.alloc(seq * state)?;
     let v_proj_d = kernels.alloc(seq * state)?;
+    // GW.4-5A: dedicated attention-context scratch. Lives outside the
+    // layer loop alongside the other per-layer scratch buffers so the
+    // fused encoder-attention kernel writes here and the out-projection
+    // reads here without an allocation per layer.
+    let attn_ctx_d = kernels.alloc(seq * state)?;
     let proj_out_d = kernels.alloc(seq * state)?;
     let mlp_ln_d = kernels.alloc(seq * state)?;
     let mlp_hidden_d = kernels.alloc(seq * ffn)?;
@@ -226,32 +252,26 @@ fn encode_audio(
             &v_proj_d,
         )?;
 
-        // Host bounce: scalar attention body. Q/K/V are read back to host,
-        // run through the existing rayon-parallel attention kernel, and the
-        // resulting context is uploaded for the on-device out projection.
-        let q_host = q_proj_d.to_host_owned()?;
-        let k_host = k_proj_d.to_host_owned()?;
-        let v_host = v_proj_d.to_host_owned()?;
-        let context_host = attention_body_host(
+        // GW.4-5A: device-resident fused encoder attention. Q/K/V stay on
+        // device; the fused kernel writes its context output into
+        // `attn_ctx_d`, which the out-projection then reads from. No host
+        // bounce, no scalar fallback when a WGPU adapter is available.
+        attention_encoder_d(
             kernels,
-            &q_host,
+            &q_proj_d,
+            &k_proj_d,
+            &v_proj_d,
             seq,
-            &k_host,
-            &v_host,
-            seq,
-            state,
-            config.audio_attention_heads,
-            false,
+            n_head,
+            head_dim,
+            attn_scale,
+            &attn_ctx_d,
         )?;
-        // Reuse the q_proj scratch for the uploaded context — saves an
-        // allocation. q_host/k_host/v_host live until end of bounce so the
-        // overwrite is safe.
-        q_proj_d.write_from_host_slice(&context_host)?;
         let out_w = model.device_weight(&format!("{prefix}.attn.out.weight"))?;
         let out_b = model.device_weight(&format!("{prefix}.attn.out.bias"))?;
         linear_d(
             kernels,
-            &q_proj_d,
+            &attn_ctx_d,
             seq,
             state,
             out_w,

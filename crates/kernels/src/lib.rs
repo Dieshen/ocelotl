@@ -282,6 +282,44 @@ pub trait KernelBackend: Debug + Send + Sync {
         out.write_from_host_slice(&out_buf)
     }
 
+    /// Whisper-style encoder self-attention on device handles. `q`, `k`, and
+    /// `v` are pre-projected activations of shape `[seq, state]` row-major
+    /// where `state == n_head * head_dim`; inside each row the heads are
+    /// laid out contiguously (head 0 occupies `head_dim` cells, head 1 the
+    /// next `head_dim`, and so on). `output` has the same `[seq, state]`
+    /// layout. `scale` is typically `1.0 / sqrt(head_dim as f32)`.
+    ///
+    /// This is encoder-only: there is no causal mask, no GQA, and the
+    /// query/key/value sequence lengths are all equal (`seq`). Decoder
+    /// attention (causal + KV cache + cross-attention) is a separate
+    /// surface; for now those paths stay on host.
+    ///
+    /// The default implementation forces host readback through
+    /// `to_host_owned` and runs the scalar reference, so any backend that
+    /// hasn't overridden this method stays correct but pays the round-trip.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_encoder_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_encoder_shapes(q, k, v, seq, n_head, head_dim, output)?;
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
+        attention_encoder_scalar(
+            &q_host, &k_host, &v_host, seq, n_head, head_dim, scale, &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
+
     /// Add a slice of a positional-embedding table into `x` in place:
     /// `x[r * cols + c] += pe[(start_pos + r) * cols + c]`. `pe` has shape
     /// `[pe_rows, cols]`; `start_pos + rows <= pe_rows` must hold.
@@ -359,6 +397,103 @@ pub(crate) fn layer_norm_whisper_scalar(
             out[start + col] = ((x[start + col] - mean) * inv_std) * weight[col] + bias[col];
         }
     }
+}
+
+/// Scalar Whisper encoder self-attention. Must produce the same numerical
+/// result as `crates/models/src/whisper/primitives.rs::attention_body_host`
+/// when invoked with `q_seq == kv_seq == seq` and `causal == false`. Layout
+/// (`[seq, state]` with state == n_head * head_dim) is the parity oracle
+/// for both the CPU `attention_encoder_d` override and the GPU cube kernel.
+///
+/// Math: per `(query_row, head)`:
+///   1. dot product `Q · K^T` scaled by `scale`
+///   2. numerically-stable softmax across all `seq` keys
+///   3. probability-weighted sum of `V`
+///
+/// Same operation order (subtract row max → exp → sum → divide → P·V) as
+/// the per-row host body so the encoder forward stays bit-stable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_encoder_scalar(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), seq * state);
+    debug_assert_eq!(k.len(), seq * state);
+    debug_assert_eq!(v.len(), seq * state);
+    debug_assert_eq!(out.len(), seq * state);
+
+    let mut scores = vec![0.0_f32; seq];
+    for qi in 0..seq {
+        for head in 0..n_head {
+            let q_base = qi * state + head * head_dim;
+            // Pass 1: scaled dot products into scores.
+            for (ki, score) in scores.iter_mut().enumerate() {
+                let k_base = ki * state + head * head_dim;
+                let mut acc = 0.0_f32;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            // Pass 2: numerically stable softmax — subtract row max,
+            // exp, then normalize. Mirrors `softmax(&mut scores)`.
+            softmax(&mut scores);
+            // Pass 3: probability-weighted accumulation of V into the
+            // output row's head slice.
+            let out_base = qi * state + head * head_dim;
+            for d in 0..head_dim {
+                out[out_base + d] = 0.0;
+            }
+            for (ki, &p) in scores.iter().enumerate() {
+                let v_base = ki * state + head * head_dim;
+                for d in 0..head_dim {
+                    out[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+}
+
+/// Shape validator for the `attention_encoder_d` device surface. Rejects
+/// zero heads, mismatched `state = n_head * head_dim`, and wrong-sized
+/// operands.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_attention_encoder_shapes(
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    v: &DeviceTensor,
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    out: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(kernel_err("attention_encoder_d n_head must be > 0"));
+    }
+    if head_dim == 0 {
+        return Err(kernel_err("attention_encoder_d head_dim must be > 0"));
+    }
+    let state = n_head
+        .checked_mul(head_dim)
+        .ok_or_else(|| kernel_err("attention_encoder_d n_head*head_dim overflowed usize"))?;
+    let expected = seq
+        .checked_mul(state)
+        .ok_or_else(|| kernel_err("attention_encoder_d seq*state overflowed usize"))?;
+    for (label, len) in [("q", q.len()), ("k", k.len()), ("v", v.len()), ("out", out.len())] {
+        if len != expected {
+            return Err(kernel_err(format!(
+                "attention_encoder_d {label} len {len} != seq*state {expected}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_layer_norm_shapes(
@@ -965,6 +1100,48 @@ impl KernelBackend for CpuKernelBackend {
         };
         let mut out_b = out_b;
         layer_norm_whisper_scalar(&x_b, rows, hidden, &w_b, &b_b, eps, &mut out_b);
+        Ok(())
+    }
+
+    /// CPU override: borrow host slices and run the scalar encoder
+    /// attention directly. Falls through to the trait default if any
+    /// operand is device-resident (shouldn't happen on the CPU backend,
+    /// but the default path stays correct).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_encoder_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_encoder_shapes(q, k, v, seq, n_head, head_dim, output)?;
+        let (q_b, k_b, v_b, out_b) = match (
+            q.borrow_host_slice(),
+            k.borrow_host_slice(),
+            v.borrow_host_slice(),
+            output.borrow_host_slice_mut(),
+        ) {
+            (Ok(q_b), Ok(k_b), Ok(v_b), Ok(out_b)) => (q_b, k_b, v_b, out_b),
+            _ => {
+                let q_host = q.to_host_owned()?;
+                let k_host = k.to_host_owned()?;
+                let v_host = v.to_host_owned()?;
+                let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
+                attention_encoder_scalar(
+                    &q_host, &k_host, &v_host, seq, n_head, head_dim, scale, &mut out_buf,
+                );
+                return output.write_from_host_slice(&out_buf);
+            }
+        };
+        let mut out_b = out_b;
+        attention_encoder_scalar(
+            &q_b, &k_b, &v_b, seq, n_head, head_dim, scale, &mut out_b,
+        );
         Ok(())
     }
 
@@ -2895,5 +3072,113 @@ mod tests {
         let t = backend.alloc(4).unwrap();
         assert_eq!(t.residency(), Residency::Host);
         assert_eq!(t.to_host_owned().unwrap(), vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    // --- attention_encoder_d ---
+
+    /// Bit-for-bit parity gate between the CPU backend's
+    /// `attention_encoder_d` override (which borrows host slices) and the
+    /// scalar reference. The override and the reference call the same
+    /// `attention_encoder_scalar` helper, so the two paths must agree
+    /// exactly — no tolerance window.
+    #[test]
+    fn cpu_attention_encoder_d_matches_scalar_bit_for_bit() {
+        let seq = 8usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let k: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.019).cos()).collect();
+        let v: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.023).sin()).collect();
+
+        let mut scalar_out = vec![0.0_f32; seq * state];
+        attention_encoder_scalar(
+            &q, &k, &v, seq, n_head, head_dim, scale, &mut scalar_out,
+        );
+
+        let backend = CpuKernelBackend::scalar();
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_encoder_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("CPU attention_encoder_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got, scalar_out, "CPU override must match scalar bit-for-bit");
+    }
+
+    /// Parity gate proving the scalar reference matches the
+    /// `attention_body_host`-style host attention on the same inputs. The
+    /// math here mirrors the Whisper primitive's loop body (head-major
+    /// `[seq, n_head, head_dim]`, scaled-dot → softmax → P·V); this test
+    /// guards against drift between the scalar reference and the host
+    /// primitive without depending on the models crate.
+    #[test]
+    fn attention_encoder_scalar_matches_hand_computed_softmax_chain() {
+        // seq=2, n_head=1, head_dim=2: small enough to hand-verify.
+        let q = vec![1.0_f32, 0.0, 0.0, 1.0];
+        let k = vec![1.0_f32, 0.0, 0.0, 1.0];
+        let v = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let scale = 1.0_f32 / (2.0_f32).sqrt();
+
+        let mut out = vec![0.0_f32; 4];
+        attention_encoder_scalar(&q, &k, &v, 2, 1, 2, scale, &mut out);
+
+        // Row 0: Q = [1, 0]. Scores [1*1+0*0, 1*0+0*1]*scale = [1/√2, 0].
+        // Softmax: exp(1/√2-1/√2)=1, exp(0-1/√2)=exp(-1/√2). Normalize.
+        let s0 = 1.0_f32 / std::f32::consts::SQRT_2;
+        let e0 = (s0 - s0).exp();
+        let e1 = (0.0 - s0).exp();
+        let denom = e0 + e1;
+        let p0 = e0 / denom;
+        let p1 = e1 / denom;
+        let expected_row0 = [p0 * 1.0 + p1 * 3.0, p0 * 2.0 + p1 * 4.0];
+        // Row 1: Q = [0, 1]. Scores [0*1+1*0, 0*0+1*1]*scale = [0, 1/√2].
+        let e0r1 = (0.0 - s0).exp();
+        let e1r1 = (s0 - s0).exp();
+        let denom1 = e0r1 + e1r1;
+        let p0r1 = e0r1 / denom1;
+        let p1r1 = e1r1 / denom1;
+        let expected_row1 = [p0r1 * 1.0 + p1r1 * 3.0, p0r1 * 2.0 + p1r1 * 4.0];
+
+        for (got, want) in out[..2].iter().zip(expected_row0.iter()) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "row 0 mismatch: got {got}, want {want}"
+            );
+        }
+        for (got, want) in out[2..].iter().zip(expected_row1.iter()) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "row 1 mismatch: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_attention_encoder_shapes_rejects_wrong_length() {
+        let backend = CpuKernelBackend::scalar();
+        let q = backend.upload(&[0.0_f32; 8]).unwrap();
+        let k = backend.upload(&[0.0_f32; 8]).unwrap();
+        let v = backend.upload(&[0.0_f32; 8]).unwrap();
+        let out = backend.alloc(8).unwrap();
+        // seq=4, n_head=1, head_dim=2 → expected 8. But pass seq=4, n_head=2
+        // so expected = 16.
+        let err = backend
+            .attention_encoder_d(&q, &k, &v, 4, 2, 2, 0.5, &out)
+            .expect_err("length mismatch must be rejected");
+        match err {
+            OcelotlError::Kernel(KernelError { message, .. }) => {
+                assert!(
+                    message.contains("attention_encoder_d"),
+                    "expected diagnostic, got {message}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
     }
 }

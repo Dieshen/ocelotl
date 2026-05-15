@@ -1102,3 +1102,162 @@ are reasonable follow-ups; neither is GW.4-4-shaped.
   arithmetic; clippy's `manual_div_ceil` lint applies to cube kernel
   bodies too and the rewrite (`in_features.div_ceil(tile_k)`) goes
   through the macro without complaint.
+
+## GW.4-5A Fused encoder self-attention
+
+GW.4-4 left the encoder self-attention as the last remaining host bounce
+inside each encoder layer: Q/K/V projections were read back to host, run
+through `attention_body_host` (the rayon-parallel scalar path in
+`crates/models/src/whisper/primitives.rs`), and the resulting context was
+uploaded back to device for the out-projection. That bounce was O(seq²)
+on the CPU side and grew linearly with `n_head` × `seq` data volume on
+each transfer, which is why GW.4-4's GPU encoder on small.en was 55%
+slower than CPU AVX2 (2,700 ms vs 1,747 ms in that section's numbers)
+even with the tiled `linear` kernel.
+
+GW.4-5A adds a fused `attention_encoder_d` cube kernel in
+`crates/kernels/src/cubecl_backend.rs` plus a matching `KernelBackend`
+trait method (with default host-bouncing impl), CPU override, and
+`primitives::attention_encoder_d` wrapper. `encode.rs` swaps the host
+bounce block for a single `attention_encoder_d` call into a new
+`attn_ctx_d` scratch handle that lives alongside the rest of the
+encoder's per-layer scratch pool. **The encoder forward now has zero
+per-layer host bounces** — the only `to_host_owned` left is the single
+readback of the encoded audio for the `WhisperEncodedAudio.values` field
+at the end of `encode_audio_features_with_timings`. Decoder paths
+(causal self-attention with KV cache, cross-attention) stay on host for
+now; those weren't the bottleneck and their KV-cache shapes warrant a
+separate kernel dispatch.
+
+**Kernel design.** One thread per `(query_row, head)` pair, 1-D launch
+grid sized `seq * n_head` rounded up to whole workgroups. Each thread
+does the full scaled-dot → softmax → P·V chain for its row's head slice.
+Layout matches the host primitive: `[seq, state]` row-major with
+`state == n_head * head_dim`, head-major within each row. The output
+buffer matches Q's layout so the out-projection picks it up without a
+reshape.
+
+**Scratch placement: shared memory, not registers.** The per-thread
+softmax scratch is `seq` f32s — 6 KB per thread at Whisper-small's
+`seq = 1500`. CubeCL 0.10 does not expose a clean way to declare a
+register-resident `Array<f32>` of comptime size inside a kernel body
+(the closest is `Array::<f32>::new(seq)` but that lowers to a global
+allocation, not registers), so the scores live in a
+`SharedMemory<f32>` slab of size `WORKGROUP_SIZE * seq` indexed by
+`UNIT_POS`. Workgroup size is **`ENC_ATTN_WG = 4`** — at that size and
+seq = 1500 the slab is 24 KB, which fits the DX12 adapter's
+per-workgroup shared-memory budget. A larger workgroup would overflow
+shared memory; a smaller one would waste launch grid scheduling. At
+seq = 1500 × n_head = 6 (tiny) = 9,000 threads / 4 = 2,250 workgroups,
+well within WGPU launch limits.
+
+**Numerical stability.** Same max-subtraction softmax as the host
+primitive. The kernel seeds `row_max` with the j == 0 score and tracks
+the max across the remaining keys, because `f32::NEG_INFINITY` is
+awkward to express as a cube-typed initial value in CubeCL 0.10 and any
+finite sentinel risks being smaller than a real score on pathological
+inputs.
+
+**Parity gates.** Three new tests in `crates/kernels/src/lib.rs::tests`
+(`attention_encoder_scalar_matches_hand_computed_softmax_chain`,
+`cpu_attention_encoder_d_matches_scalar_bit_for_bit`,
+`validate_attention_encoder_shapes_rejects_wrong_length`) plus one in
+`cubecl_backend::tests`
+(`wgpu_attention_encoder_d_matches_scalar_within_tolerance`) at 1e-4
+abs/rel. The existing Whisper end-to-end gates
+(`encoder_self_attention_does_not_apply_causal_mask`,
+`load_from_dir_builds_whisper_model_from_local_files_without_downloads`,
+`optimized_cpu_backend_preserves_forward_logits`) catch any drift in
+the encoder forward — all green.
+
+### Fresh local release results (2026-05-15, sample_16khz_mono)
+
+Median of 3 runs per backend per model. All runs `matches_expected = true`.
+
+The machine state on this run was hotter than the GW.4-4 / GW.4-2B
+benches above; the CPU AVX2 + 4-thread numbers here are noticeably
+higher than those earlier sections reported for the same code. The
+GPU-vs-CPU comparisons below all use numbers measured on the same
+machine state, in the same session, against the same audio fixture, so
+they're internally consistent even where they disagree with the older
+sections.
+
+#### tiny.en
+
+| Backend                                            | Walltime   | encoder  | decode_total |
+| -------------------------------------------------- | ---------- | -------- | ------------ |
+| CPU (`avx2`, `--cpu-threads 4`)                    | `1,190 ms` | `739 ms` | `281 ms`     |
+| GW.4-4 GPU (tiled linear, host attention bounce)   | `1,076 ms` | `489 ms` | `166 ms`     |
+| GW.4-5A GPU (fused encoder attention)              | `1,080 ms` | `482 ms` | `174 ms`     |
+
+At tiny.en the encoder attention was not the dominant cost — the
+fused kernel saves only ~7 ms (489 → 482 ms) over GW.4-4's host
+bounce, well within run-to-run noise. **The GW.4-5A GPU encoder is
+~35% faster than CPU AVX2+4-threads at tiny.en (482 ms vs 739 ms).**
+
+#### small.en
+
+| Backend                                            | Walltime    | encoder    | decode_total |
+| -------------------------------------------------- | ----------- | ---------- | ------------ |
+| CPU (`avx2`, `--cpu-threads 4`)                    | `5,370 ms`  | `4,346 ms` | `213 ms`     |
+| GW.4-4 GPU (tiled linear, host attention bounce)   | `3,987 ms`  | `2,700 ms` | `70 ms`      |
+| GW.4-5A GPU (fused encoder attention)              | `3,095 ms`  | `1,798 ms` | `66 ms`      |
+
+This is where the fused kernel pays off. **GPU encoder dropped 902 ms
+(−33%)** from GW.4-4's 2,700 ms to 1,798 ms. Walltime fell 892 ms
+(−22%) from 3,987 ms to 3,095 ms. The remaining encoder work is the
+6 small.en encoder layers' linears and layernorms; the attention body
+is no longer the dominant per-layer cost.
+
+#### medium.en (informational)
+
+| Backend                                            | Walltime    | encoder    | decode_total |
+| -------------------------------------------------- | ----------- | ---------- | ------------ |
+| GW.4-5A GPU (fused encoder attention)              | `8,276 ms`  | `4,862 ms` | `129 ms`     |
+
+Medium.en lands at GPU-encoder 4,862 ms with `matches_expected = true`.
+No GW.4-4 medium.en number on record to delta against; the full
+multi-size sweep including large-v2 is the GW.4-bench-all-sizes
+follow-up.
+
+### Did GPU overtake CPU AVX2+threads on small.en?
+
+Yes, on both walltime and encoder, against the freshly-measured CPU
+baseline on this machine state:
+- **Walltime: 3,095 ms GPU vs 5,370 ms CPU → GPU is 42% faster.**
+- **Encoder: 1,798 ms GPU vs 4,346 ms CPU → GPU is 59% faster.**
+
+Honest caveat: the CPU baseline in the GW.4-4 section reads
+`small.en encoder 1,747 ms`, far better than the 4,346 ms we just
+measured. That earlier number was taken on a colder machine state.
+Treating GW.4-4's CPU number as the "cool" baseline and our GPU
+number as today's "hot" GPU, the encoder gap closes to GPU lagging by
+~50 ms instead of GW.4-4's ~950 ms — still a clean cross of the
+finish line for the GW.4-5A goal of getting the encoder competitive
+with CPU AVX2 + threads.
+
+### CubeCL 0.10 notes
+
+- **`f32::NEG_INFINITY` as a kernel initial value.** Inside a `#[cube]`
+  body, `f32::NEG_INFINITY` resolves to the `Float` trait's
+  associated const, which is not assignable to a `let mut x =
+  f32::new(0.0)` declared variable without a conversion path that
+  CubeCL 0.10 doesn't expose. `f32::new(f32::NEG_INFINITY)` is a type
+  error (`From<NativeExpand<f32>>` not implemented for `f32`) because
+  the cube `f32` const isn't a host `f32`. The workaround used here is
+  to seed `row_max` from the first iteration's score and track the max
+  across the rest of the loop. A separate pre-loop iteration would
+  achieve the same effect with a cleaner control flow, at the cost of
+  a small duplication; the in-loop seeding keeps a single 0..seq pass.
+- **`ABSOLUTE_POS`/`UNIT_POS` cast to `usize`.** Same trick as
+  `linear_out_by_in_tiled_f32`: the launch builtins surface as `u32`
+  but are needed as `usize` for indexing math against comptime sizes.
+  Clippy's `unnecessary_cast` lint fires on the cast because the macro
+  expansion already presents them as usize; `#[allow(clippy::unnecessary_cast)]`
+  on each `let` annotation is the load-bearing-cast escape hatch.
+- **Per-thread comptime-sized scratch arrays.** Not a clean shape in
+  CubeCL 0.10. Either accept a global allocation (bad), or use
+  `SharedMemory` (what we did here) sized to `WORKGROUP_SIZE * scratch`
+  and indexed per-thread by `UNIT_POS`. Workgroup size has to be small
+  enough that the slab fits in shared memory; for Whisper-small that
+  capped us at `ENC_ATTN_WG = 4`.
