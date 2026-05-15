@@ -944,7 +944,11 @@ fn rope_apply_f32(
 /// and a length-1 dummy buffer (ignored) when `has_bias == false`. Each
 /// invocation maps `ABSOLUTE_POS` to one `(row, out_dim)` cell so a launch
 /// of `rows * out_features` threads covers the full output.
+///
+/// Retained as a parity reference and as a fallback path; the live launch
+/// helper currently dispatches the tiled variant below.
 #[cube(launch_unchecked)]
+#[allow(dead_code)]
 fn linear_out_by_in_f32(
     x: &Array<f32>,
     weight: &Array<f32>,
@@ -977,10 +981,126 @@ fn linear_out_by_in_f32(
     output[row * out_features + out_dim] = acc;
 }
 
-/// Derive the workgroup grid for a `linear_out_by_in_f32` launch and
-/// validate shape invariants that the kernel itself relies on (u32 indexing,
-/// non-zero cell count). Caller is expected to have already validated buffer
-/// lengths via `crate::validate_linear_out_by_in`.
+/// Workgroup tile dimensions for `linear_out_by_in_tiled_f32`.
+///
+/// Constraint: `TILE_M == TILE_N == TILE_K` so each (ty, tx) thread in the
+/// 16×16 workgroup is responsible for exactly one `x_tile` element load
+/// (at column `tx`) and one `w_tile` element load (at row `ty`) per K
+/// chunk. Workgroup size is `TILE_M * TILE_N = 256`, matching the WGPU
+/// per-workgroup cap on the local DX12 adapter (GW.1). Whisper-tiny
+/// `in_features = 384` divides evenly by 16, so the common path takes
+/// 24 chunks with no tail.
+const LINEAR_TILE_M: usize = 16;
+const LINEAR_TILE_N: usize = 16;
+const LINEAR_TILE_K: usize = 16;
+
+/// Workgroup-tiled `output = x * weight^T + bias`.
+///
+/// Each workgroup computes one `TILE_M × TILE_N` output tile. The K axis
+/// (`in_features`) is split into `ceil(in_features / TILE_K)` chunks; per
+/// chunk, the workgroup cooperatively loads a `TILE_M × TILE_K` block of
+/// `x` and a `TILE_N × TILE_K` block of `weight` into shared memory, then
+/// each thread accumulates its dot product over the loaded chunk. Two
+/// `sync_cube()` barriers per chunk: one after the cooperative load (so
+/// every thread sees the full tiles before reading) and one after the
+/// compute (so no thread overwrites the tile that another is still
+/// reading). Out-of-bounds threads zero-fill their tile slot and skip the
+/// final store so non-multiple-of-tile shapes work without a tail kernel.
+#[cube(launch_unchecked)]
+fn linear_out_by_in_tiled_f32(
+    x: &Array<f32>,
+    weight: &Array<f32>,
+    bias: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] rows: usize,
+    #[comptime] in_features: usize,
+    #[comptime] out_features: usize,
+    #[comptime] tile_m: usize,
+    #[comptime] tile_n: usize,
+    #[comptime] tile_k: usize,
+    #[comptime] has_bias: bool,
+) {
+    // 2-D workgroup grid: CUBE_POS_X selects the out_features tile column,
+    // CUBE_POS_Y selects the rows tile row. UNIT_POS_X/Y are this thread's
+    // position within the workgroup; (ty, tx) maps to one output cell in
+    // the tile at (row_in_tile=ty, out_in_tile=tx). Cast the u32 builtins
+    // to usize once so the rest of the body unifies with the usize
+    // comptime tile/shape constants — `layer_norm_naive_f32` mixes u32 and
+    // usize freely because its math goes straight through array indexing,
+    // but this kernel does enough intermediate arithmetic that one
+    // explicit cast up front is cheaper than peppering casts everywhere.
+    let tile_col = CUBE_POS_X as usize;
+    let tile_row = CUBE_POS_Y as usize;
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+
+    let row = tile_row * tile_m + ty;
+    let out_dim = tile_col * tile_n + tx;
+
+    let mut x_tile = SharedMemory::<f32>::new(tile_m * tile_k);
+    let mut w_tile = SharedMemory::<f32>::new(tile_n * tile_k);
+
+    let mut acc = f32::new(0.0);
+    if has_bias && out_dim < out_features {
+        acc = bias[out_dim];
+    }
+
+    // Number of K chunks. `comptime`d so the inner loop unrolls cleanly.
+    let chunks = in_features.div_ceil(tile_k);
+
+    for chunk in 0..chunks {
+        let k_base = chunk * tile_k;
+
+        // x_tile cooperative load: thread (ty, tx) loads x_tile[ty, tx]
+        // = x[row, k_base + tx]. Zero-fill OOB threads so partial-tile
+        // loads don't poison the dot product.
+        let x_k = k_base + tx;
+        if row < rows && x_k < in_features {
+            x_tile[ty * tile_k + tx] = x[row * in_features + x_k];
+        } else {
+            x_tile[ty * tile_k + tx] = f32::new(0.0);
+        }
+
+        // w_tile cooperative load: thread (ty, tx) loads w_tile[tx, ty]
+        // = weight[out_dim_of_tx, k_base + ty]. Note the transposed
+        // storage: w_tile is indexed by (out_in_tile, k) so the inner
+        // accumulate reads contiguously over k for each thread's out_dim.
+        let w_out = tile_col * tile_n + tx;
+        let w_k = k_base + ty;
+        if w_out < out_features && w_k < in_features {
+            w_tile[tx * tile_k + ty] = weight[w_out * in_features + w_k];
+        } else {
+            w_tile[tx * tile_k + ty] = f32::new(0.0);
+        }
+
+        // Wait until every thread finished loading before any thread
+        // reads from shared memory.
+        sync_cube();
+
+        if row < rows && out_dim < out_features {
+            for k in 0..tile_k {
+                acc += x_tile[ty * tile_k + k] * w_tile[tx * tile_k + k];
+            }
+        }
+
+        // Wait until every thread finished computing before the next
+        // chunk's load overwrites the tiles.
+        sync_cube();
+    }
+
+    if row < rows && out_dim < out_features {
+        output[row * out_features + out_dim] = acc;
+    }
+}
+
+/// Derive the 2-D workgroup grid for a tiled `linear_out_by_in` launch
+/// and validate shape invariants that the kernel itself relies on (u32
+/// indexing, non-zero cell count). Caller is expected to have already
+/// validated buffer lengths via `crate::validate_linear_out_by_in`.
+///
+/// Returns `(cube_count_x, cube_count_y)` — the number of workgroups
+/// along the `out_features` axis and the `rows` axis respectively. The
+/// workgroup itself is always `LINEAR_TILE_N × LINEAR_TILE_M` units.
 fn prepare_linear_launch(
     rows: usize,
     in_features: usize,
@@ -996,27 +1116,34 @@ fn prepare_linear_launch(
             "out_features {out_features} exceeds CubeCL u32 launch limit"
         ))
     })?;
+    u32::try_from(rows).map_err(|_| {
+        cubecl_err(format!("rows {rows} exceeds CubeCL u32 launch limit"))
+    })?;
     let total_cells = u32::try_from(rows * out_features).map_err(|_| {
         cubecl_err(format!(
             "linear_out_by_in cell count {} exceeds CubeCL u32 launch limit",
             rows * out_features
         ))
     })?;
-    // WGPU caps a single workgroup at 256 invocations on most adapters, so
-    // a single-workgroup launch (`CubeCount::Static(1, 1, 1)`) only computes
-    // the first 256 output cells of any larger problem. Spread the work
-    // across multiple workgroups using a fixed 1-D CubeDim. The kernel
-    // includes a bounds check for the rounded-up tail.
-    const WORKGROUP_SIZE: u32 = 256;
-    let workgroup_count = total_cells.div_ceil(WORKGROUP_SIZE).max(1);
-    Ok((workgroup_count, WORKGROUP_SIZE))
+    if total_cells == 0 {
+        return Err(cubecl_err(
+            "linear_out_by_in launch requires non-zero rows*out_features".to_string(),
+        ));
+    }
+
+    let cube_count_x =
+        (out_features as u32).div_ceil(LINEAR_TILE_N as u32).max(1);
+    let cube_count_y = (rows as u32).div_ceil(LINEAR_TILE_M as u32).max(1);
+    Ok((cube_count_x, cube_count_y))
 }
 
-/// Launch the bare `linear_out_by_in_f32` kernel against pre-existing CubeCL
-/// handles. This is the device-resident entry point: no `create_from_slice`,
-/// no `read_one`, no host bounce. Both the slice-based legacy
-/// `linear_out_by_in_cubecl` (which still does the host round trip) and the
-/// `DeviceTensor`-based `linear_d` override call into this helper.
+/// Launch the tiled `linear_out_by_in_tiled_f32` kernel against
+/// pre-existing CubeCL handles. This is the device-resident entry point:
+/// no `create_from_slice`, no `read_one`, no host bounce. Both the
+/// slice-based legacy `linear_out_by_in_cubecl` (which still does the
+/// host round trip) and the `DeviceTensor`-based `linear_d` override
+/// call into this helper, so swapping the kernel here is the single
+/// point of dispatch.
 #[allow(clippy::too_many_arguments)]
 fn launch_linear_out_by_in_kernel<R: Runtime>(
     client: &ComputeClient<R>,
@@ -1033,20 +1160,26 @@ fn launch_linear_out_by_in_kernel<R: Runtime>(
     in_features: usize,
     out_features: usize,
 ) -> Result<()> {
-    let (workgroup_count, workgroup_size) =
+    let (cube_count_x, cube_count_y) =
         prepare_linear_launch(rows, in_features, out_features)?;
 
     unsafe {
-        linear_out_by_in_f32::launch_unchecked::<R>(
+        linear_out_by_in_tiled_f32::launch_unchecked::<R>(
             client,
-            CubeCount::Static(workgroup_count, 1, 1),
-            CubeDim::new_1d(workgroup_size),
+            CubeCount::Static(cube_count_x, cube_count_y, 1),
+            // CubeDim x = out_in_tile axis (matches UNIT_POS_X / tx),
+            // CubeDim y = row_in_tile axis (matches UNIT_POS_Y / ty).
+            CubeDim::new_2d(LINEAR_TILE_N as u32, LINEAR_TILE_M as u32),
             ArrayArg::from_raw_parts(x_handle, x_len),
             ArrayArg::from_raw_parts(weight_handle, weight_len),
             ArrayArg::from_raw_parts(bias_handle, bias_len),
             ArrayArg::from_raw_parts(output_handle, out_len),
+            rows,
             in_features,
             out_features,
+            LINEAR_TILE_M,
+            LINEAR_TILE_N,
+            LINEAR_TILE_K,
             has_bias,
         );
     }
@@ -1474,6 +1607,61 @@ mod tests {
             // cleanly when it is not.
             eprintln!(
                 "skipping wgpu_linear_out_by_in_matches_scalar_within_tolerance: {err:?}"
+            );
+            return;
+        }
+
+        for (idx, (s, g)) in scalar.iter().zip(gpu.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    /// Parity gate for a fully tile-aligned shape that spans multiple
+    /// workgroups along every axis. GW.4-4 swaps `linear_out_by_in` to a
+    /// tiled kernel with 16-wide tiles in M/N/K; this exercises that the
+    /// common Whisper-tiny encoder path (rows = seq = 1500, in/out
+    /// features = 384) — sized at exact multiples of 16 — still matches
+    /// the scalar CPU reference. The existing
+    /// `wgpu_linear_out_by_in_matches_scalar_within_tolerance` test covers
+    /// the unaligned-tail path with 17/23/13.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_linear_out_by_in_tiled_aligned_matches_scalar_within_tolerance() {
+        use crate::CpuKernelBackend;
+
+        let rows = 64;
+        let in_features = 48;
+        let out_features = 32;
+        let x: Vec<f32> = (0..rows * in_features)
+            .map(|i| ((i as f32) * 0.011).sin())
+            .collect();
+        let w: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32) * 0.017).cos())
+            .collect();
+        let b: Vec<f32> = (0..out_features).map(|i| (i as f32) * 0.03).collect();
+
+        let mut scalar = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::scalar()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut scalar)
+            .expect("scalar linear_out_by_in must succeed");
+
+        let mut gpu = vec![0.0_f32; rows * out_features];
+        if let Err(err) = linear_out_by_in_wgpu(
+            &x,
+            rows,
+            in_features,
+            &w,
+            out_features,
+            Some(&b),
+            &mut gpu,
+        ) {
+            eprintln!(
+                "skipping wgpu_linear_out_by_in_tiled_aligned_matches_scalar_within_tolerance: {err:?}"
             );
             return;
         }

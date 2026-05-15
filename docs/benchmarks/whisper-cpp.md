@@ -977,3 +977,128 @@ Compared to the GW.4 audit's measured ~110 MB of cumulative host
 `Vec<f32>` churn per encoder pass, this is an >8× reduction in working
 set even before counting the saved host↔device transfers on every
 `linear` call.
+
+## GW.4-4 Workgroup-tiled `linear_out_by_in_f32`
+
+GW.4-2B left a single bottleneck on the GPU encoder path: the
+`linear_out_by_in_f32` kernel was one-thread-per-output-cell with no
+shared-memory tiling, so each thread re-fetched its `in_features`-long
+row of `x` and column of `weight` from global memory independently.
+GW.4-4 replaces that kernel with a workgroup-tiled variant in
+`crates/kernels/src/cubecl_backend.rs`.
+
+**Tile parameters.** The new `linear_out_by_in_tiled_f32` cube kernel
+uses `TILE_M = TILE_N = TILE_K = 16`. Each workgroup computes a 16×16
+output tile and walks the K (`in_features`) axis in 16-wide chunks. The
+workgroup is 16×16 = 256 threads — the WGPU per-workgroup cap on the
+local DX12 adapter (the GW.1 bug from "Workgroup-size bug caught at the
+Whisper call site" pinned this limit). Equal tile dimensions let each
+`(ty, tx)` thread load exactly one `x_tile` cell and one `w_tile` cell
+per chunk, so the cooperative load is perfectly balanced. Out-of-bounds
+threads zero-fill their tile slot and skip the final store, which makes
+the kernel correct for non-multiple-of-16 shapes without a tail kernel.
+Two `sync_cube()` barriers per chunk gate the load→compute and
+compute→reload transitions.
+
+The launch site (`launch_linear_out_by_in_kernel`) switches from a 1-D
+`CubeCount::Static(workgroup_count, 1, 1)` with `CubeDim::new_1d(256)`
+to a 2-D grid: `CubeCount::Static(out_features.div_ceil(16),
+rows.div_ceil(16), 1)` with `CubeDim::new_2d(16, 16)`. Both the
+slice-based `linear_out_by_in_cubecl` legacy path and the device-resident
+`linear_d` override flow through the same helper, so both pick up the
+tiled kernel automatically.
+
+The original `linear_out_by_in_f32` cube kernel is retained as a parity
+reference (annotated `#[allow(dead_code)]`); the live launch dispatches
+the tiled variant. Parity is gated by two GPU tests:
+`wgpu_linear_out_by_in_matches_scalar_within_tolerance` (the existing
+unaligned 17×23×13 case) plus a new
+`wgpu_linear_out_by_in_tiled_aligned_matches_scalar_within_tolerance`
+(a fully tile-aligned 64×48×32 shape that exercises the multi-workgroup
+common path). Both hold the `1e-4` abs/rel tolerance against the scalar
+CPU reference.
+
+### Fresh local release results (2026-05-15, sample_16khz_mono)
+
+Median of 3 runs per backend per model. All runs `matches_expected = true`.
+
+#### tiny.en
+
+| Backend                                            | Walltime   | encoder  | decode_total |
+| -------------------------------------------------- | ---------- | -------- | ------------ |
+| W-ASR.40 CPU (`avx2`, `--cpu-threads 4`)           | `841 ms`   | `406 ms` | `270 ms`     |
+| GW.4-2B GPU (naive `linear`, device-resident)      | `1,135 ms` | `530 ms` | `196 ms`     |
+| GW.4-4 GPU (tiled `linear`, device-resident)       | `1,076 ms` | `489 ms` | `166 ms`     |
+
+GW.4-4 trims the GPU encoder from 530 ms to 489 ms (-41 ms, ~8%) and
+total walltime from 1,135 ms to 1,076 ms (-59 ms, ~5%). **The encoder
+did not cross the AVX2 + 4-thread CPU baseline of 406 ms** — GW.4-4
+narrows the encoder gap from -124 ms to -83 ms but does not flip the
+sign. Decode total improves modestly (196 → 166 ms) because the tiled
+kernel is also used for the QKV/out projections inside the decoder
+prefill plus the FFN linears during decode.
+
+#### small.en (informational)
+
+| Backend                                            | Walltime    | encoder    | decode_total |
+| -------------------------------------------------- | ----------- | ---------- | ------------ |
+| W-ASR.40 CPU (`avx2`, `--cpu-threads 4`)           | `2,461 ms`  | `1,747 ms` | `104 ms`     |
+| GW.4-4 GPU (tiled `linear`, device-resident)       | `3,987 ms`  | `2,700 ms` | `70 ms`      |
+
+The GPU win on `decode_total` widens at small.en (70 ms GPU vs 104 ms
+CPU), but the encoder gap actually widens proportionally: tiny is ~20%
+slower on GPU, small is ~55% slower. That isn't the expected scaling
+for a memory-traffic-bound kernel and points at the next bottleneck —
+the host attention bounce (Q/K/V readback, scalar attention, context
+upload per encoder layer) grows linearly with `seq`, and at small.en's
+`seq = 1500, state = 768, n_heads = 12` the bounce volume is 4× tiny's.
+The full multi-size GPU sweep is out of scope for this commit and lives
+on the GW.4-bench-all-sizes follow-up.
+
+### Why the tiled kernel underdelivered relative to the back-of-envelope
+
+The theoretical global-memory traffic reduction for a 16×16 tile on
+fc1 (`rows = 1500, in = 384, out = 1536`) is roughly 16× — each
+`x` row is shared across 16 threads in a workgroup, same for `weight`
+columns. The measured wall-time reduction on the encoder is ~8%. Two
+likely contributors:
+
+- **Compute, not bandwidth, is the dominant axis at these shapes.** The
+  inner accumulate is 384 FMAs per output cell either way; the tiled
+  kernel saves global reads but doesn't change the FMA count. The local
+  DX12 adapter's effective FMA throughput is the rate-limiter once the
+  L1/L2 cache absorbs the naive kernel's redundant reads.
+- **`sync_cube()` is non-free.** Two barriers per chunk × 24 chunks =
+  48 cube-wide barriers per output cell. On WGPU/DX12 these compile to
+  `OpControlBarrier` and serialize the workgroup more than a
+  raster-style kernel would on a dedicated CUDA path.
+
+A plane (subgroup) reduction or a register-blocked tile (each thread
+owning a 4×4 sub-tile) would target the FMA throughput directly. Both
+are reasonable follow-ups; neither is GW.4-4-shaped.
+
+### CubeCL 0.10 notes
+
+- **Barrier name.** The kernel-level workgroup barrier in CubeCL 0.10 is
+  `sync_cube()`, not `sync_units()`. `sync_plane()` exists too but is
+  warp/SIMD-group scoped (i.e., a subgroup-shuffle primitive), not what
+  we need for a 16×16 cooperative load.
+- **Type unification inside `#[cube]` bodies.** Mixing `u32` (`CUBE_POS_*`,
+  `UNIT_POS_*`) with `usize` (`#[comptime]` arguments) in arithmetic
+  expressions inside a cube kernel triggers strict-Rust type errors
+  from the proc-macro output — the macro does not auto-coerce between
+  integer widths for free-standing `let` bindings the way it does for
+  array-index expressions. The fix here was to cast each builtin to
+  `usize` once at the top of the kernel (`let tx = UNIT_POS_X as
+  usize;`) so the rest of the body unifies with the comptime tile
+  sizes. `layer_norm_naive_f32` mixes them freely because its arithmetic
+  flows directly into array indexing (where the macro inserts coercion),
+  but the tiled kernel does enough intermediate arithmetic that the
+  one-time cast was cleaner.
+- **`SharedMemory::<f32>::new(size)`.** Takes a `#[comptime] size:
+  usize`; called outside any expand-able operator, so it must be
+  literally a `usize` at the Rust level.
+- **`div_ceil` inside a `#[cube]` body.** Works for comptime usize
+  arithmetic; clippy's `manual_div_ceil` lint applies to cube kernel
+  bodies too and the rewrite (`in_features.div_ceil(tile_k)`) goes
+  through the macro without complaint.
