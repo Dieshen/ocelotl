@@ -46,6 +46,8 @@ pub use cubecl_backend::{
 };
 pub mod mlp;
 pub mod rmsnorm;
+pub mod tensor;
+pub use tensor::{DeviceBuffer, DeviceTensor, HostBorrow, HostBorrowMut, Residency};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CpuKernelMode {
@@ -160,6 +162,59 @@ pub trait KernelBackend: Debug + Send + Sync {
     ) -> Result<()>;
 
     fn vec_add(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()>;
+
+    // ---- device-tensor surface (GW.4 Stage 1) -----------------------------
+    //
+    // These methods build the GPU forward path: backends that can keep
+    // activations on-device should override them. Defaults wrap a host
+    // `Vec<f32>` so the CPU backend works without overrides, and so any
+    // GPU backend that hasn't yet implemented a primitive can fall back
+    // to "readback → CPU kernel → upload" without breaking parity.
+
+    /// Upload host data into a backend-preferred buffer. CPU returns a
+    /// `Host` variant zero-copy; GPU backends override to upload.
+    fn upload(&self, host: &[f32]) -> Result<DeviceTensor> {
+        Ok(DeviceTensor::from_host(host.to_vec()))
+    }
+
+    /// Allocate a zero-filled buffer of `len` `f32` elements in the
+    /// backend-preferred location.
+    fn alloc(&self, len: usize) -> Result<DeviceTensor> {
+        Ok(DeviceTensor::host_zeros(len))
+    }
+
+    /// Device-resident linear projection. `out` is caller-supplied so the
+    /// caller can recycle scratch across loop iterations. The default
+    /// implementation forces host readback through `to_host_owned` and
+    /// then calls the existing slice-based `linear_out_by_in`, so any
+    /// backend that does not override pays the round-trip but stays
+    /// correct.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        in_features: usize,
+        weight: &DeviceTensor,
+        out_features: usize,
+        bias: Option<&DeviceTensor>,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        let x_host = x.to_host_owned()?;
+        let weight_host = weight.to_host_owned()?;
+        let bias_host = bias.map(DeviceTensor::to_host_owned).transpose()?;
+        let mut out_buf = vec![0.0_f32; rows * out_features];
+        self.linear_out_by_in(
+            &x_host,
+            rows,
+            in_features,
+            &weight_host,
+            out_features,
+            bias_host.as_deref(),
+            &mut out_buf,
+        )?;
+        out.write_from_host_slice(&out_buf)
+    }
 }
 
 pub type SharedKernelBackend = Arc<dyn KernelBackend>;
@@ -519,6 +574,77 @@ impl KernelBackend for CpuKernelBackend {
 
     fn vec_add(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()> {
         vec_add(a, b, out)
+    }
+
+    /// CPU override: when every handle is host-resident (the common case
+    /// for the CPU backend), borrow the underlying `Vec<f32>` slices directly
+    /// and call the existing `linear_out_by_in` — no readback, no extra
+    /// allocations. Falls back to the trait default for the rare device-on-
+    /// CPU case (which produces a readback through the default impl).
+    #[allow(clippy::too_many_arguments)]
+    fn linear_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        in_features: usize,
+        weight: &DeviceTensor,
+        out_features: usize,
+        bias: Option<&DeviceTensor>,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        // All inputs are host-resident in practice on this backend; borrow
+        // their slices directly. If any side is somehow device-resident we
+        // delegate to the default impl which forces readback.
+        let (x_borrow, w_borrow, out_borrow) = match (
+            x.borrow_host_slice(),
+            weight.borrow_host_slice(),
+            out.borrow_host_slice_mut(),
+        ) {
+            (Ok(x_b), Ok(w_b), Ok(out_b)) => (x_b, w_b, out_b),
+            _ => {
+                let x_host = x.to_host_owned()?;
+                let weight_host = weight.to_host_owned()?;
+                let bias_host = bias.map(DeviceTensor::to_host_owned).transpose()?;
+                let mut out_buf = vec![0.0_f32; rows * out_features];
+                CpuKernelBackend::linear_out_by_in(
+                    self,
+                    &x_host,
+                    rows,
+                    in_features,
+                    &weight_host,
+                    out_features,
+                    bias_host.as_deref(),
+                    &mut out_buf,
+                )?;
+                return out.write_from_host_slice(&out_buf);
+            }
+        };
+        let mut out_borrow = out_borrow;
+        match bias {
+            Some(b) => {
+                let b_borrow = b.borrow_host_slice()?;
+                CpuKernelBackend::linear_out_by_in(
+                    self,
+                    &x_borrow,
+                    rows,
+                    in_features,
+                    &w_borrow,
+                    out_features,
+                    Some(&b_borrow),
+                    &mut out_borrow,
+                )
+            }
+            None => CpuKernelBackend::linear_out_by_in(
+                self,
+                &x_borrow,
+                rows,
+                in_features,
+                &w_borrow,
+                out_features,
+                None,
+                &mut out_borrow,
+            ),
+        }
     }
 }
 
@@ -2172,5 +2298,115 @@ mod tests {
             .unwrap();
 
         assert_eq!(serial, threaded);
+    }
+
+    // --- GW.4 Stage 1A: linear_d parity ---
+
+    #[test]
+    fn cpu_linear_d_matches_linear_out_by_in_bit_for_bit() {
+        // The CPU `linear_d` override borrows host slices directly and calls
+        // the existing `linear_out_by_in`. The output must be bit-identical
+        // to the slice-based path on the same inputs — `linear_d` is the
+        // parity oracle the GPU implementation (GW.4-1B) will validate
+        // against.
+        let rows = 7usize;
+        let in_features = 23usize;
+        let out_features = 13usize;
+        let x_vec: Vec<f32> = (0..rows * in_features)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let w_vec: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let b_vec: Vec<f32> = (0..out_features).map(|i| (i as f32) * 0.05).collect();
+
+        let backend = CpuKernelBackend::scalar();
+
+        // Slice path.
+        let mut slice_out = vec![0.0_f32; rows * out_features];
+        backend
+            .linear_out_by_in(
+                &x_vec,
+                rows,
+                in_features,
+                &w_vec,
+                out_features,
+                Some(&b_vec),
+                &mut slice_out,
+            )
+            .unwrap();
+
+        // Handle path.
+        let x_h = DeviceTensor::from_host(x_vec.clone());
+        let w_h = DeviceTensor::from_host(w_vec.clone());
+        let b_h = DeviceTensor::from_host(b_vec.clone());
+        let out_h = DeviceTensor::host_zeros(rows * out_features);
+        backend
+            .linear_d(
+                &x_h,
+                rows,
+                in_features,
+                &w_h,
+                out_features,
+                Some(&b_h),
+                &out_h,
+            )
+            .unwrap();
+        let handle_out = out_h.to_host_owned().unwrap();
+
+        assert_eq!(
+            slice_out, handle_out,
+            "linear_d must be bit-identical to linear_out_by_in on the CPU backend"
+        );
+    }
+
+    #[test]
+    fn cpu_linear_d_handles_no_bias() {
+        let rows = 3usize;
+        let in_features = 5usize;
+        let out_features = 4usize;
+        let x_vec: Vec<f32> = (0..rows * in_features).map(|i| (i as f32) * 0.1).collect();
+        let w_vec: Vec<f32> = (0..out_features * in_features)
+            .map(|i| (i as f32) * -0.07)
+            .collect();
+
+        let backend = CpuKernelBackend::scalar();
+
+        let mut slice_out = vec![0.0_f32; rows * out_features];
+        backend
+            .linear_out_by_in(
+                &x_vec,
+                rows,
+                in_features,
+                &w_vec,
+                out_features,
+                None,
+                &mut slice_out,
+            )
+            .unwrap();
+
+        let x_h = DeviceTensor::from_host(x_vec);
+        let w_h = DeviceTensor::from_host(w_vec);
+        let out_h = DeviceTensor::host_zeros(rows * out_features);
+        backend
+            .linear_d(&x_h, rows, in_features, &w_h, out_features, None, &out_h)
+            .unwrap();
+        assert_eq!(slice_out, out_h.to_host_owned().unwrap());
+    }
+
+    #[test]
+    fn upload_default_returns_host_resident_tensor() {
+        let backend = CpuKernelBackend::scalar();
+        let t = backend.upload(&[1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(t.residency(), Residency::Host);
+        assert_eq!(t.to_host_owned().unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn alloc_default_returns_zero_filled_host_tensor() {
+        let backend = CpuKernelBackend::scalar();
+        let t = backend.alloc(4).unwrap();
+        assert_eq!(t.residency(), Residency::Host);
+        assert_eq!(t.to_host_owned().unwrap(), vec![0.0, 0.0, 0.0, 0.0]);
     }
 }
