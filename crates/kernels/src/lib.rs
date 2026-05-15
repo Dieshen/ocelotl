@@ -442,6 +442,56 @@ pub trait KernelBackend: Debug + Send + Sync {
         );
         output.write_from_host_slice(&out_buf)
     }
+
+    /// Whisper decoder cross-attention on device handles.
+    ///
+    /// Q comes from the decoder hidden state: shape `[q_seq, state]` where
+    /// `state == n_head * head_dim`. K and V come from the encoder output
+    /// (precomputed per-sequence in `WhisperEncodedAudio`): shape
+    /// `[kv_seq, state]`. There is **no causal mask** — each decoder query
+    /// row attends all `kv_seq` encoder positions freely. `output`: `[q_seq, state]`.
+    ///
+    /// `q_seq` is the number of decoder tokens being processed (may be 1 for
+    /// the incremental path or > 1 for the full-context path).
+    /// `kv_seq` is the number of encoder frames (audio context length).
+    ///
+    /// The default implementation forces host readback and runs
+    /// `attention_decoder_cross_scalar`.
+    ///
+    /// GW.4-5C: replaces the `attention_body_host(causal=false)` host bounce
+    /// in both `decode_tokens_with_self_attention_cache` and
+    /// `decode_appended_token` so cross-attention stays on device.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_cross_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        q_seq: usize,
+        kv_seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_cross_shapes(q, k, v, q_seq, kv_seq, n_head, head_dim, output)?;
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; q_seq * n_head * head_dim];
+        attention_decoder_cross_scalar(
+            &q_host,
+            &k_host,
+            &v_host,
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
 }
 
 /// Whisper's exact-erf GELU. Mirrors
@@ -798,6 +848,111 @@ pub(crate) fn validate_attention_decoder_incremental_shapes(
         if len != past_expected {
             return Err(kernel_err(format!(
                 "attention_decoder_incremental_d {label} len {len} != past_seq*state {past_expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Scalar Whisper decoder cross-attention (encoder-decoder attention).
+///
+/// Q: `[q_seq, state]` from decoder hidden state.
+/// K, V: `[kv_seq, state]` from encoder output (precomputed, static per sequence).
+/// No causal mask: each query row attends all `kv_seq` encoder positions.
+/// Writes `[q_seq, state]` into `out`.
+///
+/// This is the parity oracle for `attention_decoder_cross_d`. Matches
+/// `attention_body_host` with `causal == false`, `q_seq` decoder rows, and
+/// `kv_seq` encoder rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decoder_cross_scalar(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    q_seq: usize,
+    kv_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), q_seq * state);
+    debug_assert_eq!(k.len(), kv_seq * state);
+    debug_assert_eq!(v.len(), kv_seq * state);
+    debug_assert_eq!(out.len(), q_seq * state);
+
+    let mut scores = vec![0.0_f32; kv_seq];
+    for qi in 0..q_seq {
+        for head in 0..n_head {
+            let q_base = qi * state + head * head_dim;
+            // Pass 1: scaled dot products across all encoder positions.
+            for (ki, score) in scores.iter_mut().enumerate() {
+                let k_base = ki * state + head * head_dim;
+                let mut acc = 0.0_f32;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            // Pass 2: numerically stable softmax over all kv_seq scores.
+            softmax(&mut scores);
+            // Pass 3: probability-weighted accumulation of V.
+            let out_base = qi * state + head * head_dim;
+            for d in 0..head_dim {
+                out[out_base + d] = 0.0;
+            }
+            for (ki, &p) in scores.iter().enumerate() {
+                let v_base = ki * state + head * head_dim;
+                for d in 0..head_dim {
+                    out[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+}
+
+/// Shape validator for `attention_decoder_cross_d`. Rejects zero heads/dim,
+/// overflow in `state = n_head * head_dim`, wrong Q shape (must be
+/// `q_seq * state`), wrong K/V shape (must be `kv_seq * state`), and
+/// wrong output shape (must be `q_seq * state`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_attention_decoder_cross_shapes(
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    v: &DeviceTensor,
+    q_seq: usize,
+    kv_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    out: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(kernel_err("attention_decoder_cross_d n_head must be > 0"));
+    }
+    if head_dim == 0 {
+        return Err(kernel_err("attention_decoder_cross_d head_dim must be > 0"));
+    }
+    let state = n_head
+        .checked_mul(head_dim)
+        .ok_or_else(|| kernel_err("attention_decoder_cross_d n_head*head_dim overflowed usize"))?;
+    let q_expected = q_seq
+        .checked_mul(state)
+        .ok_or_else(|| kernel_err("attention_decoder_cross_d q_seq*state overflowed usize"))?;
+    let kv_expected = kv_seq
+        .checked_mul(state)
+        .ok_or_else(|| kernel_err("attention_decoder_cross_d kv_seq*state overflowed usize"))?;
+    for (label, len, expected) in [("q", q.len(), q_expected), ("out", out.len(), q_expected)] {
+        if len != expected {
+            return Err(kernel_err(format!(
+                "attention_decoder_cross_d {label} len {len} != q_seq*state {expected}"
+            )));
+        }
+    }
+    for (label, len) in [("k", k.len()), ("v", v.len())] {
+        if len != kv_expected {
+            return Err(kernel_err(format!(
+                "attention_decoder_cross_d {label} len {len} != kv_seq*state {kv_expected}"
             )));
         }
     }
@@ -3684,6 +3839,128 @@ mod tests {
                 );
             }
             other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    // GW.4-5C: decoder cross-attention scalar oracle — no causal mask,
+    // q_seq decoder rows attend all kv_seq encoder positions freely.
+    #[test]
+    fn attention_decoder_cross_scalar_matches_attention_body_host() {
+        // Q from decoder: [q_seq=3, state], K/V from encoder: [kv_seq=5, state].
+        // Verifies Q rows attend all 5 encoder positions (no causal restriction).
+        let q_seq = 3usize;
+        let kv_seq = 5usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..q_seq * state)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut got = vec![0.0_f32; q_seq * state];
+        attention_decoder_cross_scalar(
+            &q, &k, &v, q_seq, kv_seq, n_head, head_dim, scale, &mut got,
+        );
+
+        // Reference: attention_encoder_scalar with kv_seq != q_seq is not
+        // directly applicable, so compute the reference inline using the same
+        // algorithm attention_body_host uses with causal=false.
+        let mut expected = vec![0.0_f32; q_seq * state];
+        for qi in 0..q_seq {
+            for head in 0..n_head {
+                let q_base = qi * state + head * head_dim;
+                let mut scores = vec![0.0_f32; kv_seq];
+                for (ki, score) in scores.iter_mut().enumerate() {
+                    let k_base = ki * state + head * head_dim;
+                    let mut acc = 0.0_f32;
+                    for d in 0..head_dim {
+                        acc += q[q_base + d] * k[k_base + d];
+                    }
+                    *score = acc * scale;
+                }
+                softmax(&mut scores);
+                let out_base = qi * state + head * head_dim;
+                for d in 0..head_dim {
+                    expected[out_base + d] = 0.0;
+                }
+                for (ki, &p) in scores.iter().enumerate() {
+                    let v_base = ki * state + head * head_dim;
+                    for d in 0..head_dim {
+                        expected[out_base + d] += p * v[v_base + d];
+                    }
+                }
+            }
+        }
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-6,
+                "cross scalar mismatch at idx {idx}: got={g} expected={e}"
+            );
+        }
+    }
+
+    // GW.4-5C: `attention_decoder_cross_d` default trait impl (readback +
+    // scalar) must produce the same output as the scalar oracle.
+    #[test]
+    fn attention_decoder_cross_d_default_matches_scalar_oracle() {
+        let q_seq = 3usize;
+        let kv_seq = 5usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..q_seq * state)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; q_seq * state];
+        attention_decoder_cross_scalar(
+            &q,
+            &k,
+            &v,
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CpuKernelBackend::scalar();
+        let q_d = DeviceTensor::from_host(q.clone());
+        let k_d = DeviceTensor::from_host(k.clone());
+        let v_d = DeviceTensor::from_host(v.clone());
+        let out_d = DeviceTensor::host_zeros(q_seq * state);
+        backend
+            .attention_decoder_cross_d(
+                &q_d, &k_d, &v_d, q_seq, kv_seq, n_head, head_dim, scale, &out_d,
+            )
+            .expect("attention_decoder_cross_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-6,
+                "cross_d default mismatch at idx {idx}: got={g} expected={e}"
+            );
         }
     }
 }

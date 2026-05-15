@@ -583,6 +583,66 @@ impl KernelBackend for CubeClKernelBackend {
         );
         output.write_from_host_slice(&out_buf)
     }
+
+    /// Device-resident decoder cross-attention (encoder-decoder attention).
+    /// Q comes from the decoder hidden state `[q_seq, state]`; K and V come
+    /// from the precomputed encoder output `[kv_seq, state]`. No causal mask:
+    /// each query row attends all `kv_seq` encoder positions freely.
+    ///
+    /// When all operands are `WgpuDeviceBuffer`, launches the fused cube
+    /// kernel. Falls back to the trait default (readback → scalar → writeback)
+    /// when the adapter is unavailable or any operand is not on the WGPU runtime.
+    ///
+    /// GW.4-5C: replaces the `attention_body_host(causal=false)` host bounce
+    /// in both `decode_tokens_with_self_attention_cache` and
+    /// `decode_appended_token`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_cross_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        q_seq: usize,
+        kv_seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        crate::validate_attention_decoder_cross_shapes(
+            q, k, v, q_seq, kv_seq, n_head, head_dim, output,
+        )?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(k),
+                extract_wgpu_buf(v),
+                extract_wgpu_buf(output),
+            ) {
+                return run_attention_decoder_cross_d_wgpu(
+                    q_buf, k_buf, v_buf, q_seq, kv_seq, n_head, head_dim, scale, out_buf,
+                );
+            }
+        }
+        // Default: readback + scalar cross-attention + writeback.
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; q_seq * n_head * head_dim];
+        crate::attention_decoder_cross_scalar(
+            &q_host,
+            &k_host,
+            &v_host,
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
 }
 
 /// Run a fully device-resident `linear_out_by_in` on the WGPU runtime.
@@ -1507,6 +1567,178 @@ fn run_attention_decoder_incremental_d_wgpu(
             head_dim,
             visible_u32,
             scale,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GW.4-5C: fused decoder cross-attention kernel.
+//
+// Cross-attention (encoder-decoder): Q from decoder `[q_seq, state]`,
+// K and V from encoder output `[kv_seq, state]`. No causal mask — every
+// decoder query row attends all `kv_seq` encoder positions freely.
+//
+// One thread per `(query_row, head)`. Layout: `[seq, state]` row-major,
+// `state == n_head * head_dim`. Shared memory slab: `wg_size * kv_seq` floats
+// (one row per intra-workgroup lane), same strategy as the encoder kernel.
+//
+// Key differences from `attention_decoder_causal_f32` (GW.4-5B):
+//   - K/V sequence length is `kv_seq` (encoder frames), not `q_seq`.
+//   - No causal guard — all `kv_seq` positions are always visible.
+//   - `q_seq` may be 1 (incremental append path) or > 1 (full-context path).
+// ---------------------------------------------------------------------------
+
+/// Fused decoder cross-attention kernel. One thread per `(query_row, head)`.
+///
+/// Layout: `q` is `[q_seq, state]`, `k`/`v` are `[kv_seq, state]`,
+/// `output` is `[q_seq, state]`. `state == n_head * head_dim`.
+/// Every query row attends all `kv_seq` encoder positions (no causal mask).
+///
+/// Shared memory slab: `wg_size * kv_seq` floats, one row per lane.
+#[cube(launch_unchecked)]
+fn attention_decoder_cross_f32(
+    q: &Array<f32>,
+    k: &Array<f32>,
+    v: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] q_seq: usize,
+    #[comptime] kv_seq: usize,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    #[comptime] wg_size: usize,
+    scale: f32,
+) {
+    #[allow(clippy::unnecessary_cast)]
+    let pos = ABSOLUTE_POS as usize;
+    let total = q_seq * n_head;
+    if pos >= total {
+        terminate!();
+    }
+
+    let query_row = pos / n_head;
+    let head = pos - query_row * n_head;
+    let state = n_head * head_dim;
+
+    // Shared-memory slab: kv_seq scores per lane, same design as encoder kernel.
+    let mut scores = SharedMemory::<f32>::new(wg_size * kv_seq);
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let lane_base = lane * kv_seq;
+
+    let q_base = query_row * state + head * head_dim;
+
+    // Pass 1: scaled dot products against all kv_seq encoder keys.
+    let mut row_max = f32::new(0.0);
+    for j in 0..kv_seq {
+        let k_base = j * state + head * head_dim;
+        let mut acc = f32::new(0.0);
+        for d in 0..head_dim {
+            acc += q[q_base + d] * k[k_base + d];
+        }
+        let scaled = acc * scale;
+        scores[lane_base + j] = scaled;
+        if j == 0 || scaled > row_max {
+            row_max = scaled;
+        }
+    }
+
+    // Pass 2: numerically stable softmax over all kv_seq scores.
+    let mut denom = f32::new(0.0);
+    for j in 0..kv_seq {
+        let e = f32::exp(scores[lane_base + j] - row_max);
+        scores[lane_base + j] = e;
+        denom += e;
+    }
+    let inv_denom = f32::new(1.0) / denom;
+    for j in 0..kv_seq {
+        scores[lane_base + j] = scores[lane_base + j] * inv_denom;
+    }
+
+    // Pass 3: probability-weighted accumulation of V across all encoder positions.
+    let out_base = query_row * state + head * head_dim;
+    for d in 0..head_dim {
+        let mut ctx = f32::new(0.0);
+        for j in 0..kv_seq {
+            let v_base = j * state + head * head_dim;
+            ctx += scores[lane_base + j] * v[v_base + d];
+        }
+        output[out_base + d] = ctx;
+    }
+}
+
+/// Launch helper for the fused decoder cross-attention kernel.
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_decoder_cross_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    k: &WgpuDeviceBuffer,
+    v: &WgpuDeviceBuffer,
+    q_seq: usize,
+    kv_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        cubecl_wgpu_err("attention_decoder_cross_d n_head*head_dim overflowed usize")
+    })?;
+    let q_expected = q_seq
+        .checked_mul(state)
+        .ok_or_else(|| cubecl_wgpu_err("attention_decoder_cross_d q_seq*state overflowed usize"))?;
+    let kv_expected = kv_seq.checked_mul(state).ok_or_else(|| {
+        cubecl_wgpu_err("attention_decoder_cross_d kv_seq*state overflowed usize")
+    })?;
+    for (label, len, expected) in [
+        ("q", q.len_f32(), q_expected),
+        ("out", out.len_f32(), q_expected),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_decoder_cross_d {label} len {len} != q_seq*state {expected}"
+            )));
+        }
+    }
+    for (label, len) in [("k", k.len_f32()), ("v", v.len_f32())] {
+        if len != kv_expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_decoder_cross_d {label} len {len} != kv_seq*state {kv_expected}"
+            )));
+        }
+    }
+
+    let total = u32::try_from(q_seq * n_head).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_decoder_cross_d thread count {} exceeds CubeCL u32 launch limit",
+            q_seq * n_head
+        ))
+    })?;
+    // Reuse the same workgroup size as the encoder and decoder self-attention kernels.
+    let workgroup_count = total.div_ceil(ENC_ATTN_WG).max(1);
+
+    let client = q.client();
+    let out_handle = client.empty(q_expected * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_decoder_cross_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(ENC_ATTN_WG),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(k.clone_handle(), k.len_f32()),
+            ArrayArg::from_raw_parts(v.clone_handle(), v.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), q_expected),
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            ENC_ATTN_WG as usize,
+            ScalarArg::new(scale),
         );
     }
 
@@ -2942,6 +3174,74 @@ mod tests {
             assert!(
                 abs <= 1e-4 || rel <= 1e-4,
                 "GPU incremental decoder attention drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    /// GW.4-5C GPU parity gate: the fused decoder cross-attention kernel must
+    /// match `attention_decoder_cross_scalar` within `1e-4` rel/abs.
+    /// Shape: q_seq=3 decoder rows, kv_seq=7 encoder frames, n_head=2, head_dim=4.
+    /// The asymmetric q_seq vs kv_seq exercises the cross-attention-specific
+    /// path where Q and K/V have different sequence lengths.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_decoder_cross_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_decoder_cross_d_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let q_seq = 3usize;
+        let kv_seq = 7usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..q_seq * state)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; q_seq * state];
+        crate::attention_decoder_cross_scalar(
+            &q,
+            &k,
+            &v,
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(q_seq * state).expect("alloc out");
+        backend
+            .attention_decoder_cross_d(
+                &q_d, &k_d, &v_d, q_seq, kv_seq, n_head, head_dim, scale, &out_d,
+            )
+            .expect("device attention_decoder_cross_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU cross attention drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
             );
         }
     }
