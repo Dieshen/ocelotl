@@ -47,6 +47,10 @@ readme = "README.md"
 keywords = ["llm", "inference", "gpu", "runtime"]
 categories = ["science", "api-bindings"]
 
+[features]
+default = []
+cubecl-wgpu = ["ocelotl-kernels/cubecl-wgpu", "ocelotl-models/cubecl-wgpu"]
+
 [dependencies]
 ocelotl-core.workspace = true
 ocelotl-kernels.workspace = true

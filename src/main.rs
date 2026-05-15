@@ -5,7 +5,9 @@ use std::{
 };
 
 use ocelotl_core::TokenId;
-use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode};
+use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode, KernelBackend};
+#[cfg(feature = "cubecl-wgpu")]
+use ocelotl_kernels::CubeClKernelBackend;
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 use ocelotl_models::whisper::{
     WhisperAudioEncodeTimings, WhisperConfig, WhisperEncodedAudio, WhisperModel,
@@ -20,6 +22,22 @@ use serde::Deserialize;
 
 const OPENAI_MULTILINGUAL_VOCAB_THRESHOLD: usize = 51_865;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BenchBackend {
+    #[default]
+    Cpu,
+    CubeclWgpu,
+}
+
+impl BenchBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::CubeclWgpu => "cubecl-wgpu",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BenchWhisperArgs {
     config_path: PathBuf,
@@ -29,6 +47,7 @@ struct BenchWhisperArgs {
     tokenizer_path: Option<PathBuf>,
     cpu_kernel_mode: CpuKernelMode,
     cpu_threads: usize,
+    backend: BenchBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +211,7 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!(
-        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized|avx2] [--cpu-threads <n>]"
+        "  bench-whisper-transcribe --config-path <path> --model-path <path> --audio-path <path> --expected-tokens-path <path> [--tokenizer-path <path>] [--cpu-kernel-mode scalar|optimized|avx2] [--cpu-threads <n>] [--backend cpu|cubecl-wgpu]"
     );
     println!(
         "  fetch hf --repo <repo> --revision <sha> --local-dir <path> [--include <pattern> ...] [--execute]"
@@ -207,6 +226,7 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
     let mut tokenizer_path = None;
     let mut cpu_kernel_mode = CpuKernelMode::Scalar;
     let mut cpu_threads: usize = 1;
+    let mut backend = BenchBackend::Cpu;
     let mut iter = args.into_iter();
 
     while let Some(flag) = iter.next() {
@@ -221,6 +241,7 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
             "--tokenizer-path" => tokenizer_path = Some(PathBuf::from(value)),
             "--cpu-kernel-mode" => cpu_kernel_mode = parse_cpu_kernel_mode(&value)?,
             "--cpu-threads" => cpu_threads = parse_cpu_threads(&value)?,
+            "--backend" => backend = parse_backend(&value)?,
             _ => {
                 return Err(format!(
                     "unsupported bench-whisper-transcribe flag {flag:?}"
@@ -237,7 +258,46 @@ fn parse_bench_args(args: impl IntoIterator<Item = String>) -> Result<BenchWhisp
         tokenizer_path,
         cpu_kernel_mode,
         cpu_threads,
+        backend,
     })
+}
+
+fn parse_backend(value: &str) -> Result<BenchBackend, String> {
+    match value {
+        "cpu" => Ok(BenchBackend::Cpu),
+        "cubecl-wgpu" => Ok(BenchBackend::CubeclWgpu),
+        other => Err(format!(
+            "unsupported --backend {other:?}; supported values: cpu, cubecl-wgpu"
+        )),
+    }
+}
+
+fn build_bench_backend(
+    backend: BenchBackend,
+    cpu_kernel_mode: CpuKernelMode,
+    cpu_threads: usize,
+) -> Result<Arc<dyn KernelBackend>, String> {
+    match backend {
+        BenchBackend::Cpu => {
+            let cpu = CpuKernelBackend::with_mode_and_threads(cpu_kernel_mode, cpu_threads)
+                .map_err(|err| format!("failed to build CPU kernel backend - {err:?}"))?;
+            Ok(Arc::new(cpu))
+        }
+        BenchBackend::CubeclWgpu => build_cubecl_wgpu_backend(),
+    }
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn build_cubecl_wgpu_backend() -> Result<Arc<dyn KernelBackend>, String> {
+    Ok(Arc::new(CubeClKernelBackend::new_gpu(0)))
+}
+
+#[cfg(not(feature = "cubecl-wgpu"))]
+fn build_cubecl_wgpu_backend() -> Result<Arc<dyn KernelBackend>, String> {
+    Err(
+        "--backend cubecl-wgpu requires the binary to be built with --features cubecl-wgpu"
+            .to_string(),
+    )
 }
 
 fn parse_cpu_threads(value: &str) -> Result<usize, String> {
@@ -413,12 +473,11 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
     let expected_tokens_read_ms = expected_started.elapsed().as_millis();
 
     let tensor_started = Instant::now();
-    let kernels = CpuKernelBackend::with_mode_and_threads(args.cpu_kernel_mode, args.cpu_threads)
-        .map_err(|err| format!("failed to build CPU kernel backend - {err:?}"))?;
+    let kernels = build_bench_backend(args.backend, args.cpu_kernel_mode, args.cpu_threads)?;
     let model = WhisperModel::with_kernel_backend(
         whisper_config.clone(),
         load_required_whisper_tensors(&args.model_path, &whisper_config)?,
-        Arc::new(kernels),
+        kernels,
     )
     .map_err(|err| format!("failed to construct Whisper model - {err:?}"))?;
     let tensor_load_model_ms = tensor_started.elapsed().as_millis();
@@ -477,6 +536,7 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
     };
     let output = bench_whisper_output(
         matches_expected,
+        args.backend,
         args.cpu_kernel_mode,
         args.cpu_threads,
         &generated,
@@ -494,6 +554,7 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
 
 fn bench_whisper_output(
     matches_expected: bool,
+    backend: BenchBackend,
     cpu_kernel_mode: CpuKernelMode,
     cpu_threads: usize,
     generated: &[TokenId],
@@ -508,6 +569,7 @@ fn bench_whisper_output(
         "tokens": token_ids,
         "text": transcript_text,
         "matches_expected": matches_expected,
+        "backend": backend.as_str(),
         "cpu_kernel_mode": cpu_kernel_mode.as_str(),
         "cpu_threads": cpu_threads,
         "resident_model_ms": {
@@ -854,6 +916,12 @@ mod tests {
             parse_bench_args(base.iter().copied().map(str::to_string)).expect("default args");
         assert_eq!(default_args.cpu_kernel_mode, CpuKernelMode::Scalar);
         assert_eq!(default_args.cpu_threads, 1);
+        assert_eq!(default_args.backend, BenchBackend::Cpu);
+
+        let mut with_backend = base.iter().copied().map(str::to_string).collect::<Vec<_>>();
+        with_backend.extend(["--backend".to_string(), "cubecl-wgpu".to_string()]);
+        let backend_args = parse_bench_args(with_backend).expect("backend args");
+        assert_eq!(backend_args.backend, BenchBackend::CubeclWgpu);
 
         let mut optimized = base.iter().copied().map(str::to_string).collect::<Vec<_>>();
         optimized.extend(["--cpu-kernel-mode".to_string(), "optimized".to_string()]);
@@ -962,6 +1030,7 @@ mod tests {
 
         let output = bench_whisper_output(
             true,
+            BenchBackend::Cpu,
             CpuKernelMode::Optimized,
             4,
             &[TokenId(50257), TokenId(50362)],
@@ -970,6 +1039,7 @@ mod tests {
         );
 
         assert_eq!(output["status"], "completed");
+        assert_eq!(output["backend"], "cpu");
         assert_eq!(output["cpu_kernel_mode"], "optimized");
         assert_eq!(output["cpu_threads"], 4);
         assert_eq!(output["elapsed_ms"], 100);

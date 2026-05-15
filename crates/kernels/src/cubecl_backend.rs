@@ -95,15 +95,31 @@ impl KernelBackend for CubeClKernelBackend {
         bias: Option<&[f32]>,
         out: &mut [f32],
     ) -> Result<()> {
-        crate::linear_out_by_in(
-            x,
-            rows,
-            in_features,
-            weight_out_by_in,
-            out_features,
-            bias,
-            out,
-        )
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            linear_out_by_in_wgpu(
+                x,
+                rows,
+                in_features,
+                weight_out_by_in,
+                out_features,
+                bias,
+                out,
+            )
+        }
+
+        #[cfg(not(feature = "cubecl-wgpu"))]
+        {
+            crate::linear_out_by_in(
+                x,
+                rows,
+                in_features,
+                weight_out_by_in,
+                out_features,
+                bias,
+                out,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -139,7 +155,7 @@ impl KernelBackend for CubeClKernelBackend {
     ) -> Result<()> {
         #[cfg(feature = "cubecl-wgpu")]
         {
-            return rope_apply_inplace_wgpu(x, head_dim, position, theta);
+            rope_apply_inplace_wgpu(x, head_dim, position, theta)
         }
 
         #[cfg(not(feature = "cubecl-wgpu"))]
@@ -331,6 +347,164 @@ fn rope_apply_f32(
     output[hi] = x_lo * s + x_hi * c;
 }
 
+/// Compute a single `[row, out_dim]` cell of `output = x * weight^T + bias`.
+///
+/// `weight` is row-major `[out_features, in_features]` matching the CPU
+/// `linear_out_by_in` contract. `bias` is `[out_features]` when `has_bias`
+/// and a length-1 dummy buffer (ignored) when `has_bias == false`. Each
+/// invocation maps `ABSOLUTE_POS` to one `(row, out_dim)` cell so a launch
+/// of `rows * out_features` threads covers the full output.
+#[cube(launch_unchecked)]
+fn linear_out_by_in_f32(
+    x: &Array<f32>,
+    weight: &Array<f32>,
+    bias: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] in_features: usize,
+    #[comptime] out_features: usize,
+    #[comptime] has_bias: bool,
+) {
+    let cell = ABSOLUTE_POS;
+    // `ABSOLUTE_POS` can run past the real output length because we round the
+    // launch grid up to whole workgroups. Bail out for those tail threads.
+    if cell >= output.len() {
+        terminate!();
+    }
+
+    let row = cell / out_features;
+    let out_dim = cell - row * out_features;
+
+    let mut acc = f32::new(0.0);
+    if has_bias {
+        acc = bias[out_dim];
+    }
+
+    let x_base = row * in_features;
+    let w_base = out_dim * in_features;
+    for k in 0..in_features {
+        acc += x[x_base + k] * weight[w_base + k];
+    }
+    output[row * out_features + out_dim] = acc;
+}
+
+/// Launch `linear_out_by_in_f32` through a CubeCL runtime.
+///
+/// The CPU reference (`crate::linear_out_by_in`) remains the parity oracle.
+/// Buffers cross the runtime boundary as contiguous row-major f32 slices,
+/// matching the M1 layout contract — no strides, no quantized weights.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_out_by_in_cubecl<R: Runtime>(
+    device: &R::Device,
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    crate::validate_linear_out_by_in(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )?;
+
+    u32::try_from(in_features).map_err(|_| {
+        cubecl_err(format!(
+            "in_features {in_features} exceeds CubeCL u32 launch limit"
+        ))
+    })?;
+    u32::try_from(out_features).map_err(|_| {
+        cubecl_err(format!(
+            "out_features {out_features} exceeds CubeCL u32 launch limit"
+        ))
+    })?;
+    let total_cells = u32::try_from(rows * out_features).map_err(|_| {
+        cubecl_err(format!(
+            "linear_out_by_in cell count {} exceeds CubeCL u32 launch limit",
+            rows * out_features
+        ))
+    })?;
+    // WGPU caps a single workgroup at 256 invocations on most adapters, so
+    // a single-workgroup launch (`CubeCount::Static(1, 1, 1)`) only computes
+    // the first 256 output cells of any larger problem. Spread the work
+    // across multiple workgroups using a fixed 1-D CubeDim. The kernel
+    // includes a bounds check for the rounded-up tail.
+    const WORKGROUP_SIZE: u32 = 256;
+    let workgroup_count = total_cells.div_ceil(WORKGROUP_SIZE).max(1);
+
+    let client = R::client(device);
+    let x_handle = client.create_from_slice(f32::as_bytes(x));
+    let weight_handle = client.create_from_slice(f32::as_bytes(weight_out_by_in));
+    let (bias_handle, bias_len, has_bias) = match bias {
+        Some(b) => (client.create_from_slice(f32::as_bytes(b)), b.len(), true),
+        None => {
+            let dummy = [0.0_f32];
+            (client.create_from_slice(f32::as_bytes(&dummy)), 1, false)
+        }
+    };
+    let output_handle = client.empty(size_of_val(out));
+
+    unsafe {
+        linear_out_by_in_f32::launch_unchecked::<R>(
+            &client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(WORKGROUP_SIZE),
+            ArrayArg::from_raw_parts(x_handle, x.len()),
+            ArrayArg::from_raw_parts(weight_handle, weight_out_by_in.len()),
+            ArrayArg::from_raw_parts(bias_handle, bias_len),
+            ArrayArg::from_raw_parts(output_handle.clone(), out.len()),
+            in_features,
+            out_features,
+            has_bias,
+        );
+    }
+
+    let bytes = client.read_one(output_handle).map_err(|err| {
+        cubecl_err(format!(
+            "failed to read CubeCL linear_out_by_in output: {err:?}"
+        ))
+    })?;
+    let read = f32::from_bytes(&bytes);
+    if read.len() != out.len() {
+        return Err(cubecl_err(format!(
+            "CubeCL linear_out_by_in output length {} did not match expected {}",
+            read.len(),
+            out.len()
+        )));
+    }
+    out.copy_from_slice(read);
+
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn linear_out_by_in_wgpu(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    linear_out_by_in_cubecl::<cubecl::wgpu::WgpuRuntime>(
+        &Default::default(),
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )
+}
+
 fn cubecl_err(message: impl Into<String>) -> OcelotlError {
     OcelotlError::Kernel(KernelError {
         backend: CUBECL_BACKEND.to_string(),
@@ -431,6 +605,58 @@ mod tests {
                 );
             }
             other => panic!("expected CubeCL KernelError, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_linear_out_by_in_matches_scalar_within_tolerance() {
+        use crate::CpuKernelBackend;
+
+        let rows = 17;
+        let in_features = 23;
+        let out_features = 13;
+        let x: Vec<f32> = (0..rows * in_features)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let w: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let b: Vec<f32> = (0..out_features).map(|i| (i as f32) * 0.05).collect();
+
+        let mut scalar = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::scalar()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut scalar)
+            .expect("scalar linear_out_by_in must succeed");
+
+        let mut gpu = vec![0.0_f32; rows * out_features];
+        if let Err(err) = linear_out_by_in_wgpu(
+            &x,
+            rows,
+            in_features,
+            &w,
+            out_features,
+            Some(&b),
+            &mut gpu,
+        ) {
+            // No usable WGPU adapter on this host — skip rather than fail. This
+            // mirrors `wgpu_rope_matches_cpu_reference_for_position_one`, which
+            // is `#[ignore]` for the same reason but in a coarser way; here we
+            // would rather run the test when an adapter is present and skip
+            // cleanly when it is not.
+            eprintln!(
+                "skipping wgpu_linear_out_by_in_matches_scalar_within_tolerance: {err:?}"
+            );
+            return;
+        }
+
+        for (idx, (s, g)) in scalar.iter().zip(gpu.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
         }
     }
 

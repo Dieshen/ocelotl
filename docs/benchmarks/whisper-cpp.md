@@ -828,3 +828,65 @@ The remaining roadmap levers are all secondary to where we now are:
    exactly; going wider risks register spilling.
 4. **AVX-512** — narrower host coverage; only worth it if a clear
    target platform emerges.
+
+## GW.1 GPU `linear_out_by_in` via CubeCL/WGPU
+
+First end-to-end GPU path: a `#[cube(launch_unchecked)]` `linear_out_by_in_f32`
+kernel in `crates/kernels/src/cubecl_backend.rs`, wired into
+`CubeClKernelBackend::linear_out_by_in` and reachable from the Whisper bench
+via a new `--backend cpu|cubecl-wgpu` CLI flag (default `cpu`). The binary
+gates the GPU path behind a workspace-root `cubecl-wgpu` feature that
+forwards to `ocelotl-models/cubecl-wgpu` → `ocelotl-kernels/cubecl-wgpu`.
+
+Scalar CPU `linear_out_by_in` remains the parity oracle. The new test
+`wgpu_linear_out_by_in_matches_scalar_within_tolerance` pins GPU output
+against scalar within `1e-4` abs/rel on a `[17,23]·[13,23]^T + [13]`
+problem, and skips cleanly with `eprintln!` when no WGPU adapter is
+available rather than failing.
+
+### Workgroup-size bug caught at the Whisper call site
+
+The first GPU run produced `matches_expected: false` and emitted the
+token `3694` ("aches") 24 times in a row. Root cause: a single-workgroup
+launch (`CubeCount::Static(1, 1, 1)` with `CubeDim::new_1d(total_cells)`)
+silently truncates to the WGPU per-workgroup limit (256 on the local
+DX12 adapter), so any Whisper linear larger than 256 output cells —
+which is all of them — only computed the first 256 cells and left the
+rest zero. The unit test masked this: `17*13 = 221 < 256`.
+
+Fix: spread the work across multiple workgroups with a fixed
+`CubeDim::new_1d(256)` and `CubeCount::Static(workgroup_count, 1, 1)`
+where `workgroup_count = ceil(total_cells / 256)`. The kernel now also
+includes a tail bounds check (`if cell >= output.len() { terminate!() }`)
+to handle the rounded-up grid. CubeCL 0.10 rejects bare `return;` in
+kernel bodies; the diagnostic explicitly points at `terminate!()`.
+
+### Fresh local release results (2026-05-15, tiny.en, sample_16khz_mono)
+
+| Backend                                                  | Walltime  | matches_expected | encoder | decode_total |
+| -------------------------------------------------------- | --------- | ---------------- | ------- | ------------ |
+| W-ASR.40 CPU (`avx2`, `--cpu-threads 4`)                 | `782 ms`  | `true`           | `347 ms`| `281 ms`     |
+| GW.1 GPU (`cubecl-wgpu`, scalar CPU fallback for others) | `2,930 ms`| `true`           | `765 ms`| `2,002 ms`   |
+
+GPU is ~3.7x slower than the AVX2 CPU baseline on tiny.en, which is the
+expected ordering for an unoptimized first-launch kernel: each output
+cell triggers its own `in_features`-long dot product with no shared
+weight reuse across cells in a workgroup, no tiling, and an upload of
+weight + bias per call. The CPU side of the model — RMSNorm, attention,
+MLP gate/up/down, residuals — still runs on the scalar CPU path because
+GW.1 only ports `linear_out_by_in`, so the encoder/decoder mixed path
+pays a host↔device round trip per linear plus scalar-CPU for everything
+else.
+
+The point of GW.1 is not perf — it is to put a real GPU primitive on the
+Whisper decode path with end-to-end token parity, so subsequent kernel
+ports can land against a real workload instead of an isolated parity
+fixture.
+
+### Output JSON now reports `backend`
+
+`bench-whisper-transcribe` adds `backend` next to `cpu_kernel_mode` so
+records distinguish CPU and GPU runs. Without the `cubecl-wgpu` feature
+compiled in, `--backend cubecl-wgpu` returns a typed error
+(`--backend cubecl-wgpu requires the binary to be built with --features cubecl-wgpu`)
+before any model load.
