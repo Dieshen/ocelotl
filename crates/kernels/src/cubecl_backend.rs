@@ -1756,7 +1756,7 @@ fn run_attention_decoder_cross_d_wgpu(
             kv_seq,
             n_head,
             head_dim,
-            ScalarArg::new(scale),
+            scale,
         );
     }
 
