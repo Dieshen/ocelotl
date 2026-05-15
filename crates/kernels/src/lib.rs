@@ -43,9 +43,7 @@ pub use cubecl_backend::{
     CUBECL_WGPU_BACKEND, WgpuDeviceBuffer, linear_out_by_in_wgpu, rope_apply_inplace_wgpu,
 };
 #[cfg(feature = "cubecl")]
-pub use cubecl_backend::{
-    CubeClKernelBackend, linear_out_by_in_cubecl, rope_apply_inplace_cubecl,
-};
+pub use cubecl_backend::{CubeClKernelBackend, linear_out_by_in_cubecl, rope_apply_inplace_cubecl};
 pub mod mlp;
 pub mod rmsnorm;
 pub mod tensor;
@@ -315,7 +313,14 @@ pub trait KernelBackend: Debug + Send + Sync {
         let v_host = v.to_host_owned()?;
         let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
         attention_encoder_scalar(
-            &q_host, &k_host, &v_host, seq, n_head, head_dim, scale, &mut out_buf,
+            &q_host,
+            &k_host,
+            &v_host,
+            seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
         );
         output.write_from_host_slice(&out_buf)
     }
@@ -343,6 +348,99 @@ pub trait KernelBackend: Debug + Send + Sync {
             }
         }
         x.write_from_host_slice(&x_host)
+    }
+
+    /// Whisper decoder causal self-attention on device handles (full context).
+    ///
+    /// `q`, `k`, `v`: `[seq, state]` row-major where `state == n_head * head_dim`.
+    /// Row `qi` attends only keys `0..=qi` (causal mask). `output` has the
+    /// same `[seq, state]` shape. `scale` is typically `1 / sqrt(head_dim)`.
+    ///
+    /// This is the full-context path used by `decode_tokens_with_self_attention_cache`.
+    /// The caller extracts K/V from the result to build the host self-attention
+    /// cache; that extraction stays on host because the cache is host-resident.
+    ///
+    /// The default implementation forces host readback and runs
+    /// `attention_decoder_causal_scalar`, so any backend that has not yet
+    /// overridden this method stays correct but pays the round-trip.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_causal_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_causal_shapes(q, k, v, seq, n_head, head_dim, output)?;
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
+        attention_decoder_causal_scalar(
+            &q_host,
+            &k_host,
+            &v_host,
+            seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
+
+    /// Whisper decoder incremental self-attention on device handles (single token).
+    ///
+    /// `q`: `[state]`, `past_k`/`past_v`: `[past_seq, state]`,
+    /// `new_k`/`new_v`: `[state]`. Visible = `past_seq + 1`. `output`: `[state]`.
+    /// `scale` is typically `1 / sqrt(head_dim)`.
+    ///
+    /// This is the append path used by `decode_appended_token`. The KV-cache
+    /// append (`past_k` grow by one row) is performed by the caller on host
+    /// before or after this call; the kernel only reads the past cache.
+    ///
+    /// The default implementation forces host readback and runs
+    /// `attention_decoder_incremental_scalar`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_d(
+        &self,
+        q: &DeviceTensor,
+        past_k: &DeviceTensor,
+        past_v: &DeviceTensor,
+        new_k: &DeviceTensor,
+        new_v: &DeviceTensor,
+        past_seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_incremental_shapes(
+            q, past_k, past_v, new_k, new_v, past_seq, n_head, head_dim, output,
+        )?;
+        let q_host = q.to_host_owned()?;
+        let past_k_host = past_k.to_host_owned()?;
+        let past_v_host = past_v.to_host_owned()?;
+        let new_k_host = new_k.to_host_owned()?;
+        let new_v_host = new_v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; n_head * head_dim];
+        attention_decoder_incremental_scalar(
+            &q_host,
+            &past_k_host,
+            &past_v_host,
+            &new_k_host,
+            &new_v_host,
+            past_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
     }
 }
 
@@ -461,6 +559,117 @@ pub(crate) fn attention_encoder_scalar(
     }
 }
 
+/// Scalar Whisper decoder causal self-attention (full-context).
+///
+/// Q, K, V: `[seq, state]` row-major where `state == n_head * head_dim`.
+/// Row `qi` attends only keys `0..=qi` (causal mask). Writes `[seq, state]`
+/// into `out`. This is the parity oracle for `attention_decoder_causal_d`.
+///
+/// Matches `attention_body_host` with `causal == true` and `q_seq == kv_seq`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decoder_causal_scalar(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), seq * state);
+    debug_assert_eq!(k.len(), seq * state);
+    debug_assert_eq!(v.len(), seq * state);
+    debug_assert_eq!(out.len(), seq * state);
+
+    let mut scores = vec![0.0_f32; seq];
+    for qi in 0..seq {
+        let visible = qi + 1; // causal mask
+        for head in 0..n_head {
+            let q_base = qi * state + head * head_dim;
+            for (ki, score) in scores.iter_mut().enumerate().take(visible) {
+                let k_base = ki * state + head * head_dim;
+                let mut acc = 0.0_f32;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            softmax(&mut scores[..visible]);
+            let out_base = qi * state + head * head_dim;
+            for d in 0..head_dim {
+                out[out_base + d] = 0.0;
+            }
+            for (ki, &p) in scores.iter().enumerate().take(visible) {
+                let v_base = ki * state + head * head_dim;
+                for d in 0..head_dim {
+                    out[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+}
+
+/// Scalar single-token incremental decoder self-attention.
+///
+/// Q: `[state]`, past_k/past_v: `[past_seq, state]`, new_k/new_v: `[state]`.
+/// Visible tokens = `past_seq + 1`. Writes `[state]` into `out`.
+/// Matches `attention_incremental_body_host` from `whisper/primitives.rs`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decoder_incremental_scalar(
+    q: &[f32],
+    past_k: &[f32],
+    past_v: &[f32],
+    new_k: &[f32],
+    new_v: &[f32],
+    past_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let state = n_head * head_dim;
+    let visible = past_seq + 1;
+    debug_assert_eq!(q.len(), state);
+    debug_assert_eq!(past_k.len(), past_seq * state);
+    debug_assert_eq!(past_v.len(), past_seq * state);
+    debug_assert_eq!(new_k.len(), state);
+    debug_assert_eq!(new_v.len(), state);
+    debug_assert_eq!(out.len(), state);
+
+    let mut scores = vec![0.0_f32; visible];
+    for head in 0..n_head {
+        let q_base = head * head_dim;
+        for (ki, score) in scores.iter_mut().enumerate() {
+            let mut acc = 0.0_f32;
+            for d in 0..head_dim {
+                let key = if ki < past_seq {
+                    past_k[ki * state + head * head_dim + d]
+                } else {
+                    new_k[head * head_dim + d]
+                };
+                acc += q[q_base + d] * key;
+            }
+            *score = acc * scale;
+        }
+        softmax(&mut scores);
+        let out_base = head * head_dim;
+        for d in 0..head_dim {
+            let mut acc = 0.0_f32;
+            for (ki, &p) in scores.iter().enumerate() {
+                let value = if ki < past_seq {
+                    past_v[ki * state + head * head_dim + d]
+                } else {
+                    new_v[head * head_dim + d]
+                };
+                acc += p * value;
+            }
+            out[out_base + d] = acc;
+        }
+    }
+}
+
 /// Shape validator for the `attention_encoder_d` device surface. Rejects
 /// zero heads, mismatched `state = n_head * head_dim`, and wrong-sized
 /// operands.
@@ -486,10 +695,109 @@ pub(crate) fn validate_attention_encoder_shapes(
     let expected = seq
         .checked_mul(state)
         .ok_or_else(|| kernel_err("attention_encoder_d seq*state overflowed usize"))?;
-    for (label, len) in [("q", q.len()), ("k", k.len()), ("v", v.len()), ("out", out.len())] {
+    for (label, len) in [
+        ("q", q.len()),
+        ("k", k.len()),
+        ("v", v.len()),
+        ("out", out.len()),
+    ] {
         if len != expected {
             return Err(kernel_err(format!(
                 "attention_encoder_d {label} len {len} != seq*state {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Shape validator for `attention_decoder_causal_d`. Rejects zero heads/dim,
+/// overflow in `state = n_head * head_dim`, and wrong-sized Q/K/V/out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_attention_decoder_causal_shapes(
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    v: &DeviceTensor,
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    out: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(kernel_err("attention_decoder_causal_d n_head must be > 0"));
+    }
+    if head_dim == 0 {
+        return Err(kernel_err(
+            "attention_decoder_causal_d head_dim must be > 0",
+        ));
+    }
+    let state = n_head
+        .checked_mul(head_dim)
+        .ok_or_else(|| kernel_err("attention_decoder_causal_d n_head*head_dim overflowed usize"))?;
+    let expected = seq
+        .checked_mul(state)
+        .ok_or_else(|| kernel_err("attention_decoder_causal_d seq*state overflowed usize"))?;
+    for (label, len) in [
+        ("q", q.len()),
+        ("k", k.len()),
+        ("v", v.len()),
+        ("out", out.len()),
+    ] {
+        if len != expected {
+            return Err(kernel_err(format!(
+                "attention_decoder_causal_d {label} len {len} != seq*state {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Shape validator for `attention_decoder_incremental_d`. Rejects zero
+/// heads/dim, wrong Q/new_k/new_v lengths (must be `state`), and wrong
+/// past_k/past_v lengths (must be `past_seq * state`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_attention_decoder_incremental_shapes(
+    q: &DeviceTensor,
+    past_k: &DeviceTensor,
+    past_v: &DeviceTensor,
+    new_k: &DeviceTensor,
+    new_v: &DeviceTensor,
+    past_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    out: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(kernel_err(
+            "attention_decoder_incremental_d n_head must be > 0",
+        ));
+    }
+    if head_dim == 0 {
+        return Err(kernel_err(
+            "attention_decoder_incremental_d head_dim must be > 0",
+        ));
+    }
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        kernel_err("attention_decoder_incremental_d n_head*head_dim overflowed usize")
+    })?;
+    for (label, len) in [
+        ("q", q.len()),
+        ("new_k", new_k.len()),
+        ("new_v", new_v.len()),
+        ("out", out.len()),
+    ] {
+        if len != state {
+            return Err(kernel_err(format!(
+                "attention_decoder_incremental_d {label} len {len} != state {state}"
+            )));
+        }
+    }
+    let past_expected = past_seq.checked_mul(state).ok_or_else(|| {
+        kernel_err("attention_decoder_incremental_d past_seq*state overflowed usize")
+    })?;
+    for (label, len) in [("past_k", past_k.len()), ("past_v", past_v.len())] {
+        if len != past_expected {
+            return Err(kernel_err(format!(
+                "attention_decoder_incremental_d {label} len {len} != past_seq*state {past_expected}"
             )));
         }
     }
@@ -1093,7 +1401,13 @@ impl KernelBackend for CpuKernelBackend {
                 let b_host = bias.to_host_owned()?;
                 let mut out_buf = vec![0.0_f32; rows * hidden];
                 layer_norm_whisper_scalar(
-                    &x_host, rows, hidden, &w_host, &b_host, eps, &mut out_buf,
+                    &x_host,
+                    rows,
+                    hidden,
+                    &w_host,
+                    &b_host,
+                    eps,
+                    &mut out_buf,
                 );
                 return out.write_from_host_slice(&out_buf);
             }
@@ -1133,15 +1447,20 @@ impl KernelBackend for CpuKernelBackend {
                 let v_host = v.to_host_owned()?;
                 let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
                 attention_encoder_scalar(
-                    &q_host, &k_host, &v_host, seq, n_head, head_dim, scale, &mut out_buf,
+                    &q_host,
+                    &k_host,
+                    &v_host,
+                    seq,
+                    n_head,
+                    head_dim,
+                    scale,
+                    &mut out_buf,
                 );
                 return output.write_from_host_slice(&out_buf);
             }
         };
         let mut out_b = out_b;
-        attention_encoder_scalar(
-            &q_b, &k_b, &v_b, seq, n_head, head_dim, scale, &mut out_b,
-        );
+        attention_encoder_scalar(&q_b, &k_b, &v_b, seq, n_head, head_dim, scale, &mut out_b);
         Ok(())
     }
 
@@ -1480,7 +1799,15 @@ fn linear_out_by_in(
         bias,
         out,
     )?;
-    linear_out_by_in_compute(x, rows, in_features, weight_out_by_in, out_features, bias, out);
+    linear_out_by_in_compute(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    );
     Ok(())
 }
 
@@ -1781,9 +2108,7 @@ fn validate_mode_supported(mode: CpuKernelMode) -> Result<()> {
         CpuKernelMode::Avx2 => {
             #[cfg(target_arch = "x86_64")]
             {
-                if std::is_x86_feature_detected!("avx2")
-                    && std::is_x86_feature_detected!("fma")
-                {
+                if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
                     Ok(())
                 } else {
                     Err(OcelotlError::Kernel(KernelError {
@@ -2429,7 +2754,15 @@ mod tests {
         let mut serial = vec![0.0_f32; rows * out_features];
         let serial_backend = CpuKernelBackend::scalar();
         serial_backend
-            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut serial)
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut serial,
+            )
             .expect("serial linear must succeed");
 
         let mut threaded = vec![0.0_f32; rows * out_features];
@@ -2479,7 +2812,15 @@ mod tests {
 
         let mut scalar = vec![0.0_f32; rows * out_features];
         CpuKernelBackend::scalar()
-            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut scalar)
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut scalar,
+            )
             .expect("scalar must succeed");
 
         let mut avx2 = vec![0.0_f32; rows * out_features];
@@ -2498,11 +2839,7 @@ mod tests {
         // `matches_expected` field.
         for (idx, (a, s)) in avx2.iter().zip(scalar.iter()).enumerate() {
             let abs = (a - s).abs();
-            let rel = if s.abs() > 1e-6 {
-                abs / s.abs()
-            } else {
-                abs
-            };
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
             assert!(
                 abs <= 1e-4 || rel <= 1e-4,
                 "AVX2 output drifted at idx {idx}: scalar={s} avx2={a} abs={abs} rel={rel}"
@@ -2556,7 +2893,9 @@ mod tests {
         let rows = 3usize;
         let in_features = 5;
         let out_features = 4;
-        let x: Vec<f32> = (0..(rows * in_features)).map(|i| (i as f32) * 0.1).collect();
+        let x: Vec<f32> = (0..(rows * in_features))
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let w: Vec<f32> = (0..(out_features * in_features))
             .map(|i| (i as f32) * -0.07)
             .collect();
@@ -2801,7 +3140,9 @@ mod tests {
         let num_q_heads = 2usize;
         let num_kv_heads = 1usize;
         let head_dim = 2usize;
-        let q = [1.0_f32, 0.0, 0.0, 1.0, 0.5, 0.5, 0.25, 0.75, -1.0, 1.0, 0.3, 0.7];
+        let q = [
+            1.0_f32, 0.0, 0.0, 1.0, 0.5, 0.5, 0.25, 0.75, -1.0, 1.0, 0.3, 0.7,
+        ];
         let k = [1.0_f32, 0.0, 0.5, 0.5, -1.0, 1.0];
         let v = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
 
@@ -2956,7 +3297,9 @@ mod tests {
         let backend = CpuKernelBackend::scalar();
         let lhs_h = DeviceTensor::from_host(vec![1.0_f32, 2.0, 3.0]);
         let rhs_h = DeviceTensor::from_host(vec![1.0_f32, 2.0]);
-        let err = backend.add_inplace_d(&lhs_h, &rhs_h).expect_err("must reject");
+        let err = backend
+            .add_inplace_d(&lhs_h, &rhs_h)
+            .expect_err("must reject");
         assert!(matches!(err, OcelotlError::Kernel(_)));
     }
 
@@ -3089,14 +3432,18 @@ mod tests {
         let state = n_head * head_dim;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
-        let q: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.013).sin()).collect();
-        let k: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.019).cos()).collect();
-        let v: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.023).sin()).collect();
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
 
         let mut scalar_out = vec![0.0_f32; seq * state];
-        attention_encoder_scalar(
-            &q, &k, &v, seq, n_head, head_dim, scale, &mut scalar_out,
-        );
+        attention_encoder_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut scalar_out);
 
         let backend = CpuKernelBackend::scalar();
         let q_d = backend.upload(&q).expect("upload q");
@@ -3108,8 +3455,166 @@ mod tests {
             .expect("CPU attention_encoder_d must succeed");
         let got = out_d.to_host_owned().expect("readback");
 
-        assert_eq!(got, scalar_out, "CPU override must match scalar bit-for-bit");
+        assert_eq!(
+            got, scalar_out,
+            "CPU override must match scalar bit-for-bit"
+        );
     }
+
+    // -----------------------------------------------------------------------
+    // GW.4-5B CPU parity gates
+    // -----------------------------------------------------------------------
+
+    /// GW.4-5B: `attention_decoder_causal_d` on the CPU backend must match
+    /// `attention_decoder_causal_scalar` bit-for-bit. Both take the same
+    /// path so no tolerance window is needed.
+    #[test]
+    fn cpu_attention_decoder_causal_d_matches_scalar_bit_for_bit() {
+        let seq = 5usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.031).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; seq * state];
+        attention_decoder_causal_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut expected);
+
+        let backend = CpuKernelBackend::scalar();
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_decoder_causal_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("CPU attention_decoder_causal_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+        assert_eq!(
+            got, expected,
+            "CPU causal decoder attention must be bit-identical to scalar"
+        );
+    }
+
+    /// GW.4-5B: `attention_decoder_incremental_d` on the CPU backend must
+    /// match `attention_decoder_incremental_scalar` bit-for-bit.
+    #[test]
+    fn cpu_attention_decoder_incremental_d_matches_scalar_bit_for_bit() {
+        let past_seq = 3usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let past_k: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let past_v: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.019).sin())
+            .collect();
+        let new_k: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.027).cos()).collect();
+        let new_v: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.033).sin()).collect();
+
+        let mut expected = vec![0.0_f32; state];
+        attention_decoder_incremental_scalar(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CpuKernelBackend::scalar();
+        let q_d = backend.upload(&q).expect("upload q");
+        let past_k_d = backend.upload(&past_k).expect("upload past_k");
+        let past_v_d = backend.upload(&past_v).expect("upload past_v");
+        let new_k_d = backend.upload(&new_k).expect("upload new_k");
+        let new_v_d = backend.upload(&new_v).expect("upload new_v");
+        let out_d = backend.alloc(state).expect("alloc out");
+        backend
+            .attention_decoder_incremental_d(
+                &q_d, &past_k_d, &past_v_d, &new_k_d, &new_v_d, past_seq, n_head, head_dim, scale,
+                &out_d,
+            )
+            .expect("CPU attention_decoder_incremental_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+        assert_eq!(
+            got, expected,
+            "CPU incremental decoder attention must be bit-identical to scalar"
+        );
+    }
+
+    /// GW.4-5B: `attention_decoder_causal_d` rejects wrong buffer lengths.
+    #[test]
+    fn validate_attention_decoder_causal_shapes_rejects_wrong_length() {
+        let backend = CpuKernelBackend::scalar();
+        // seq=3, n_head=2, head_dim=2 → expected len = 12. Give len=8 buffers.
+        let q = backend.upload(&[0.0_f32; 8]).unwrap();
+        let k = backend.upload(&[0.0_f32; 8]).unwrap();
+        let v = backend.upload(&[0.0_f32; 8]).unwrap();
+        let out = backend.alloc(8).unwrap();
+        let err = backend
+            .attention_decoder_causal_d(&q, &k, &v, 3, 2, 2, 0.5, &out)
+            .expect_err("length mismatch must be rejected");
+        match err {
+            OcelotlError::Kernel(KernelError { message, .. }) => {
+                assert!(
+                    message.contains("attention_decoder_causal_d"),
+                    "expected diagnostic, got {message}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    /// GW.4-5B: `attention_decoder_incremental_d` rejects wrong past_k length.
+    #[test]
+    fn validate_attention_decoder_incremental_shapes_rejects_wrong_past_length() {
+        let backend = CpuKernelBackend::scalar();
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let past_seq = 3usize;
+        let q = backend.upload(&vec![0.0_f32; state]).unwrap();
+        // Wrong: past_k is too short (2*state instead of 3*state).
+        let past_k = backend.upload(&vec![0.0_f32; 2 * state]).unwrap();
+        let past_v = backend.upload(&vec![0.0_f32; past_seq * state]).unwrap();
+        let new_k = backend.upload(&vec![0.0_f32; state]).unwrap();
+        let new_v = backend.upload(&vec![0.0_f32; state]).unwrap();
+        let out = backend.alloc(state).unwrap();
+        let err = backend
+            .attention_decoder_incremental_d(
+                &q, &past_k, &past_v, &new_k, &new_v, past_seq, n_head, head_dim, 0.5, &out,
+            )
+            .expect_err("length mismatch must be rejected");
+        match err {
+            OcelotlError::Kernel(KernelError { message, .. }) => {
+                assert!(
+                    message.contains("attention_decoder_incremental_d"),
+                    "expected diagnostic, got {message}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // End GW.4-5B CPU tests
+    // -----------------------------------------------------------------------
 
     /// Parity gate proving the scalar reference matches the
     /// `attention_body_host`-style host attention on the same inputs. The
