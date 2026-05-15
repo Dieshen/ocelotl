@@ -260,6 +260,12 @@ impl CpuKernelBackend {
         b_shape: (usize, usize),
         out: &mut [f32],
     ) -> Result<()> {
+        let m = a_shape.0;
+        if let Some(pool) = &self.pool {
+            if m >= PARALLEL_MATMUL_MIN_ROWS {
+                return matmul_parallel(pool, self.mode, a, a_shape, b, b_shape, out);
+            }
+        }
         match self.mode {
             CpuKernelMode::Scalar => matmul(a, a_shape, b, b_shape, out),
             CpuKernelMode::Optimized => matmul_optimized(a, a_shape, b, b_shape, out),
@@ -340,6 +346,22 @@ impl CpuKernelBackend {
         head_dim: usize,
         out: &mut [f32],
     ) -> Result<()> {
+        if let Some(pool) = &self.pool {
+            if seq_len >= PARALLEL_SDPA_MIN_SEQ {
+                return attention::scaled_dot_product_attention_parallel(
+                    pool,
+                    self.mode,
+                    q,
+                    k,
+                    v,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    out,
+                );
+            }
+        }
         match self.mode {
             CpuKernelMode::Scalar => attention::scaled_dot_product_attention(
                 q,
@@ -685,7 +707,15 @@ pub fn matmul(
     out: &mut [f32],
 ) -> Result<()> {
     let (m, k, n) = validate_matmul(a, a_shape, b, b_shape, out)?;
+    matmul_compute(a, m, k, b, n, out);
+    Ok(())
+}
 
+/// Scalar matmul body. Inputs are assumed pre-validated. Splits cleanly over
+/// disjoint output-row chunks (M-axis), so the parallel dispatcher can call
+/// this per chunk with its slice of `a` and `out` and the K-loop accumulation
+/// order stays identical to the serial path (parity oracle for threaded runs).
+fn matmul_compute(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
     for i in 0..m {
         for j in 0..n {
             let mut acc = 0.0_f32;
@@ -695,7 +725,6 @@ pub fn matmul(
             out[i * n + j] = acc;
         }
     }
-    Ok(())
 }
 
 fn matmul_optimized(
@@ -706,7 +735,13 @@ fn matmul_optimized(
     out: &mut [f32],
 ) -> Result<()> {
     let (m, k, n) = validate_matmul(a, a_shape, b, b_shape, out)?;
+    matmul_optimized_compute(a, m, k, b, n, out);
+    Ok(())
+}
 
+/// Cache-friendlier matmul body (K outer, N inner, no transpose). Inputs are
+/// assumed pre-validated. Same chunkability story as `matmul_compute`.
+fn matmul_optimized_compute(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
     out.fill(0.0);
     for i in 0..m {
         let out_row = &mut out[i * n..(i + 1) * n];
@@ -718,7 +753,6 @@ fn matmul_optimized(
             }
         }
     }
-    Ok(())
 }
 
 fn validate_matmul(
@@ -1063,6 +1097,16 @@ fn linear_out_by_in_optimized_compute(
 /// serial regardless of pool configuration.
 const PARALLEL_LINEAR_MIN_ROWS: usize = 32;
 
+/// Same rationale as `PARALLEL_LINEAR_MIN_ROWS` but for the generic `matmul`
+/// kernel. Qwen prefill uses M = seq_len which can run into the hundreds for
+/// realistic prompts; decode is M = 1 and stays serial.
+const PARALLEL_MATMUL_MIN_ROWS: usize = 32;
+
+/// Below this query count, single-threaded SDPA beats the rayon dispatch
+/// overhead. Mirrors the Whisper attention threshold; chosen so that single-
+/// token decode (seq_len = 1) stays serial.
+const PARALLEL_SDPA_MIN_SEQ: usize = 32;
+
 /// Validate that the host CPU supports the requested mode. AVX2 needs both
 /// the `avx2` and `fma` x86_64 features at runtime; the scalar/optimized
 /// modes have no host requirements.
@@ -1193,6 +1237,55 @@ fn linear_out_by_in_parallel(
                         // to avoid pulling in a no-op fallback.
                         #[cfg(not(target_arch = "x86_64"))]
                         unreachable!("Avx2 mode rejected at construction on non-x86_64");
+                    }
+                }
+            });
+    });
+
+    Ok(())
+}
+
+/// Parallel dispatcher for `matmul`. Partitions the M (output-row) axis across
+/// the rayon pool. Each chunk reads disjoint rows of `a` and writes disjoint
+/// rows of `out`; `b` is shared read-only. The accumulation order within each
+/// (i, j) cell is identical to the serial path, so the result is bit-identical
+/// to running serially.
+fn matmul_parallel(
+    pool: &rayon::ThreadPool,
+    mode: CpuKernelMode,
+    a: &[f32],
+    a_shape: (usize, usize),
+    b: &[f32],
+    b_shape: (usize, usize),
+    out: &mut [f32],
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    let (m, k, n) = validate_matmul(a, a_shape, b, b_shape, out)?;
+
+    let threads = pool.current_num_threads().max(1);
+    let rows_per_chunk = m.div_ceil(threads).max(1);
+    let chunk_out_len = rows_per_chunk * n;
+
+    pool.install(|| {
+        out.par_chunks_mut(chunk_out_len)
+            .enumerate()
+            .for_each(|(idx, out_chunk)| {
+                let row_start = idx * rows_per_chunk;
+                let chunk_rows = out_chunk.len() / n;
+                let a_start = row_start * k;
+                let a_chunk = &a[a_start..a_start + chunk_rows * k];
+                debug_assert_eq!(out_chunk.len(), chunk_rows * n);
+                match mode {
+                    CpuKernelMode::Scalar => {
+                        matmul_compute(a_chunk, chunk_rows, k, b, n, out_chunk);
+                    }
+                    // matmul Avx2 today falls back to optimized scalar (the
+                    // AVX2 microkernel only covers `linear_out_by_in`'s
+                    // [out, in] layout). Both modes therefore share the same
+                    // optimized compute body.
+                    CpuKernelMode::Optimized | CpuKernelMode::Avx2 => {
+                        matmul_optimized_compute(a_chunk, chunk_rows, k, b, n, out_chunk);
                     }
                 }
             });
@@ -1848,5 +1941,234 @@ mod tests {
                 "optimized attention drifted: got {got}, want {want}"
             );
         }
+    }
+
+    // --- parallel matmul parity ---
+
+    #[test]
+    fn threaded_matmul_scalar_matches_serial_bit_for_bit() {
+        // Disjoint output-row chunks + identical accumulation order =
+        // bit-identical to the serial scalar path.
+        let m = 64usize;
+        let k = 19usize;
+        let n = 17usize;
+        let a: Vec<f32> = (0..(m * k)).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let b: Vec<f32> = (0..(k * n)).map(|i| ((i as f32) * 0.019).cos()).collect();
+
+        let mut serial = vec![0.0_f32; m * n];
+        CpuKernelBackend::scalar()
+            .matmul(&a, (m, k), &b, (k, n), &mut serial)
+            .expect("serial scalar matmul must succeed");
+
+        let mut threaded = vec![0.0_f32; m * n];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .expect("4-thread scalar backend must build")
+            .matmul(&a, (m, k), &b, (k, n), &mut threaded)
+            .expect("threaded matmul must succeed");
+
+        assert_eq!(
+            serial, threaded,
+            "threaded matmul must be bit-identical to serial scalar"
+        );
+    }
+
+    #[test]
+    fn threaded_matmul_optimized_matches_serial_bit_for_bit() {
+        let m = 96usize;
+        let k = 33usize;
+        let n = 25usize;
+        let a: Vec<f32> = (0..(m * k)).map(|i| ((i as f32) * 0.011).sin()).collect();
+        let b: Vec<f32> = (0..(k * n)).map(|i| ((i as f32) * 0.017).cos()).collect();
+
+        let mut serial = vec![0.0_f32; m * n];
+        CpuKernelBackend::optimized()
+            .matmul(&a, (m, k), &b, (k, n), &mut serial)
+            .expect("serial optimized matmul must succeed");
+
+        let mut threaded = vec![0.0_f32; m * n];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Optimized, 4)
+            .expect("4-thread optimized backend must build")
+            .matmul(&a, (m, k), &b, (k, n), &mut threaded)
+            .expect("threaded matmul must succeed");
+
+        assert_eq!(
+            serial, threaded,
+            "threaded optimized matmul must be bit-identical to serial optimized"
+        );
+    }
+
+    #[test]
+    fn threaded_matmul_falls_back_to_serial_for_small_inputs() {
+        // M below PARALLEL_MATMUL_MIN_ROWS must still produce the serial
+        // result. We can't observe the dispatch path directly, but a small
+        // shape must round-trip identically.
+        let m = 5usize;
+        let k = 7usize;
+        let n = 3usize;
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.1).collect();
+        let b: Vec<f32> = (0..(k * n)).map(|i| (i as f32) * -0.07).collect();
+
+        let mut serial = vec![0.0_f32; m * n];
+        CpuKernelBackend::scalar()
+            .matmul(&a, (m, k), &b, (k, n), &mut serial)
+            .unwrap();
+
+        let mut threaded = vec![0.0_f32; m * n];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .unwrap()
+            .matmul(&a, (m, k), &b, (k, n), &mut threaded)
+            .unwrap();
+
+        assert_eq!(serial, threaded);
+    }
+
+    // --- parallel SDPA parity ---
+
+    #[test]
+    fn threaded_sdpa_scalar_matches_serial_bit_for_bit() {
+        // Per-chunk scratch + per-query-position output cells = identical
+        // accumulation order to the serial path. Use a seq_len above
+        // PARALLEL_SDPA_MIN_SEQ so the pool actually dispatches.
+        let seq_len = 48usize;
+        let num_q_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 6usize;
+        let q: Vec<f32> = (0..(seq_len * num_q_heads * head_dim))
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..(seq_len * num_kv_heads * head_dim))
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..(seq_len * num_kv_heads * head_dim))
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut serial = vec![0.0_f32; seq_len * num_q_heads * head_dim];
+        CpuKernelBackend::scalar()
+            .scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &mut serial,
+            )
+            .expect("serial SDPA must succeed");
+
+        let mut threaded = vec![0.0_f32; seq_len * num_q_heads * head_dim];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .expect("4-thread scalar backend must build")
+            .scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &mut threaded,
+            )
+            .expect("threaded SDPA must succeed");
+
+        assert_eq!(
+            serial, threaded,
+            "threaded scalar SDPA must be bit-identical to serial scalar SDPA"
+        );
+    }
+
+    #[test]
+    fn threaded_sdpa_optimized_matches_serial_bit_for_bit() {
+        let seq_len = 64usize;
+        let num_q_heads = 6usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let q: Vec<f32> = (0..(seq_len * num_q_heads * head_dim))
+            .map(|i| ((i as f32) * 0.011).sin())
+            .collect();
+        let k: Vec<f32> = (0..(seq_len * num_kv_heads * head_dim))
+            .map(|i| ((i as f32) * 0.017).cos())
+            .collect();
+        let v: Vec<f32> = (0..(seq_len * num_kv_heads * head_dim))
+            .map(|i| ((i as f32) * 0.021).sin())
+            .collect();
+
+        let mut serial = vec![0.0_f32; seq_len * num_q_heads * head_dim];
+        CpuKernelBackend::optimized()
+            .scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &mut serial,
+            )
+            .expect("serial optimized SDPA must succeed");
+
+        let mut threaded = vec![0.0_f32; seq_len * num_q_heads * head_dim];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Optimized, 4)
+            .expect("4-thread optimized backend must build")
+            .scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &mut threaded,
+            )
+            .expect("threaded SDPA must succeed");
+
+        assert_eq!(
+            serial, threaded,
+            "threaded optimized SDPA must be bit-identical to serial optimized SDPA"
+        );
+    }
+
+    #[test]
+    fn threaded_sdpa_falls_back_to_serial_for_small_seq() {
+        // seq_len below PARALLEL_SDPA_MIN_SEQ stays on the serial path.
+        let seq_len = 3usize;
+        let num_q_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 2usize;
+        let q = [1.0_f32, 0.0, 0.0, 1.0, 0.5, 0.5, 0.25, 0.75, -1.0, 1.0, 0.3, 0.7];
+        let k = [1.0_f32, 0.0, 0.5, 0.5, -1.0, 1.0];
+        let v = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        let mut serial = vec![0.0_f32; seq_len * num_q_heads * head_dim];
+        CpuKernelBackend::scalar()
+            .scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &mut serial,
+            )
+            .unwrap();
+
+        let mut threaded = vec![0.0_f32; seq_len * num_q_heads * head_dim];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .unwrap()
+            .scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &mut threaded,
+            )
+            .unwrap();
+
+        assert_eq!(serial, threaded);
     }
 }

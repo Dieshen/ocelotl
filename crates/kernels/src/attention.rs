@@ -114,49 +114,21 @@ pub fn scaled_dot_product_attention(
         out,
     )?;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
-
-    // Per-(query position i, query head h) softmax buffer. We allocate it
-    // once and reuse across iterations; the masked tail beyond i+1 is not
-    // touched by either the score loop or the output accumulation loop.
     let mut scores = vec![0.0_f32; seq_len];
-
-    for i in 0..seq_len {
-        for h in 0..num_q_heads {
-            let kh = h / group_size;
-
-            // 1) Compute scaled dot products for j in 0..=i; j>i stays
-            //    untouched and is never read (we only softmax/accumulate
-            //    over the unmasked prefix). Setting -inf is unnecessary
-            //    when we slice the prefix; numerically equivalent.
-            let q_base = (i * num_q_heads + h) * head_dim;
-            for (j, score) in scores.iter_mut().enumerate().take(i + 1) {
-                let mut acc = 0.0_f32;
-                let k_base = (j * num_kv_heads + kh) * head_dim;
-                for d in 0..head_dim {
-                    acc += q[q_base + d] * k[k_base + d];
-                }
-                *score = acc * scale;
-            }
-
-            // 2) Softmax over the unmasked prefix [0..=i]. Reuse the
-            //    in-place softmax kernel from M1.7.
-            softmax(&mut scores[..=i]);
-
-            // 3) Accumulate weighted V into out. Zero the output row
-            //    first because we accumulate.
-            let out_base = (i * num_q_heads + h) * head_dim;
-            for d in 0..head_dim {
-                out[out_base + d] = 0.0_f32;
-            }
-            for (j, &p) in scores.iter().enumerate().take(i + 1) {
-                let v_base = (j * num_kv_heads + kh) * head_dim;
-                for d in 0..head_dim {
-                    out[out_base + d] += p * v[v_base + d];
-                }
-            }
-        }
-    }
-
+    scaled_dot_product_attention_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        scale,
+        &mut scores,
+        out,
+    );
     Ok(())
 }
 
@@ -183,8 +155,95 @@ pub(crate) fn scaled_dot_product_attention_optimized(
     )?;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let mut scores = vec![0.0_f32; seq_len];
+    scaled_dot_product_attention_optimized_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        scale,
+        &mut scores,
+        out,
+    );
+    Ok(())
+}
 
-    for i in 0..seq_len {
+/// Scalar SDPA compute body. Inputs are assumed pre-validated. Writes the
+/// output rows for query positions `i_start..i_end` into `out_chunk`, which
+/// must be exactly `(i_end - i_start) * num_q_heads * head_dim` long. Reads
+/// the full `q/k/v` buffers; KV positions `0..=i` are needed for each query
+/// position `i` regardless of chunking. `scores` is a caller-owned scratch
+/// buffer of length `>= seq_len` (or `>= i_end` is sufficient — we only touch
+/// the unmasked prefix per row).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_compute(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    i_start: usize,
+    i_end: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    group_size: usize,
+    scale: f32,
+    scores: &mut [f32],
+    out_chunk: &mut [f32],
+) {
+    for i in i_start..i_end {
+        let out_row_base = (i - i_start) * num_q_heads * head_dim;
+        for h in 0..num_q_heads {
+            let kh = h / group_size;
+
+            let q_base = (i * num_q_heads + h) * head_dim;
+            for (j, score) in scores.iter_mut().enumerate().take(i + 1) {
+                let mut acc = 0.0_f32;
+                let k_base = (j * num_kv_heads + kh) * head_dim;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+
+            softmax(&mut scores[..=i]);
+
+            let out_base = out_row_base + h * head_dim;
+            for d in 0..head_dim {
+                out_chunk[out_base + d] = 0.0_f32;
+            }
+            for (j, &p) in scores.iter().enumerate().take(i + 1) {
+                let v_base = (j * num_kv_heads + kh) * head_dim;
+                for d in 0..head_dim {
+                    out_chunk[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+}
+
+/// Optimized SDPA compute body (rows borrowed into `&[f32]` once per head;
+/// otherwise identical accumulation order to the scalar path).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_optimized_compute(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    i_start: usize,
+    i_end: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    group_size: usize,
+    scale: f32,
+    scores: &mut [f32],
+    out_chunk: &mut [f32],
+) {
+    for i in i_start..i_end {
+        let out_row_base = (i - i_start) * num_q_heads * head_dim;
         for h in 0..num_q_heads {
             let kh = h / group_size;
             let q_base = (i * num_q_heads + h) * head_dim;
@@ -202,8 +261,8 @@ pub(crate) fn scaled_dot_product_attention_optimized(
 
             softmax(&mut scores[..=i]);
 
-            let out_base = (i * num_q_heads + h) * head_dim;
-            let out_row = &mut out[out_base..out_base + head_dim];
+            let out_base = out_row_base + h * head_dim;
+            let out_row = &mut out_chunk[out_base..out_base + head_dim];
             out_row.fill(0.0);
             for (j, &p) in scores.iter().enumerate().take(i + 1) {
                 let v_base = (j * num_kv_heads + kh) * head_dim;
@@ -214,6 +273,92 @@ pub(crate) fn scaled_dot_product_attention_optimized(
             }
         }
     }
+}
+
+/// Parallel dispatcher for SDPA. Partitions the query-position axis `i` across
+/// the rayon pool. Each chunk computes its query rows independently — KV is
+/// read-only and per-chunk scratch is private — so the accumulation order at
+/// every cell is identical to the serial path. Bit-identical when mode and
+/// chunking match the serial dispatch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_parallel(
+    pool: &rayon::ThreadPool,
+    mode: crate::CpuKernelMode,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    let group_size = validate_scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        out,
+    )?;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let threads = pool.current_num_threads().max(1);
+    let rows_per_chunk = seq_len.div_ceil(threads).max(1);
+    let chunk_out_len = rows_per_chunk * num_q_heads * head_dim;
+
+    pool.install(|| {
+        out.par_chunks_mut(chunk_out_len)
+            .enumerate()
+            .for_each(|(idx, out_chunk)| {
+                let i_start = idx * rows_per_chunk;
+                let chunk_rows = out_chunk.len() / (num_q_heads * head_dim);
+                let i_end = i_start + chunk_rows;
+                // Per-chunk scratch — keeps cross-thread accumulation isolated
+                // and matches the serial path's "single reusable buffer".
+                let mut scores = vec![0.0_f32; seq_len];
+                match mode {
+                    crate::CpuKernelMode::Scalar => {
+                        scaled_dot_product_attention_compute(
+                            q,
+                            k,
+                            v,
+                            i_start,
+                            i_end,
+                            num_q_heads,
+                            num_kv_heads,
+                            head_dim,
+                            group_size,
+                            scale,
+                            &mut scores,
+                            out_chunk,
+                        );
+                    }
+                    // Optimized + Avx2 share the same compute body (see
+                    // CpuKernelBackend::scaled_dot_product_attention).
+                    crate::CpuKernelMode::Optimized | crate::CpuKernelMode::Avx2 => {
+                        scaled_dot_product_attention_optimized_compute(
+                            q,
+                            k,
+                            v,
+                            i_start,
+                            i_end,
+                            num_q_heads,
+                            num_kv_heads,
+                            head_dim,
+                            group_size,
+                            scale,
+                            &mut scores,
+                            out_chunk,
+                        );
+                    }
+                }
+            });
+    });
 
     Ok(())
 }
