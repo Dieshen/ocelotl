@@ -129,6 +129,18 @@ fn encode_audio(model: &WhisperModel, log_mel: &[f32], mel_frames: usize) -> Res
     )?;
 
     let mut x = conv2;
+    // Per-layer MLP scratch and output buffers, allocated once and reused
+    // across all encoder layers. At tiny (seq=1500, audio_ffn_size=1536,
+    // audio_state_size=384, f32) the hidden_act buffer is ~9.2 MB and the
+    // out buffer is ~2.3 MB, so one encode pass over the 4-layer stack
+    // previously allocated ~46 MB across the per-layer mlp_gelu calls; now
+    // it allocates ~11.5 MB once. Buffers are sized to the post-conv
+    // `seq`, not the padded `audio_context_length`, because the MLP only
+    // ever sees `seq` rows.
+    let mlp_hidden_act_buf_len = seq * config.audio_ffn_size;
+    let mlp_out_buf_len = seq * config.audio_state_size;
+    let mut mlp_hidden_act_buf = vec![0.0_f32; mlp_hidden_act_buf_len];
+    let mut mlp_out_buf = vec![0.0_f32; mlp_out_buf_len];
     for layer in 0..config.audio_layers {
         let prefix = format!("encoder.blocks.{layer}");
         let attn_ln = layer_norm(
@@ -165,7 +177,7 @@ fn encode_audio(model: &WhisperModel, log_mel: &[f32], mel_frames: usize) -> Res
             model.weights.get(&format!("{prefix}.mlp_ln.bias")),
             LAYER_NORM_EPS,
         )?;
-        let mlp = mlp_gelu(
+        mlp_gelu(
             model.kernels.as_ref(),
             &mlp_ln,
             seq,
@@ -175,8 +187,10 @@ fn encode_audio(model: &WhisperModel, log_mel: &[f32], mel_frames: usize) -> Res
             model.weights.get(&format!("{prefix}.mlp.0.bias")),
             model.weights.get(&format!("{prefix}.mlp.2.weight")),
             model.weights.get(&format!("{prefix}.mlp.2.bias")),
+            &mut mlp_hidden_act_buf,
+            &mut mlp_out_buf,
         )?;
-        add_inplace(&mut x, &mlp);
+        add_inplace(&mut x, &mlp_out_buf);
     }
 
     layer_norm(

@@ -109,6 +109,16 @@ fn decode_tokens_with_self_attention_cache(
         }
     }
 
+    // Per-layer MLP scratch and output buffers, allocated once and reused
+    // across all decoder layers. Same pattern as the encoder: keeps the
+    // allocator quiet across the layer loop and prepares the call site for
+    // the device-resident `linear_d` migration. Sized to the prompt's
+    // `seq` because the prefill path runs full-context over all tokens.
+    let mlp_hidden_act_buf_len = seq * model.config.text_ffn_size;
+    let mlp_out_buf_len = seq * text_state;
+    let mut mlp_hidden_act_buf = vec![0.0_f32; mlp_hidden_act_buf_len];
+    let mut mlp_out_buf = vec![0.0_f32; mlp_out_buf_len];
+
     for layer in 0..model.config.text_layers {
         let prefix = format!("decoder.blocks.{layer}");
         let attn_ln = layer_norm(
@@ -202,7 +212,7 @@ fn decode_tokens_with_self_attention_cache(
             model.weights.get(&format!("{prefix}.mlp_ln.bias")),
             LAYER_NORM_EPS,
         )?;
-        let mlp = mlp_gelu(
+        mlp_gelu(
             model.kernels.as_ref(),
             &mlp_ln,
             seq,
@@ -212,8 +222,10 @@ fn decode_tokens_with_self_attention_cache(
             model.weights.get(&format!("{prefix}.mlp.0.bias")),
             model.weights.get(&format!("{prefix}.mlp.2.weight")),
             model.weights.get(&format!("{prefix}.mlp.2.bias")),
+            &mut mlp_hidden_act_buf,
+            &mut mlp_out_buf,
         )?;
-        add_inplace(&mut x, &mlp);
+        add_inplace(&mut x, &mlp_out_buf);
     }
 
     let decoded = layer_norm(
@@ -245,6 +257,14 @@ fn decode_appended_token(
     }
 
     let mut next_self_attention = Vec::with_capacity(model.config.text_layers);
+    // Per-layer MLP scratch and output buffers, allocated once and reused.
+    // Single-token path: seq=1, so these are small (e.g. 1×1536 + 1×384 at
+    // tiny ~= 7.5 KB) but reusing them still avoids 2 allocations per layer
+    // per token. Over an 80-token decode at tiny that's 80×4×2 = 640 saved
+    // allocations.
+    let mut mlp_hidden_act_buf = vec![0.0_f32; model.config.text_ffn_size];
+    let mut mlp_out_buf = vec![0.0_f32; text_state];
+
     for layer in 0..model.config.text_layers {
         let prefix = format!("decoder.blocks.{layer}");
         let attn_ln = layer_norm(
@@ -339,7 +359,7 @@ fn decode_appended_token(
             model.weights.get(&format!("{prefix}.mlp_ln.bias")),
             LAYER_NORM_EPS,
         )?;
-        let mlp = mlp_gelu(
+        mlp_gelu(
             model.kernels.as_ref(),
             &mlp_ln,
             1,
@@ -349,8 +369,10 @@ fn decode_appended_token(
             model.weights.get(&format!("{prefix}.mlp.0.bias")),
             model.weights.get(&format!("{prefix}.mlp.2.weight")),
             model.weights.get(&format!("{prefix}.mlp.2.bias")),
+            &mut mlp_hidden_act_buf,
+            &mut mlp_out_buf,
         )?;
-        add_inplace(&mut x, &mlp);
+        add_inplace(&mut x, &mlp_out_buf);
     }
 
     let decoded = layer_norm(

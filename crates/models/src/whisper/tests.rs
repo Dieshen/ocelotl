@@ -45,7 +45,9 @@ fn gelu_mlp_projection_path_matches_hand_checked_fixture() {
     let fc2_b = [0.0_f32, 0.0];
     let kernels = default_kernel_backend();
 
-    let out = mlp_gelu(
+    let mut hidden_act_buf = [0.0_f32; 2];
+    let mut out = [0.0_f32; 2];
+    mlp_gelu(
         kernels.as_ref(),
         &x,
         1,
@@ -55,6 +57,8 @@ fn gelu_mlp_projection_path_matches_hand_checked_fixture() {
         &fc1_b,
         &fc2_w,
         &fc2_b,
+        &mut hidden_act_buf,
+        &mut out,
     )
     .expect("mlp");
 

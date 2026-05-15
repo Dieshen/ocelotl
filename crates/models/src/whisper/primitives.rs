@@ -147,6 +147,16 @@ pub(super) fn layer_norm(
     Ok(out)
 }
 
+/// Caller-supplied scratch + output variant of the Whisper GELU MLP.
+///
+/// `hidden_act_buf` is the `rows * ffn` intermediate (post-fc1, post-GELU).
+/// `out` is the `rows * hidden` projection back to model width.
+/// Both are passed in so the encoder and decoder forward paths allocate them
+/// once outside their per-layer loops and reuse across all layers, which
+/// dominates allocator pressure on the encoder pass at tiny (4 layers, 1500
+/// rows, 1536 ffn = ~37 MB per layer in the old vec-returning version).
+/// This matches the kernel-crate `mlp_gated_silu` convention and prepares
+/// the call sites for the upcoming `linear_d` device-resident migration.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mlp_gelu(
     kernels: &dyn KernelBackend,
@@ -158,10 +168,110 @@ pub(super) fn mlp_gelu(
     fc1_b: &[f32],
     fc2_w: &[f32],
     fc2_b: &[f32],
-) -> Result<Vec<f32>> {
-    let mut hidden_act = linear(kernels, x, rows, hidden, fc1_w, ffn, Some(fc1_b))?;
-    gelu_inplace(&mut hidden_act);
-    linear(kernels, &hidden_act, rows, ffn, fc2_w, hidden, Some(fc2_b))
+    hidden_act_buf: &mut [f32],
+    out: &mut [f32],
+) -> Result<()> {
+    let hidden_act_expected = checked_len_product("mlp_gelu.hidden_act", &[rows, ffn])?;
+    if hidden_act_buf.len() != hidden_act_expected {
+        return Err(invalid_request(
+            "mlp_gelu.hidden_act",
+            &format!(
+                "expected hidden_act buffer length {hidden_act_expected}, got {}",
+                hidden_act_buf.len()
+            ),
+        ));
+    }
+    let out_expected = checked_len_product("mlp_gelu.out", &[rows, hidden])?;
+    if out.len() != out_expected {
+        return Err(invalid_request(
+            "mlp_gelu.out",
+            &format!(
+                "expected out buffer length {out_expected}, got {}",
+                out.len()
+            ),
+        ));
+    }
+
+    linear_into(
+        kernels,
+        x,
+        rows,
+        hidden,
+        fc1_w,
+        ffn,
+        Some(fc1_b),
+        hidden_act_buf,
+    )?;
+    gelu_inplace(hidden_act_buf);
+    linear_into(
+        kernels,
+        hidden_act_buf,
+        rows,
+        ffn,
+        fc2_w,
+        hidden,
+        Some(fc2_b),
+        out,
+    )
+}
+
+/// Caller-supplied output variant of `linear`. Same validation contract,
+/// no internal allocation. Used by `mlp_gelu` to write into pre-allocated
+/// scratch and output buffers, and available for future call sites that
+/// want to skip the `Vec` round-trip.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn linear_into(
+    kernels: &dyn KernelBackend,
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    let x_expected = checked_len_product("linear.x", &[rows, in_features])?;
+    if x.len() != x_expected {
+        return Err(invalid_request(
+            "linear.x",
+            &format!("expected input length {x_expected}, got {}", x.len()),
+        ));
+    }
+    let weight_expected = checked_len_product("linear.weight", &[out_features, in_features])?;
+    if weight_out_by_in.len() != weight_expected {
+        return Err(invalid_model(
+            "linear.weight",
+            &format!(
+                "expected [out,in] weight length {weight_expected}, got {}",
+                weight_out_by_in.len()
+            ),
+        ));
+    }
+    if let Some(bias) = bias {
+        if bias.len() != out_features {
+            return Err(invalid_model(
+                "linear.bias",
+                &format!("expected bias length {out_features}, got {}", bias.len()),
+            ));
+        }
+    }
+    let out_expected = checked_len_product("linear.out", &[rows, out_features])?;
+    if out.len() != out_expected {
+        return Err(invalid_request(
+            "linear.out",
+            &format!("expected output length {out_expected}, got {}", out.len()),
+        ));
+    }
+
+    kernels.linear_out_by_in(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
