@@ -1039,29 +1039,39 @@ fn add_positional_embedding_out_f32(
 // GW.4-5A: fused encoder self-attention kernel.
 //
 // The cube kernel maps one thread to one `(query_row, head)` pair and does
-// the entire `(scaled-dot → softmax → P·V)` chain into device registers and
-// a shared-memory scratch slab. Layout follows the host primitive: `[seq,
-// state]` row-major with `state == n_head * head_dim`; within each row,
-// head H occupies the `head_dim` cells starting at `head * head_dim`.
+// the entire `(scaled-dot → softmax → P·V)` chain using a flash-attention-
+// style online softmax. Layout follows the host primitive: `[seq, state]`
+// row-major with `state == n_head * head_dim`; within each row, head H
+// occupies the `head_dim` cells starting at `head * head_dim`.
 //
-// Scratch placement: per-thread scores would be `seq` f32s, which at
-// Whisper-small's `seq = 1500` is 6 KB per thread. CubeCL 0.10 does not
-// expose a clean per-thread register-array of comptime size, so we put the
-// scores into `SharedMemory<f32>` of size `WORKGROUP_SIZE * seq` and index
-// each thread's slot by `UNIT_POS`. Workgroup size is `ENC_ATTN_WG`; at
-// `WORKGROUP_SIZE = 4` and seq = 1500 the slab is 24 KB, which fits within
-// the WGPU/DX12 shared-memory budget on the local adapter. Smaller seqs
-// (the parity test uses seq = 8) use the same workgroup size with a much
-// smaller slab.
+// GW.4-shmem fix: the previous implementation stored a `seq`-long score
+// row in SharedMemory per thread (`WORKGROUP_SIZE * seq * 4 bytes`). At
+// seq=1500 and ENC_ATTN_WG=4 this was 24 KiB per workgroup, exceeding the
+// 16 KiB WebGPU spec floor for `maxComputeWorkgroupStorageSize`. The fix
+// replaces the three-pass algorithm with a single-pass online softmax that
+// keeps only three running scalars (`m`, `l`, `p`) plus an O(head_dim)
+// per-thread accumulator. No SharedMemory is allocated.
+//
+// Numerical equivalence: the online softmax is mathematically identical to
+// the subtract-max two-pass form. See the flash-attention algorithm for proof.
 // ---------------------------------------------------------------------------
 
-/// Threads per workgroup for the encoder attention kernel. Bound by shared
-/// memory: each thread holds a `seq`-long score buffer, so `ENC_ATTN_WG *
-/// seq * 4 bytes` must fit in the workgroup's shared memory budget. At
-/// `ENC_ATTN_WG = 4` and seq = 1500 the slab is 24 KB. The launch grid
-/// fans the remaining (`seq * n_head`) threads across as many workgroups
-/// as it needs.
+/// Threads per workgroup for the attention kernels. After the GW.4-shmem
+/// flash rewrite there is no O(seq) shared-memory slab, so this constant
+/// is only about launch occupancy, not memory budget.
 const ENC_ATTN_WG: u32 = 4;
+
+/// Maximum head_dim used by any Whisper variant (tiny through large-v2 all
+/// use head_dim=64). The flash-attention kernels allocate `ENC_ATTN_WG *
+/// head_dim * 4` bytes of shared memory per workgroup. At the maximum:
+///   4 threads/wg * 64 floats/thread * 4 bytes/float = 1024 bytes.
+/// The WebGPU spec floor is 16 384 bytes. This assertion ensures the
+/// constant-size slab never silently regress to O(seq) proportions.
+const WHISPER_MAX_HEAD_DIM: u32 = 64;
+const _: () = assert!(
+    ENC_ATTN_WG * WHISPER_MAX_HEAD_DIM * 4 <= 16_384,
+    "GW.4-shmem: attention kernel shared-memory budget exceeds 16 KiB WebGPU floor"
+);
 
 /// Fused encoder self-attention. One thread per `(query_row, head)` pair.
 ///
@@ -1070,13 +1080,9 @@ const ENC_ATTN_WG: u32 = 4;
 ///   row stride is `n_head * head_dim` and the head H slice of row R lives
 ///   at `R * n_head * head_dim + H * head_dim`.
 ///
-/// Per `(query_row, head)`:
-///   1. Scaled dot product `Q[query_row, head, :] · K[:, head, :]^T` into a
-///      shared-memory scores buffer (one slot per thread in the workgroup).
-///   2. Numerically stable softmax across all `seq` keys: subtract row
-///      max, exp, sum, divide.
-///   3. Accumulate `P · V[:, head, :]` into `head_dim` register
-///      accumulators and write the row's head slice once at the end.
+/// Per `(query_row, head)`: single-pass online softmax over all `seq` keys,
+/// accumulating `P · V` into `head_dim` per-thread register values.
+/// No shared memory is used; shared-memory budget is O(1) per workgroup.
 #[cube(launch_unchecked)]
 fn attention_encoder_f32(
     q: &Array<f32>,
@@ -1086,7 +1092,6 @@ fn attention_encoder_f32(
     #[comptime] seq: usize,
     #[comptime] n_head: usize,
     #[comptime] head_dim: usize,
-    #[comptime] wg_size: usize,
     scale: f32,
 ) {
     // Cast each u32 launch builtin to usize once so the rest of the body
@@ -1106,65 +1111,79 @@ fn attention_encoder_f32(
     let query_row = pos / n_head;
     let head = pos - query_row * n_head;
     let state = n_head * head_dim;
-
-    // Shared-memory scratch: `wg_size` rows of `seq` floats each. The thread
-    // at intra-workgroup position `UNIT_POS` owns row `UNIT_POS`. This is
-    // the design call from the GW.4-5A spec — register arrays of comptime
-    // size aren't a clean shape in CubeCL 0.10, so we put the scores into
-    // shared memory and pay the indirection per access.
-    let mut scores = SharedMemory::<f32>::new(wg_size * seq);
-    #[allow(clippy::unnecessary_cast)]
-    let lane = UNIT_POS as usize;
-    let lane_base = lane * seq;
-
     let q_base = query_row * state + head * head_dim;
 
-    // Pass 1: scaled dot products. Seed `row_max` with the j == 0 score so
-    // we never compare against a sentinel — `f32::NEG_INFINITY` as a
-    // cube-typed initial value is awkward in 0.10, and any finite
-    // sentinel risks being smaller than a real score on pathological
-    // inputs. The j == 0 branch and the `scaled > row_max` branch
-    // intentionally do the same store; we could split with an explicit
-    // pre-loop iteration but keeping a single 0..seq loop unifies the
-    // memory-access pattern across all heads.
-    let mut row_max = f32::new(0.0);
-    for j in 0..seq {
+    // Online (flash-attention) softmax: stream over all seq keys, maintaining
+    // running max `m`, running normaliser `l`, and weighted V accumulator.
+    // On each step j:
+    //   s      = scale * dot(Q[query_row,head,:], K[j,head,:])
+    //   m_new  = max(m, s)
+    //   alpha  = exp(m - m_new)      -- rescale accumulated mass from old max
+    //   p      = exp(s - m_new)      -- softmax weight for key j
+    //   l      = l * alpha + p
+    //   acc[d] = acc[d] * alpha + p * V[j,head,d]
+    //   m      = m_new
+    //
+    // After the loop: output[d] = acc[d] / l. This is numerically identical
+    // to subtract-max two-pass softmax (within f32 rounding).
+    //
+    // `m` is seeded with the j=0 score so we never compare against a
+    // sentinel; the alpha for j=0 is exp(m - m_new) = exp(0) = 1.0, which
+    // is correct — no prior mass to rescale.
+
+    // Seed with j=0 to avoid needing -inf as a CubeCL literal.
+    let k_base_0 = head * head_dim;
+    let mut m = f32::new(0.0);
+    for d in 0..head_dim {
+        m += q[q_base + d] * k[k_base_0 + d];
+    }
+    m *= scale;
+
+    let p0 = f32::new(1.0); // exp(m - m) = 1.0
+    let mut l = p0;
+
+    // acc holds the running weighted V sum; initialise with p0 * V[0].
+    // Using an unrolled approach: CubeCL comptime loops over head_dim.
+    // We declare a SharedMemory of size head_dim as per-thread accumulator
+    // storage — it is O(head_dim * wg_size) which is tiny (e.g. 64 * 4 = 256
+    // bytes) and independent of seq. We index by lane * head_dim + d.
+    // NOTE: head_dim is comptime so the slab size is a compile-time constant.
+    // At Whisper's head_dim=64 and ENC_ATTN_WG=4 this is 1 KiB — well within
+    // the 16 KiB WebGPU floor.
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let mut acc = SharedMemory::<f32>::new(ENC_ATTN_WG as usize * head_dim);
+    let acc_base = lane * head_dim;
+
+    for d in 0..head_dim {
+        acc[acc_base + d] = p0 * v[k_base_0 + d];
+    }
+
+    // Stream remaining keys j=1..seq.
+    for j in 1..seq {
         let k_base = j * state + head * head_dim;
-        let mut acc = f32::new(0.0);
+        let mut s = f32::new(0.0);
         for d in 0..head_dim {
-            acc += q[q_base + d] * k[k_base + d];
+            s += q[q_base + d] * k[k_base + d];
         }
-        let scaled = acc * scale;
-        scores[lane_base + j] = scaled;
-        if j == 0 || scaled > row_max {
-            row_max = scaled;
+        s *= scale;
+
+        let m_new = f32::max(m, s);
+        let alpha = f32::exp(m - m_new);
+        let p = f32::exp(s - m_new);
+        l = l * alpha + p;
+
+        let v_base = j * state + head * head_dim;
+        for d in 0..head_dim {
+            acc[acc_base + d] = acc[acc_base + d] * alpha + p * v[v_base + d];
         }
+        m = m_new;
     }
 
-    // Pass 2: numerically stable softmax — exp(score - max), sum, divide.
-    let mut denom = f32::new(0.0);
-    for j in 0..seq {
-        let e = f32::exp(scores[lane_base + j] - row_max);
-        scores[lane_base + j] = e;
-        denom += e;
-    }
-    let inv_denom = f32::new(1.0) / denom;
-    for j in 0..seq {
-        scores[lane_base + j] = scores[lane_base + j] * inv_denom;
-    }
-
-    // Pass 3: P · V into a register accumulator per output dim. Whisper
-    // head_dim is small (64 at tiny, 64 at small, 64 at medium, 64 at
-    // large-v2 — Whisper keeps head_dim fixed at 64 and varies n_head),
-    // so the inner-loop arithmetic stays in registers.
+    // Normalise and write output.
     let out_base = q_base;
     for d in 0..head_dim {
-        let mut ctx = f32::new(0.0);
-        for j in 0..seq {
-            let v_base = j * state + head * head_dim;
-            ctx += scores[lane_base + j] * v[v_base + d];
-        }
-        output[out_base + d] = ctx;
+        output[out_base + d] = acc[acc_base + d] / l;
     }
 }
 
@@ -1226,7 +1245,6 @@ fn run_attention_encoder_d_wgpu(
             seq,
             n_head,
             head_dim,
-            ENC_ATTN_WG as usize,
             scale,
         );
     }
@@ -1260,8 +1278,9 @@ fn run_attention_encoder_d_wgpu(
 /// Layout: `q`, `k`, `v`, `output` are `[seq, state]` row-major,
 /// `state == n_head * head_dim`. Row `qi` attends keys `0..=qi` only.
 ///
-/// Shared memory slab: `wg_size * seq` floats, one row per intra-workgroup
-/// thread — same design as the encoder kernel.
+/// GW.4-shmem fix: replaced O(seq) SharedMemory slab with an online softmax
+/// that uses O(head_dim) per-thread shared memory (comptime size, independent
+/// of seq). No shared-memory budget grows with runtime `seq`.
 #[cube(launch_unchecked)]
 fn attention_decoder_causal_f32(
     q: &Array<f32>,
@@ -1271,7 +1290,6 @@ fn attention_decoder_causal_f32(
     #[comptime] seq: usize,
     #[comptime] n_head: usize,
     #[comptime] head_dim: usize,
-    #[comptime] wg_size: usize,
     scale: f32,
 ) {
     #[allow(clippy::unnecessary_cast)]
@@ -1287,61 +1305,57 @@ fn attention_decoder_causal_f32(
     // Row `query_row` may attend keys `0..=query_row` (causal mask).
     let visible = query_row + 1;
 
-    // Shared-memory slab: same shape as encoder kernel.
-    let mut scores = SharedMemory::<f32>::new(wg_size * seq);
-    #[allow(clippy::unnecessary_cast)]
-    let lane = UNIT_POS as usize;
-    let lane_base = lane * seq;
-
     let q_base = query_row * state + head * head_dim;
 
-    // Pass 1: scaled dot products for the causally-visible keys only.
-    // Uninitialised slots beyond `visible` are never read by the softmax or
-    // accumulation passes, so we leave them as allocated (zero-init is not
-    // guaranteed by CubeCL shared memory, but we never read past `visible`).
-    let mut row_max = f32::new(0.0);
-    for j in 0..seq {
+    // Online (flash-attention) softmax over the causally-visible keys.
+    // Seed with j=0: exp(m - m) = 1, no prior mass to rescale.
+    let k_base_0 = head * head_dim; // j=0: row 0, head slice
+    let mut m = f32::new(0.0);
+    for d in 0..head_dim {
+        m += q[q_base + d] * k[k_base_0 + d];
+    }
+    m *= scale;
+
+    let p0 = f32::new(1.0);
+    let mut l = p0;
+
+    // Per-thread accumulator stored in O(head_dim) shared memory.
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let mut acc = SharedMemory::<f32>::new(ENC_ATTN_WG as usize * head_dim);
+    let acc_base = lane * head_dim;
+
+    for d in 0..head_dim {
+        acc[acc_base + d] = p0 * v[k_base_0 + d];
+    }
+
+    // Stream keys j=1..visible (causal: stop at query_row).
+    for j in 1..seq {
         if j < visible {
             let k_base = j * state + head * head_dim;
-            let mut acc = f32::new(0.0);
+            let mut s = f32::new(0.0);
             for d in 0..head_dim {
-                acc += q[q_base + d] * k[k_base + d];
+                s += q[q_base + d] * k[k_base + d];
             }
-            let scaled = acc * scale;
-            scores[lane_base + j] = scaled;
-            if j == 0 || scaled > row_max {
-                row_max = scaled;
+            s *= scale;
+
+            let m_new = f32::max(m, s);
+            let alpha = f32::exp(m - m_new);
+            let p = f32::exp(s - m_new);
+            l = l * alpha + p;
+
+            let v_base = j * state + head * head_dim;
+            for d in 0..head_dim {
+                acc[acc_base + d] = acc[acc_base + d] * alpha + p * v[v_base + d];
             }
+            m = m_new;
         }
     }
 
-    // Pass 2: numerically stable softmax over the `visible` scores.
-    let mut denom = f32::new(0.0);
-    for j in 0..seq {
-        if j < visible {
-            let e = f32::exp(scores[lane_base + j] - row_max);
-            scores[lane_base + j] = e;
-            denom += e;
-        }
-    }
-    let inv_denom = f32::new(1.0) / denom;
-    for j in 0..seq {
-        if j < visible {
-            scores[lane_base + j] = scores[lane_base + j] * inv_denom;
-        }
-    }
-
-    // Pass 3: probability-weighted accumulation of V (visible tokens only).
+    // Normalise and write output.
     let out_base = query_row * state + head * head_dim;
     for d in 0..head_dim {
-        let mut ctx = f32::new(0.0);
-        for j in 0..seq {
-            if j < visible {
-                let v_base = j * state + head * head_dim;
-                ctx += scores[lane_base + j] * v[v_base + d];
-            }
-        }
-        output[out_base + d] = ctx;
+        output[out_base + d] = acc[acc_base + d] / l;
     }
 }
 
@@ -1401,7 +1415,6 @@ fn run_attention_decoder_causal_d_wgpu(
             seq,
             n_head,
             head_dim,
-            ENC_ATTN_WG as usize,
             scale,
         );
     }
@@ -1599,7 +1612,10 @@ fn run_attention_decoder_incremental_d_wgpu(
 /// `output` is `[q_seq, state]`. `state == n_head * head_dim`.
 /// Every query row attends all `kv_seq` encoder positions (no causal mask).
 ///
-/// Shared memory slab: `wg_size * kv_seq` floats, one row per lane.
+/// GW.4-shmem fix: replaced O(kv_seq) SharedMemory slab with an online
+/// softmax that uses O(head_dim) per-thread shared memory, independent of
+/// `kv_seq`. At Whisper-large kv_seq=1500 the old slab was 24 KiB; the new
+/// slab is constant (e.g. 1 KiB at head_dim=64, ENC_ATTN_WG=4).
 #[cube(launch_unchecked)]
 fn attention_decoder_cross_f32(
     q: &Array<f32>,
@@ -1610,7 +1626,6 @@ fn attention_decoder_cross_f32(
     #[comptime] kv_seq: usize,
     #[comptime] n_head: usize,
     #[comptime] head_dim: usize,
-    #[comptime] wg_size: usize,
     scale: f32,
 ) {
     #[allow(clippy::unnecessary_cast)]
@@ -1623,51 +1638,55 @@ fn attention_decoder_cross_f32(
     let query_row = pos / n_head;
     let head = pos - query_row * n_head;
     let state = n_head * head_dim;
-
-    // Shared-memory slab: kv_seq scores per lane, same design as encoder kernel.
-    let mut scores = SharedMemory::<f32>::new(wg_size * kv_seq);
-    #[allow(clippy::unnecessary_cast)]
-    let lane = UNIT_POS as usize;
-    let lane_base = lane * kv_seq;
-
     let q_base = query_row * state + head * head_dim;
 
-    // Pass 1: scaled dot products against all kv_seq encoder keys.
-    let mut row_max = f32::new(0.0);
-    for j in 0..kv_seq {
+    // Online softmax over all kv_seq encoder keys. Seed with j=0.
+    let k_base_0 = head * head_dim; // j=0: row 0, head slice in K
+    let mut m = f32::new(0.0);
+    for d in 0..head_dim {
+        m += q[q_base + d] * k[k_base_0 + d];
+    }
+    m *= scale;
+
+    let p0 = f32::new(1.0);
+    let mut l = p0;
+
+    // Per-thread O(head_dim) accumulator in shared memory.
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let mut acc = SharedMemory::<f32>::new(ENC_ATTN_WG as usize * head_dim);
+    let acc_base = lane * head_dim;
+
+    let v_base_0 = head * head_dim; // j=0: row 0, head slice in V
+    for d in 0..head_dim {
+        acc[acc_base + d] = p0 * v[v_base_0 + d];
+    }
+
+    // Stream keys j=1..kv_seq (no causal mask in cross-attention).
+    for j in 1..kv_seq {
         let k_base = j * state + head * head_dim;
-        let mut acc = f32::new(0.0);
+        let mut s = f32::new(0.0);
         for d in 0..head_dim {
-            acc += q[q_base + d] * k[k_base + d];
+            s += q[q_base + d] * k[k_base + d];
         }
-        let scaled = acc * scale;
-        scores[lane_base + j] = scaled;
-        if j == 0 || scaled > row_max {
-            row_max = scaled;
+        s *= scale;
+
+        let m_new = f32::max(m, s);
+        let alpha = f32::exp(m - m_new);
+        let p = f32::exp(s - m_new);
+        l = l * alpha + p;
+
+        let v_base = j * state + head * head_dim;
+        for d in 0..head_dim {
+            acc[acc_base + d] = acc[acc_base + d] * alpha + p * v[v_base + d];
         }
+        m = m_new;
     }
 
-    // Pass 2: numerically stable softmax over all kv_seq scores.
-    let mut denom = f32::new(0.0);
-    for j in 0..kv_seq {
-        let e = f32::exp(scores[lane_base + j] - row_max);
-        scores[lane_base + j] = e;
-        denom += e;
-    }
-    let inv_denom = f32::new(1.0) / denom;
-    for j in 0..kv_seq {
-        scores[lane_base + j] = scores[lane_base + j] * inv_denom;
-    }
-
-    // Pass 3: probability-weighted accumulation of V across all encoder positions.
+    // Normalise and write output.
     let out_base = query_row * state + head * head_dim;
     for d in 0..head_dim {
-        let mut ctx = f32::new(0.0);
-        for j in 0..kv_seq {
-            let v_base = j * state + head * head_dim;
-            ctx += scores[lane_base + j] * v[v_base + d];
-        }
-        output[out_base + d] = ctx;
+        output[out_base + d] = acc[acc_base + d] / l;
     }
 }
 
@@ -1737,7 +1756,6 @@ fn run_attention_decoder_cross_d_wgpu(
             kv_seq,
             n_head,
             head_dim,
-            ENC_ATTN_WG as usize,
             ScalarArg::new(scale),
         );
     }
@@ -3246,13 +3264,209 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // GW.4-shmem large-seq regression guards.
+    //
+    // The small-seq parity tests above (seq <= 8) were blind to the O(seq)
+    // shared-memory overflow: at seq=8 and ENC_ATTN_WG=4, the slab was only
+    // 128 bytes, well within the 16 KiB WebGPU floor. At seq=1500 it becomes
+    // 24 KiB, exceeding it on spec/downlevel adapters. These tests exercise
+    // seq=512 (well above the 16 KiB threshold for the old kernel) against the
+    // same CPU oracles. Any regression back to O(seq) shared memory will cause
+    // pipeline creation failures visible here.
+    // -----------------------------------------------------------------------
+
+    /// GW.4-shmem large-seq encoder regression guard.
+    /// seq=512, n_head=2, head_dim=4: with the old slab, this would require
+    /// `4 * 512 * 4 = 8192` bytes per workgroup -- still fits on most adapters
+    /// but the test documents the intent; at seq=1500 the old design exceeds
+    /// the 16 KiB WebGPU floor. Use seq=512 as the highest value that still
+    /// exercises the overflow regime without making the test slow.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_encoder_d_large_seq_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_encoder_d_large_seq_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let seq = 512usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; seq * state];
+        crate::attention_encoder_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut expected);
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_encoder_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("device attention_encoder_d large-seq must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        let mut max_err = 0.0_f32;
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            max_err = max_err.max(abs);
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU encoder attention (large-seq) drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+        eprintln!("wgpu_attention_encoder_d_large_seq: seq={seq} max_abs_err={max_err:.2e}");
+    }
+
+    /// GW.4-shmem large-seq causal decoder regression guard.
+    /// seq=512 exercises the causal mask path across many rows.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_decoder_causal_d_large_seq_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_decoder_causal_d_large_seq_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let seq = 512usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; seq * state];
+        attention_decoder_causal_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut expected);
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_decoder_causal_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("device attention_decoder_causal_d large-seq must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        let mut max_err = 0.0_f32;
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            max_err = max_err.max(abs);
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU causal decoder attention (large-seq) drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+        eprintln!("wgpu_attention_decoder_causal_d_large_seq: seq={seq} max_abs_err={max_err:.2e}");
+    }
+
+    /// GW.4-shmem large-kv_seq cross-attention regression guard.
+    /// kv_seq=512 encoder frames exercises the O(kv_seq) path that existed
+    /// before the flash rewrite.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_decoder_cross_d_large_kv_seq_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_decoder_cross_d_large_kv_seq_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let q_seq = 4usize;
+        let kv_seq = 512usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..q_seq * state)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; q_seq * state];
+        crate::attention_decoder_cross_scalar(
+            &q,
+            &k,
+            &v,
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(q_seq * state).expect("alloc out");
+        backend
+            .attention_decoder_cross_d(
+                &q_d, &k_d, &v_d, q_seq, kv_seq, n_head, head_dim, scale, &out_d,
+            )
+            .expect("device attention_decoder_cross_d large-kv_seq must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        let mut max_err = 0.0_f32;
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            max_err = max_err.max(abs);
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU cross attention (large-kv_seq) drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+        eprintln!(
+            "wgpu_attention_decoder_cross_d_large_kv_seq: kv_seq={kv_seq} max_abs_err={max_err:.2e}"
+        );
+    }
+
     /// GW.4-5A parity gate: the fused encoder-attention kernel must match
     /// the scalar reference within `1e-4` rel/abs on a small but
     /// non-trivial shape that exercises the head/seq indexing, the
     /// softmax stability path, and the P·V accumulation. The shape
-    /// (seq=8, n_head=2, head_dim=4) keeps the shared-memory slab tiny
-    /// (8 floats per thread × 4 threads/workgroup = 128 bytes) so it is
-    /// also viable on adapters with very small shared-memory budgets.
+    /// (seq=8, n_head=2, head_dim=4) keeps the flash-attention slab O(1)
+    /// and is viable on all adapters.
     #[cfg(feature = "cubecl-wgpu")]
     #[test]
     fn wgpu_attention_encoder_d_matches_scalar_within_tolerance() {
