@@ -287,6 +287,126 @@ impl KernelBackend for CubeClKernelBackend {
         )?;
         out.write_from_host_slice(&out_buf)
     }
+
+    /// Device-resident elementwise add. When both operands are
+    /// `WgpuDeviceBuffer`s, launch the cube kernel against their existing
+    /// handles. Otherwise fall back to the trait default, which forces
+    /// host readback.
+    fn add_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(lhs_buf), Some(rhs_buf)) =
+                (extract_wgpu_buf(lhs), extract_wgpu_buf(rhs))
+            {
+                return run_add_inplace_d_wgpu(lhs_buf, rhs_buf);
+            }
+        }
+        // Default: readback + host loop.
+        let mut lhs_host = lhs.to_host_owned()?;
+        let rhs_host = rhs.to_host_owned()?;
+        if lhs_host.len() != rhs_host.len() {
+            return Err(cubecl_err(format!(
+                "add_inplace_d length mismatch: lhs={} rhs={}",
+                lhs_host.len(),
+                rhs_host.len()
+            )));
+        }
+        for (l, r) in lhs_host.iter_mut().zip(rhs_host.iter()) {
+            *l += *r;
+        }
+        lhs.write_from_host_slice(&lhs_host)
+    }
+
+    /// Device-resident GELU in place. When the operand is a
+    /// `WgpuDeviceBuffer`, launch the cube kernel. Otherwise fall back
+    /// to the host path. Note: the cube `f32::erf` intrinsic may not be
+    /// bit-identical to the CPU `erf_approx` Whisper uses; the 1e-4
+    /// tolerance gate accepts this drift.
+    fn gelu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let Some(buf) = extract_wgpu_buf(x) {
+                return run_gelu_inplace_d_wgpu(buf);
+            }
+        }
+        let mut host = x.to_host_owned()?;
+        for v in host.iter_mut() {
+            *v = crate::gelu_whisper_scalar(*v);
+        }
+        x.write_from_host_slice(&host)
+    }
+
+    /// Device-resident LayerNorm. When every operand is a
+    /// `WgpuDeviceBuffer`, launch a naive one-thread-per-row kernel.
+    /// Stage 3 can optimize to a workgroup-per-row reduction.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        hidden: usize,
+        weight: &DeviceTensor,
+        bias: &DeviceTensor,
+        eps: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        crate::validate_layer_norm_shapes(x, rows, hidden, weight, bias, out)?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(x_buf), Some(w_buf), Some(b_buf), Some(out_buf)) = (
+                extract_wgpu_buf(x),
+                extract_wgpu_buf(weight),
+                extract_wgpu_buf(bias),
+                extract_wgpu_buf(out),
+            ) {
+                return run_layer_norm_d_wgpu(x_buf, rows, hidden, w_buf, b_buf, eps, out_buf);
+            }
+        }
+        // Default: readback + host scalar layer_norm + writeback.
+        let x_host = x.to_host_owned()?;
+        let w_host = weight.to_host_owned()?;
+        let b_host = bias.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; rows * hidden];
+        crate::layer_norm_whisper_scalar(
+            &x_host, rows, hidden, &w_host, &b_host, eps, &mut out_buf,
+        );
+        out.write_from_host_slice(&out_buf)
+    }
+
+    /// Device-resident `x += pe[start_pos..start_pos + rows]`. When both
+    /// operands are `WgpuDeviceBuffer`s, launch the cube kernel against
+    /// the existing handles.
+    fn add_positional_embedding_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        pe: &DeviceTensor,
+        pe_rows: usize,
+        start_pos: usize,
+    ) -> Result<()> {
+        crate::validate_add_positional_embedding_shapes(
+            x, rows, cols, pe, pe_rows, start_pos,
+        )?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(x_buf), Some(pe_buf)) = (extract_wgpu_buf(x), extract_wgpu_buf(pe)) {
+                return run_add_positional_embedding_d_wgpu(
+                    x_buf, rows, cols, pe_buf, start_pos,
+                );
+            }
+        }
+        let mut x_host = x.to_host_owned()?;
+        let pe_host = pe.to_host_owned()?;
+        for row in 0..rows {
+            let dst_start = row * cols;
+            let src_start = (start_pos + row) * cols;
+            for col in 0..cols {
+                x_host[dst_start + col] += pe_host[src_start + col];
+            }
+        }
+        x.write_from_host_slice(&x_host)
+    }
 }
 
 /// Run a fully device-resident `linear_out_by_in` on the WGPU runtime.
@@ -393,6 +513,290 @@ fn run_linear_d_wgpu(
         .lock()
         .expect("WgpuDeviceBuffer handle mutex poisoned") = output_handle;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GW.4 Stage 2A: device-resident critical-chain primitives
+// (add_inplace_d, gelu_inplace_d, layer_norm_d, add_positional_embedding_d).
+//
+// All four kernels follow the same "out-of-place + handle swap" pattern as
+// `linear_d`: launch into a fresh output handle, then swap it into the
+// caller-supplied `WgpuDeviceBuffer` so subsequent reads pick up the
+// result. The kernels themselves are "_out_f32" suffixed; the trait
+// methods that look like "in-place" describe caller-visible semantics.
+// ---------------------------------------------------------------------------
+
+/// Naive LayerNorm — one thread per row, sequential reductions of the row.
+/// Bit-identical to the CPU `layer_norm_whisper_scalar` op order: sum-then-
+/// divide for the mean, then sum of squared deltas, divide, then add eps
+/// and inverse-sqrt. Stage 3 should swap this for a workgroup-per-row
+/// reduction, but for correctness on encoder shapes (rows ~1500, hidden
+/// 384–1280) the naive form is fine.
+#[cube(launch_unchecked)]
+fn layer_norm_naive_f32(
+    x: &Array<f32>,
+    weight: &Array<f32>,
+    bias: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] hidden: usize,
+    eps: f32,
+) {
+    let row = ABSOLUTE_POS;
+    let row_start = row * hidden;
+    // Bound check: each row writes `hidden` cells starting at `row_start`,
+    // so the last written index is `row_start + hidden - 1`. Bail out if
+    // there is no room for a full row.
+    if row_start + hidden > output.len() {
+        terminate!();
+    }
+
+    // Pass 1: mean.
+    let mut sum = f32::new(0.0);
+    for c in 0..hidden {
+        sum += x[row_start + c];
+    }
+    let mean = sum / f32::cast_from(hidden as u32);
+
+    // Pass 2: biased variance.
+    let mut var_sum = f32::new(0.0);
+    for c in 0..hidden {
+        let d = x[row_start + c] - mean;
+        var_sum += d * d;
+    }
+    let var = var_sum / f32::cast_from(hidden as u32);
+    let inv_std = f32::new(1.0) / f32::sqrt(var + eps);
+
+    // Pass 3: normalize + affine.
+    for c in 0..hidden {
+        let normed = (x[row_start + c] - mean) * inv_std;
+        output[row_start + c] = normed * weight[c] + bias[c];
+    }
+}
+
+/// Compute `(workgroup_count, workgroup_size)` for a 1-D elementwise
+/// launch sized `total` (in cells), rounded up to whole workgroups. Same
+/// pattern as `prepare_linear_launch`: WGPU caps workgroup size at 256 on
+/// most adapters, so we fan out across workgroups with a fixed 1-D
+/// `CubeDim::new_1d(256)` and the kernel does a tail bounds check.
+#[cfg(feature = "cubecl-wgpu")]
+fn prepare_elementwise_launch(total: usize) -> Result<(u32, u32)> {
+    const WORKGROUP_SIZE: u32 = 256;
+    let total = u32::try_from(total).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "elementwise launch cell count {total} exceeds CubeCL u32 launch limit"
+        ))
+    })?;
+    let workgroup_count = total.div_ceil(WORKGROUP_SIZE).max(1);
+    Ok((workgroup_count, WORKGROUP_SIZE))
+}
+
+/// Compute `(workgroup_count, workgroup_size)` for a one-thread-per-row
+/// launch. We use a 1-D launch (`CubeDim::new_1d(WORKGROUP_SIZE)`) and
+/// round up the row count to whole workgroups; the kernel itself bounds-
+/// checks against `output.len()`.
+#[cfg(feature = "cubecl-wgpu")]
+fn prepare_per_row_launch(rows: usize) -> Result<(u32, u32)> {
+    const WORKGROUP_SIZE: u32 = 64; // rows per layer are typically << #cells;
+    // a smaller workgroup avoids wasting threads
+    // on tail bounds checks.
+    let rows = u32::try_from(rows).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "per-row launch row count {rows} exceeds CubeCL u32 launch limit"
+        ))
+    })?;
+    let workgroup_count = rows.div_ceil(WORKGROUP_SIZE).max(1);
+    Ok((workgroup_count, WORKGROUP_SIZE))
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_add_inplace_d_wgpu(lhs: &WgpuDeviceBuffer, rhs: &WgpuDeviceBuffer) -> Result<()> {
+    if lhs.len_f32() != rhs.len_f32() {
+        return Err(cubecl_wgpu_err(format!(
+            "add_inplace_d length mismatch: lhs={} rhs={}",
+            lhs.len_f32(),
+            rhs.len_f32()
+        )));
+    }
+    let len = lhs.len_f32();
+    let client = lhs.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+
+    // Same swap-on-write discipline as `run_linear_d_wgpu`: launch a
+    // dedicated out-of-place kernel into a fresh output handle, then
+    // swap that handle into `lhs`.
+    let lhs_handle = lhs.clone_handle();
+    let rhs_handle = rhs.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        add_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(lhs_handle, len),
+            ArrayArg::from_raw_parts(rhs_handle, len),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+        );
+    }
+
+    *lhs.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+/// Out-of-place add used by `run_add_inplace_d_wgpu`. The "_inplace"
+/// suffix on `add_inplace_d` describes the caller-visible semantics
+/// (lhs's handle is swapped to a buffer that holds lhs+rhs), not the
+/// kernel itself.
+#[cube(launch_unchecked)]
+fn add_out_f32(lhs: &Array<f32>, rhs: &Array<f32>, output: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    if i >= output.len() {
+        terminate!();
+    }
+    output[i] = lhs[i] + rhs[i];
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_gelu_inplace_d_wgpu(x: &WgpuDeviceBuffer) -> Result<()> {
+    let len = x.len_f32();
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let in_handle = x.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        gelu_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(in_handle, len),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+        );
+    }
+
+    *x.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+/// Out-of-place GELU. See `add_out_f32` for the rationale on the
+/// kernel-vs-caller "in place" naming.
+#[cube(launch_unchecked)]
+fn gelu_out_f32(input: &Array<f32>, output: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    if i >= output.len() {
+        terminate!();
+    }
+    let v = input[i];
+    let sqrt2 = f32::sqrt(f32::new(2.0));
+    let erf_val = cubecl::frontend::Erf::erf(v / sqrt2);
+    output[i] = f32::new(0.5) * v * (f32::new(1.0) + erf_val);
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_layer_norm_d_wgpu(
+    x: &WgpuDeviceBuffer,
+    rows: usize,
+    hidden: usize,
+    weight: &WgpuDeviceBuffer,
+    bias: &WgpuDeviceBuffer,
+    eps: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_per_row_launch(rows)?;
+    let out_handle = client.empty(out.len_f32() * std::mem::size_of::<f32>());
+
+    unsafe {
+        layer_norm_naive_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(x.clone_handle(), x.len_f32()),
+            ArrayArg::from_raw_parts(weight.clone_handle(), weight.len_f32()),
+            ArrayArg::from_raw_parts(bias.clone_handle(), bias.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), out.len_f32()),
+            hidden,
+            eps,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_add_positional_embedding_d_wgpu(
+    x: &WgpuDeviceBuffer,
+    rows: usize,
+    cols: usize,
+    pe: &WgpuDeviceBuffer,
+    start_pos: usize,
+) -> Result<()> {
+    let len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| cubecl_wgpu_err("add_positional_embedding_d rows*cols overflowed usize"))?;
+    if x.len_f32() != len {
+        return Err(cubecl_wgpu_err(format!(
+            "add_positional_embedding_d x len {} != rows*cols {len}",
+            x.len_f32()
+        )));
+    }
+    let offset_elems = start_pos
+        .checked_mul(cols)
+        .ok_or_else(|| cubecl_wgpu_err("add_positional_embedding_d start_pos*cols overflowed usize"))?;
+    if offset_elems + len > pe.len_f32() {
+        return Err(cubecl_wgpu_err(format!(
+            "add_positional_embedding_d pe window {}..{} exceeds pe len {}",
+            offset_elems,
+            offset_elems + len,
+            pe.len_f32()
+        )));
+    }
+
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        add_positional_embedding_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(x.clone_handle(), x.len_f32()),
+            ArrayArg::from_raw_parts(pe.clone_handle(), pe.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+            offset_elems,
+        );
+    }
+
+    *x.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+/// Out-of-place positional-embedding add. The launch passes the absolute
+/// element offset `start_pos * cols` as a comptime so the kernel does a
+/// single load from `pe[offset + i]` without a per-thread div/mod for the
+/// row.
+#[cube(launch_unchecked)]
+fn add_positional_embedding_out_f32(
+    x_in: &Array<f32>,
+    pe: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] pe_offset_elems: usize,
+) {
+    let i = ABSOLUTE_POS;
+    if i >= output.len() {
+        terminate!();
+    }
+    output[i] = x_in[i] + pe[pe_offset_elems + i];
 }
 
 /// Apply RoPE through CubeCL.
@@ -1196,6 +1600,180 @@ mod tests {
         buf.write_from_host(&next).expect("write_from_host");
         let back2 = buf.to_host().expect("readback after write");
         assert_eq!(back2, next);
+    }
+
+    // ---------------------------------------------------------------
+    // GW.4 Stage 2A: device-resident critical-chain primitives
+    // ---------------------------------------------------------------
+
+    /// Small adapter-probe helper: try a trivial wgpu launch through the
+    /// legacy slice path. If it errors (no adapter / no driver / etc.) we
+    /// signal "skip" so each device-parity test gets the same skip
+    /// semantics as the existing `wgpu_linear_out_by_in_matches_scalar_*`.
+    #[cfg(feature = "cubecl-wgpu")]
+    fn wgpu_adapter_available() -> bool {
+        let mut probe = vec![0.0_f32; 1];
+        linear_out_by_in_wgpu(&[1.0_f32], 1, 1, &[1.0_f32], 1, None, &mut probe).is_ok()
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_add_inplace_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_add_inplace_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+
+        // Use a non-power-of-two length so the workgroup tail bounds check
+        // exercises real work.
+        let lhs: Vec<f32> = (0..(257_usize + 13))
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let rhs: Vec<f32> = lhs.iter().map(|v| v.cos() * 0.5).collect();
+        let mut expected = lhs.clone();
+        for (l, r) in expected.iter_mut().zip(rhs.iter()) {
+            *l += *r;
+        }
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let lhs_d = backend.upload(&lhs).expect("upload lhs");
+        let rhs_d = backend.upload(&rhs).expect("upload rhs");
+        assert!(matches!(
+            lhs_d.residency(),
+            crate::Residency::Device(CUBECL_WGPU_BACKEND)
+        ));
+        backend
+            .add_inplace_d(&lhs_d, &rhs_d)
+            .expect("device add_inplace_d must succeed");
+        let got = lhs_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_gelu_inplace_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_gelu_inplace_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+
+        let host: Vec<f32> = (0..513_usize).map(|i| ((i as f32) * 0.025) - 6.4).collect();
+        let mut expected = host.clone();
+        for v in expected.iter_mut() {
+            *v = crate::gelu_whisper_scalar(*v);
+        }
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&host).expect("upload x");
+        backend
+            .gelu_inplace_d(&x_d)
+            .expect("device gelu_inplace_d must succeed");
+        let got = x_d.to_host_owned().expect("readback");
+
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU GELU drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_layer_norm_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_layer_norm_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+
+        let rows = 17usize;
+        let hidden = 23usize;
+        let eps = 1e-5_f32;
+        let x_vec: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32) * 0.011).sin())
+            .collect();
+        let weight: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.01).collect();
+        let bias: Vec<f32> = (0..hidden).map(|i| (i as f32) * -0.005).collect();
+
+        let mut expected = vec![0.0_f32; rows * hidden];
+        crate::layer_norm_whisper_scalar(
+            &x_vec, rows, hidden, &weight, &bias, eps, &mut expected,
+        );
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x_vec).expect("upload x");
+        let w_d = backend.upload(&weight).expect("upload weight");
+        let b_d = backend.upload(&bias).expect("upload bias");
+        let out_d = backend.alloc(rows * hidden).expect("alloc output");
+        backend
+            .layer_norm_d(&x_d, rows, hidden, &w_d, &b_d, eps, &out_d)
+            .expect("device layer_norm_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU layer_norm drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_add_positional_embedding_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_add_positional_embedding_d_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let rows = 5usize;
+        let cols = 11usize;
+        let pe_rows = 12usize;
+        let start_pos = 3usize;
+        let x_vec: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.02).collect();
+        let pe_vec: Vec<f32> = (0..pe_rows * cols).map(|i| (i as f32) * -0.013).collect();
+
+        let mut expected = x_vec.clone();
+        for row in 0..rows {
+            let dst = row * cols;
+            let src = (start_pos + row) * cols;
+            for col in 0..cols {
+                expected[dst + col] += pe_vec[src + col];
+            }
+        }
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x_vec).expect("upload x");
+        let pe_d = backend.upload(&pe_vec).expect("upload pe");
+        backend
+            .add_positional_embedding_d(&x_d, rows, cols, &pe_d, pe_rows, start_pos)
+            .expect("device add_positional_embedding_d must succeed");
+        let got = x_d.to_host_owned().expect("readback");
+
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU pe-add drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
     }
 
     #[cfg(feature = "cubecl-wgpu")]

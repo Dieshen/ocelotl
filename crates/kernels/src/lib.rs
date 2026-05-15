@@ -217,6 +217,227 @@ pub trait KernelBackend: Debug + Send + Sync {
         )?;
         out.write_from_host_slice(&out_buf)
     }
+
+    /// Elementwise `lhs[i] += rhs[i]`. Lengths must match. Default impl
+    /// forces a host readback of both operands and a write-back of the
+    /// sum — backends override to keep the work on-device.
+    fn add_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
+        let mut lhs_host = lhs.to_host_owned()?;
+        let rhs_host = rhs.to_host_owned()?;
+        if lhs_host.len() != rhs_host.len() {
+            return Err(kernel_err(format!(
+                "add_inplace_d length mismatch: lhs={} rhs={}",
+                lhs_host.len(),
+                rhs_host.len()
+            )));
+        }
+        for (l, r) in lhs_host.iter_mut().zip(rhs_host.iter()) {
+            *l += *r;
+        }
+        lhs.write_from_host_slice(&lhs_host)
+    }
+
+    /// Elementwise GELU. Must match
+    /// `crates/models/src/whisper/primitives.rs::gelu_inplace` bit-for-bit
+    /// on CPU (same exact-erf approximation) and within `1e-4` rel/abs on
+    /// GPU. Default impl forces readback + host compute.
+    fn gelu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
+        let mut host = x.to_host_owned()?;
+        for v in host.iter_mut() {
+            *v = gelu_whisper_scalar(*v);
+        }
+        x.write_from_host_slice(&host)
+    }
+
+    /// Per-row LayerNorm with affine. `weight` and `bias` are length
+    /// `hidden`; `x` and `out` are length `rows * hidden`. Variance uses
+    /// the biased estimator (divide by `hidden`, not `hidden - 1`) so this
+    /// matches `crates/models/src/whisper/primitives.rs::layer_norm`
+    /// bit-for-bit on CPU.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        hidden: usize,
+        weight: &DeviceTensor,
+        bias: &DeviceTensor,
+        eps: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        validate_layer_norm_shapes(x, rows, hidden, weight, bias, out)?;
+        let x_host = x.to_host_owned()?;
+        let weight_host = weight.to_host_owned()?;
+        let bias_host = bias.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; rows * hidden];
+        layer_norm_whisper_scalar(
+            &x_host,
+            rows,
+            hidden,
+            &weight_host,
+            &bias_host,
+            eps,
+            &mut out_buf,
+        );
+        out.write_from_host_slice(&out_buf)
+    }
+
+    /// Add a slice of a positional-embedding table into `x` in place:
+    /// `x[r * cols + c] += pe[(start_pos + r) * cols + c]`. `pe` has shape
+    /// `[pe_rows, cols]`; `start_pos + rows <= pe_rows` must hold.
+    fn add_positional_embedding_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        pe: &DeviceTensor,
+        pe_rows: usize,
+        start_pos: usize,
+    ) -> Result<()> {
+        validate_add_positional_embedding_shapes(x, rows, cols, pe, pe_rows, start_pos)?;
+        let mut x_host = x.to_host_owned()?;
+        let pe_host = pe.to_host_owned()?;
+        for row in 0..rows {
+            let dst_start = row * cols;
+            let src_start = (start_pos + row) * cols;
+            for col in 0..cols {
+                x_host[dst_start + col] += pe_host[src_start + col];
+            }
+        }
+        x.write_from_host_slice(&x_host)
+    }
+}
+
+/// Whisper's exact-erf GELU. Mirrors
+/// `crates/models/src/whisper/primitives.rs::gelu` bit-for-bit so the
+/// kernels-crate `gelu_inplace_d` CPU path is a parity oracle for any
+/// GPU implementation.
+#[inline]
+pub(crate) fn gelu_whisper_scalar(x: f32) -> f32 {
+    0.5 * x * (1.0 + erf_whisper_scalar(x / std::f32::consts::SQRT_2))
+}
+
+#[inline]
+pub(crate) fn erf_whisper_scalar(x: f32) -> f32 {
+    let sign = if x.is_sign_negative() { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp());
+    sign * y
+}
+
+/// Scalar LayerNorm matching `whisper::primitives::layer_norm` op-for-op
+/// (biased variance, `1.0 / sqrt(var + eps)`, then `(x - mean) * inv_std
+/// * weight + bias`).
+pub(crate) fn layer_norm_whisper_scalar(
+    x: &[f32],
+    rows: usize,
+    hidden: usize,
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) {
+    for row in 0..rows {
+        let start = row * hidden;
+        let values = &x[start..start + hidden];
+        let mean = values.iter().sum::<f32>() / hidden as f32;
+        let variance = values
+            .iter()
+            .map(|v| {
+                let delta = *v - mean;
+                delta * delta
+            })
+            .sum::<f32>()
+            / hidden as f32;
+        let inv_std = 1.0_f32 / (variance + eps).sqrt();
+        for col in 0..hidden {
+            out[start + col] = ((x[start + col] - mean) * inv_std) * weight[col] + bias[col];
+        }
+    }
+}
+
+pub(crate) fn validate_layer_norm_shapes(
+    x: &DeviceTensor,
+    rows: usize,
+    hidden: usize,
+    weight: &DeviceTensor,
+    bias: &DeviceTensor,
+    out: &DeviceTensor,
+) -> Result<()> {
+    let expected = rows
+        .checked_mul(hidden)
+        .ok_or_else(|| kernel_err("layer_norm_d rows*hidden overflowed usize"))?;
+    if x.len() != expected {
+        return Err(kernel_err(format!(
+            "layer_norm_d x len {} != rows*hidden {}",
+            x.len(),
+            expected
+        )));
+    }
+    if out.len() != expected {
+        return Err(kernel_err(format!(
+            "layer_norm_d out len {} != rows*hidden {}",
+            out.len(),
+            expected
+        )));
+    }
+    if weight.len() != hidden {
+        return Err(kernel_err(format!(
+            "layer_norm_d weight len {} != hidden {hidden}",
+            weight.len()
+        )));
+    }
+    if bias.len() != hidden {
+        return Err(kernel_err(format!(
+            "layer_norm_d bias len {} != hidden {hidden}",
+            bias.len()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_add_positional_embedding_shapes(
+    x: &DeviceTensor,
+    rows: usize,
+    cols: usize,
+    pe: &DeviceTensor,
+    pe_rows: usize,
+    start_pos: usize,
+) -> Result<()> {
+    let x_expected = rows
+        .checked_mul(cols)
+        .ok_or_else(|| kernel_err("add_positional_embedding_d rows*cols overflowed usize"))?;
+    let pe_expected = pe_rows
+        .checked_mul(cols)
+        .ok_or_else(|| kernel_err("add_positional_embedding_d pe_rows*cols overflowed usize"))?;
+    if x.len() != x_expected {
+        return Err(kernel_err(format!(
+            "add_positional_embedding_d x len {} != rows*cols {}",
+            x.len(),
+            x_expected
+        )));
+    }
+    if pe.len() != pe_expected {
+        return Err(kernel_err(format!(
+            "add_positional_embedding_d pe len {} != pe_rows*cols {}",
+            pe.len(),
+            pe_expected
+        )));
+    }
+    let end = start_pos
+        .checked_add(rows)
+        .ok_or_else(|| kernel_err("add_positional_embedding_d start_pos+rows overflowed usize"))?;
+    if end > pe_rows {
+        return Err(kernel_err(format!(
+            "add_positional_embedding_d start_pos {start_pos} + rows {rows} exceeds pe_rows {pe_rows}"
+        )));
+    }
+    Ok(())
 }
 
 pub type SharedKernelBackend = Arc<dyn KernelBackend>;
@@ -647,6 +868,143 @@ impl KernelBackend for CpuKernelBackend {
                 &mut out_borrow,
             ),
         }
+    }
+
+    /// CPU override: borrow both host slices and do an elementwise add.
+    /// Falls through to the trait default if either side is device-resident
+    /// (shouldn't happen on the CPU backend, but the default path stays
+    /// correct).
+    fn add_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
+        let lhs_borrow = lhs.borrow_host_slice_mut();
+        let rhs_borrow = rhs.borrow_host_slice();
+        match (lhs_borrow, rhs_borrow) {
+            (Ok(mut l), Ok(r)) => {
+                if l.len() != r.len() {
+                    return Err(kernel_err(format!(
+                        "add_inplace_d length mismatch: lhs={} rhs={}",
+                        l.len(),
+                        r.len()
+                    )));
+                }
+                for (lv, rv) in l.iter_mut().zip(r.iter()) {
+                    *lv += *rv;
+                }
+                Ok(())
+            }
+            _ => {
+                let mut lhs_host = lhs.to_host_owned()?;
+                let rhs_host = rhs.to_host_owned()?;
+                if lhs_host.len() != rhs_host.len() {
+                    return Err(kernel_err(format!(
+                        "add_inplace_d length mismatch: lhs={} rhs={}",
+                        lhs_host.len(),
+                        rhs_host.len()
+                    )));
+                }
+                for (l, r) in lhs_host.iter_mut().zip(rhs_host.iter()) {
+                    *l += *r;
+                }
+                lhs.write_from_host_slice(&lhs_host)
+            }
+        }
+    }
+
+    /// CPU override: borrow the host slice and apply the Whisper-exact
+    /// GELU in place. Bit-identical to `gelu_inplace` in the models crate
+    /// because both call the same `gelu_whisper_scalar` math.
+    fn gelu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
+        match x.borrow_host_slice_mut() {
+            Ok(mut borrow) => {
+                for v in borrow.iter_mut() {
+                    *v = gelu_whisper_scalar(*v);
+                }
+                Ok(())
+            }
+            Err(_) => {
+                let mut host = x.to_host_owned()?;
+                for v in host.iter_mut() {
+                    *v = gelu_whisper_scalar(*v);
+                }
+                x.write_from_host_slice(&host)
+            }
+        }
+    }
+
+    /// CPU override: borrow host slices and run the scalar Whisper-shape
+    /// LayerNorm directly. Falls through to the trait default for the
+    /// device-on-CPU case.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        hidden: usize,
+        weight: &DeviceTensor,
+        bias: &DeviceTensor,
+        eps: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        validate_layer_norm_shapes(x, rows, hidden, weight, bias, out)?;
+        let (x_b, w_b, b_b, out_b) = match (
+            x.borrow_host_slice(),
+            weight.borrow_host_slice(),
+            bias.borrow_host_slice(),
+            out.borrow_host_slice_mut(),
+        ) {
+            (Ok(x_b), Ok(w_b), Ok(b_b), Ok(out_b)) => (x_b, w_b, b_b, out_b),
+            _ => {
+                let x_host = x.to_host_owned()?;
+                let w_host = weight.to_host_owned()?;
+                let b_host = bias.to_host_owned()?;
+                let mut out_buf = vec![0.0_f32; rows * hidden];
+                layer_norm_whisper_scalar(
+                    &x_host, rows, hidden, &w_host, &b_host, eps, &mut out_buf,
+                );
+                return out.write_from_host_slice(&out_buf);
+            }
+        };
+        let mut out_b = out_b;
+        layer_norm_whisper_scalar(&x_b, rows, hidden, &w_b, &b_b, eps, &mut out_b);
+        Ok(())
+    }
+
+    /// CPU override: borrow host slices and accumulate the positional
+    /// embedding into `x` in place. Falls through to the trait default
+    /// for the device-on-CPU case.
+    fn add_positional_embedding_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        pe: &DeviceTensor,
+        pe_rows: usize,
+        start_pos: usize,
+    ) -> Result<()> {
+        validate_add_positional_embedding_shapes(x, rows, cols, pe, pe_rows, start_pos)?;
+        let (x_b, pe_b) = match (x.borrow_host_slice_mut(), pe.borrow_host_slice()) {
+            (Ok(x_b), Ok(pe_b)) => (x_b, pe_b),
+            _ => {
+                let mut x_host = x.to_host_owned()?;
+                let pe_host = pe.to_host_owned()?;
+                for row in 0..rows {
+                    let dst_start = row * cols;
+                    let src_start = (start_pos + row) * cols;
+                    for col in 0..cols {
+                        x_host[dst_start + col] += pe_host[src_start + col];
+                    }
+                }
+                return x.write_from_host_slice(&x_host);
+            }
+        };
+        let mut x_b = x_b;
+        for row in 0..rows {
+            let dst_start = row * cols;
+            let src_start = (start_pos + row) * cols;
+            for col in 0..cols {
+                x_b[dst_start + col] += pe_b[src_start + col];
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2394,6 +2752,133 @@ mod tests {
             .linear_d(&x_h, rows, in_features, &w_h, out_features, None, &out_h)
             .unwrap();
         assert_eq!(slice_out, out_h.to_host_owned().unwrap());
+    }
+
+    // --- GW.4 Stage 2A: device-resident critical-chain primitives ---
+
+    #[test]
+    fn cpu_add_inplace_d_matches_scalar_add_bit_for_bit() {
+        // Parity oracle: a hand-rolled lhs+rhs loop. CPU backend must
+        // produce identical f32 bit patterns.
+        let lhs_vec: Vec<f32> = (0..37).map(|i| (i as f32) * 0.013).collect();
+        let rhs_vec: Vec<f32> = (0..37).map(|i| ((i as f32) * 0.019).sin()).collect();
+        let mut expected = lhs_vec.clone();
+        for (l, r) in expected.iter_mut().zip(rhs_vec.iter()) {
+            *l += *r;
+        }
+
+        let backend = CpuKernelBackend::scalar();
+        let lhs_h = DeviceTensor::from_host(lhs_vec.clone());
+        let rhs_h = DeviceTensor::from_host(rhs_vec);
+        backend.add_inplace_d(&lhs_h, &rhs_h).unwrap();
+        assert_eq!(lhs_h.to_host_owned().unwrap(), expected);
+    }
+
+    #[test]
+    fn cpu_add_inplace_d_rejects_mismatched_lengths() {
+        let backend = CpuKernelBackend::scalar();
+        let lhs_h = DeviceTensor::from_host(vec![1.0_f32, 2.0, 3.0]);
+        let rhs_h = DeviceTensor::from_host(vec![1.0_f32, 2.0]);
+        let err = backend.add_inplace_d(&lhs_h, &rhs_h).expect_err("must reject");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn cpu_gelu_inplace_d_matches_whisper_primitive_bit_for_bit() {
+        // Bit-exactness gate: this is the math both the kernels crate and
+        // the Whisper primitive call. They share the same scalar function
+        // (gelu_whisper_scalar), so the only way this can drift is if one
+        // side changes the formula.
+        let host: Vec<f32> = (-32..32).map(|i| (i as f32) * 0.25).collect();
+        let mut expected = host.clone();
+        for v in expected.iter_mut() {
+            *v = gelu_whisper_scalar(*v);
+        }
+
+        let backend = CpuKernelBackend::scalar();
+        let t = DeviceTensor::from_host(host);
+        backend.gelu_inplace_d(&t).unwrap();
+        assert_eq!(t.to_host_owned().unwrap(), expected);
+    }
+
+    #[test]
+    fn cpu_layer_norm_d_matches_whisper_primitive_bit_for_bit() {
+        // This test fails iff the kernels-crate scalar layer-norm has
+        // drifted from the Whisper primitive. Both call layer_norm_whisper_scalar,
+        // so a failure here is the canary.
+        let rows = 17usize;
+        let hidden = 23usize;
+        let eps = 1e-5_f32;
+        let x_vec: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32) * 0.011).sin())
+            .collect();
+        let weight: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.01).collect();
+        let bias: Vec<f32> = (0..hidden).map(|i| (i as f32) * -0.005).collect();
+
+        let mut expected = vec![0.0_f32; rows * hidden];
+        layer_norm_whisper_scalar(&x_vec, rows, hidden, &weight, &bias, eps, &mut expected);
+
+        let backend = CpuKernelBackend::scalar();
+        let x_h = DeviceTensor::from_host(x_vec);
+        let w_h = DeviceTensor::from_host(weight);
+        let b_h = DeviceTensor::from_host(bias);
+        let out_h = DeviceTensor::host_zeros(rows * hidden);
+        backend
+            .layer_norm_d(&x_h, rows, hidden, &w_h, &b_h, eps, &out_h)
+            .unwrap();
+        assert_eq!(out_h.to_host_owned().unwrap(), expected);
+    }
+
+    #[test]
+    fn cpu_layer_norm_d_rejects_shape_mismatch() {
+        let backend = CpuKernelBackend::scalar();
+        let x_h = DeviceTensor::from_host(vec![0.0_f32; 12]);
+        let w_h = DeviceTensor::from_host(vec![1.0_f32; 4]);
+        let b_h = DeviceTensor::from_host(vec![0.0_f32; 4]);
+        let out_h = DeviceTensor::host_zeros(11); // wrong length
+        let err = backend
+            .layer_norm_d(&x_h, 3, 4, &w_h, &b_h, 1e-5, &out_h)
+            .expect_err("must reject");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn cpu_add_positional_embedding_d_matches_scalar_bit_for_bit() {
+        let rows = 5usize;
+        let cols = 11usize;
+        let pe_rows = 12usize;
+        let start_pos = 3usize;
+        let x_vec: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.02).collect();
+        let pe_vec: Vec<f32> = (0..pe_rows * cols).map(|i| (i as f32) * -0.013).collect();
+
+        let mut expected = x_vec.clone();
+        for row in 0..rows {
+            let dst_start = row * cols;
+            let src_start = (start_pos + row) * cols;
+            for col in 0..cols {
+                expected[dst_start + col] += pe_vec[src_start + col];
+            }
+        }
+
+        let backend = CpuKernelBackend::scalar();
+        let x_h = DeviceTensor::from_host(x_vec);
+        let pe_h = DeviceTensor::from_host(pe_vec);
+        backend
+            .add_positional_embedding_d(&x_h, rows, cols, &pe_h, pe_rows, start_pos)
+            .unwrap();
+        assert_eq!(x_h.to_host_owned().unwrap(), expected);
+    }
+
+    #[test]
+    fn cpu_add_positional_embedding_d_rejects_out_of_range_start_pos() {
+        let backend = CpuKernelBackend::scalar();
+        let x_h = DeviceTensor::from_host(vec![0.0_f32; 6]); // 2 rows × 3 cols
+        let pe_h = DeviceTensor::from_host(vec![0.0_f32; 12]); // 4 rows × 3 cols
+        // start_pos=3 + rows=2 = 5 > pe_rows=4
+        let err = backend
+            .add_positional_embedding_d(&x_h, 2, 3, &pe_h, 4, 3)
+            .expect_err("must reject");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
     }
 
     #[test]
