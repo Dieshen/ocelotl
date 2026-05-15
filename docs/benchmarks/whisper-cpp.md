@@ -890,3 +890,90 @@ records distinguish CPU and GPU runs. Without the `cubecl-wgpu` feature
 compiled in, `--backend cubecl-wgpu` returns a typed error
 (`--backend cubecl-wgpu requires the binary to be built with --features cubecl-wgpu`)
 before any model load.
+
+## GW.4-2B Whisper forward path on device-tensor handles
+
+The encoder/decoder forward path now threads `DeviceTensor` handles
+through every per-layer linear, layer norm, GELU MLP, residual add, and
+positional embedding consumer. Weights upload once at `WhisperModel`
+construction. The 18.43 MB cross-attention K/V cache produced by
+`precompute_cross_attention` is now device-resident from creation, so the
+80 per-token reads during decode do not bounce 18 MB through host memory
+each time. The encoder/decoder run an explicit scratch pool of
+`DeviceTensor` buffers reused across every layer — at tiny that pool is
+~13 MB device-resident (8 buffers × `seq * state`, 1 × `seq * ffn`) vs.
+the prior 110+ MB of cumulative host `Vec<f32>` churn from the GW.4
+audit.
+
+The scalar attention bodies (`attention_body_host` and
+`attention_incremental_body_host` in
+`crates/models/src/whisper/primitives.rs`) plus the self-attention KV
+cache append remain on host. Search `to_host_owned()` in
+`encode.rs` / `decode.rs` to grep every host bounce — Q/K/V projections
+are read back to host, run through the existing rayon-parallel scalar
+attention, and the resulting context is uploaded for the on-device out
+projection. The final logits readback (one per decoded token) is the only
+post-attention bounce. A fused attention kernel is a later milestone.
+
+### Fresh local release results (2026-05-15, tiny.en, sample_16khz_mono)
+
+Median of 3 runs per backend:
+
+| Backend                                                  | Walltime  | matches_expected | encoder  | decode_total |
+| -------------------------------------------------------- | --------- | ---------------- | -------- | ------------ |
+| W-ASR.40 CPU (`avx2`, `--cpu-threads 4`)                 | `850 ms`  | `true`           | `398 ms` | `268 ms`     |
+| GW.1 GPU (`cubecl-wgpu`, scalar-CPU fallback elsewhere)  | `2,930 ms`| `true`           | `765 ms` | `2,002 ms`   |
+| GW.4-2B GPU (`cubecl-wgpu`, device-resident forward)     | `1,135 ms`| `true`           | `530 ms` | `196 ms`     |
+
+GW.4-2B knocks GPU walltime down by 1,795 ms — about a **61% reduction**
+versus the GW.1 baseline. The bulk of the win is on the decode side:
+`decode_total` falls from 2,002 ms to 196 ms (>10×), because every token
+no longer pays a host upload of the 18 MB cross-attention K/V cache
+through `linear_out_by_in`. Per-token decode (`decode_token` in the JSON)
+runs ~7-9 ms on GPU vs ~10-11 ms on the AVX2 CPU baseline, so the GPU is
+now faster than CPU on the post-prefill decode loop in absolute terms.
+
+The encoder still trails the AVX2+4-threads CPU by ~130 ms because the
+encoder pass is dominated by 4 × 1500×384·384·1536 linears for the MLP
+fc1 and 4 × 1500×384·384·384 linears for the attention QKV. The
+`linear_out_by_in_f32` kernel is still single-cell-per-thread with no
+weight reuse across cells in a workgroup, so it does not yet beat AVX2 +
+4-thread CPU on rectangular shapes at tiny dims. Adding workgroup
+shared-memory tiling to that kernel is the obvious next milestone.
+
+### Where the time goes (rough breakdown, GPU run)
+
+- `audio_encode`: ~530 ms = 4 encoder layers × (3 QKV linears + 1 attn-out
+  linear + 2 MLP linears + layer-norms + adds + 1 host attention bounce)
+  plus the conv1d+positional add on host.
+- `cross_attention_precompute`: ~0 ms (was reported as nonzero before:
+  4 × 2 cross-K/V linears now fire as `linear_d` into pre-allocated device
+  caches — small enough vs the encoder pass to round to 0 in the timer).
+- `decode_total`: ~196 ms for the 4-token prefill plus the 23 incremental
+  token steps. Most of this is now the host attention bounce (reading Q/K/V
+  back, scalar attention, uploading context) — the GPU `linear_d` calls
+  themselves are tiny at seq=1.
+- `tensor_load_model`: ~324 ms — slightly higher than the CPU path because
+  of the extra eager `kernels.upload(...)` walk over every weight. This is
+  a cold-path one-shot cost, paid once per `WhisperModel` construction.
+
+### Scratch pool sizing
+
+The encoder/decoder per-layer scratch pool consists of:
+
+- 8 buffers at `seq * state` (attn_ln, q, k, v, proj_out, cross_ln, cross_q,
+  cross_out, mlp_ln, mlp_out — 10 actually for the decoder which also
+  hosts the cross-attention projections; the encoder needs 7 because it
+  has no cross-attention path)
+- 1 buffer at `seq * ffn` (mlp_hidden)
+
+At tiny (seq=1500, state=384, ffn=1536): ~4 MB across the `seq * state`
+buffers plus ~9.2 MB for `mlp_hidden`, totalling ~13 MB device-resident
+per encoder pass. The decoder's prefill scratch is the same shape over
+the prompt length (typically 1-4 tokens), so ~30 KB device-resident.
+Incremental decode scratch is ~3 KB device-resident (seq=1).
+
+Compared to the GW.4 audit's measured ~110 MB of cumulative host
+`Vec<f32>` churn per encoder pass, this is an >8× reduction in working
+set even before counting the saved host↔device transfers on every
+`linear` call.

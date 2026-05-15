@@ -88,6 +88,14 @@ impl WhisperWeights {
             .map(Vec::as_slice)
             .expect("WhisperWeights validation guarantees required tensors")
     }
+
+    /// Iterate over every weight name in deterministic key order. Used at
+    /// `WhisperModel` construction to upload every weight to the device side
+    /// once, so the forward path can pass `DeviceTensor` handles directly
+    /// into `linear_d` / `layer_norm_d` / etc.
+    pub(super) fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
 }
 
 pub(super) fn expected_shape(name: &str, config: &WhisperConfig) -> Result<Vec<usize>> {

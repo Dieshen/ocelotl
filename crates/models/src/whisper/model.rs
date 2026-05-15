@@ -5,22 +5,28 @@
 //! file are `pub(super)` because both encoder and decoder code paths consume
 //! them; this keeps the validation invariants in one place.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use ocelotl_core::{Result, TokenId};
-use ocelotl_kernels::{KernelBackend, default_kernel_backend};
+use ocelotl_kernels::{DeviceTensor, KernelBackend, default_kernel_backend};
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 
 use super::{WhisperConfig, parse_whisper_config_json, required_whisper_tensor_names};
 use super::state::{WhisperDecoderState, WhisperEncodedAudio};
 use super::weights::WhisperWeights;
-use super::{checked_len_product, invalid_request};
+use super::{checked_len_product, invalid_model, invalid_request};
 
 #[derive(Debug, Clone)]
 pub struct WhisperModel {
     pub(super) config: WhisperConfig,
     pub(super) weights: WhisperWeights,
     pub(super) kernels: Arc<dyn KernelBackend>,
+    /// Device-resident mirror of every host weight tensor. Populated once at
+    /// construction so the encoder/decoder forward path can pass weight
+    /// `DeviceTensor` handles directly to `linear_d` / `layer_norm_d` / etc.
+    /// without re-uploading every call. GW.4-2B: the upload cost is amortised
+    /// once per model load, which is a cold-path event.
+    pub(super) device_weights: Arc<BTreeMap<String, DeviceTensor>>,
 }
 
 impl WhisperModel {
@@ -88,10 +94,12 @@ impl WhisperModel {
     ) -> Result<Self> {
         let config = config.validate()?;
         let weights = WhisperWeights::from_loaded_tensors(&config, tensors)?;
+        let device_weights = upload_device_weights(kernels.as_ref(), &weights)?;
         Ok(Self {
             config,
             weights,
             kernels,
+            device_weights: Arc::new(device_weights),
         })
     }
 
@@ -102,6 +110,30 @@ impl WhisperModel {
     pub fn kernel_backend(&self) -> &dyn KernelBackend {
         self.kernels.as_ref()
     }
+
+    /// Borrow the device-resident `DeviceTensor` for a named weight. Errors
+    /// if the name is not in the uploaded set — that should be impossible
+    /// because `upload_device_weights` walks `required_whisper_tensor_names`,
+    /// but we surface a typed error rather than panic so a future schema
+    /// addition is loud.
+    pub(super) fn device_weight(&self, name: &str) -> Result<&DeviceTensor> {
+        self.device_weights
+            .get(name)
+            .ok_or_else(|| invalid_model(name, "missing device-resident weight upload"))
+    }
+}
+
+fn upload_device_weights(
+    kernels: &dyn KernelBackend,
+    weights: &WhisperWeights,
+) -> Result<BTreeMap<String, DeviceTensor>> {
+    let mut device = BTreeMap::new();
+    for name in weights.names() {
+        let host = weights.get(name);
+        let tensor = kernels.upload(host)?;
+        device.insert(name.to_string(), tensor);
+    }
+    Ok(device)
 }
 
 pub(super) fn validate_forward_request(

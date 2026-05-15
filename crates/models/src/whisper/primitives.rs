@@ -7,7 +7,7 @@
 //! `ocelotl-kernels`; until then, it stays here.
 
 use ocelotl_core::Result;
-use ocelotl_kernels::{KernelBackend, softmax};
+use ocelotl_kernels::{DeviceTensor, KernelBackend, softmax};
 
 use super::{checked_len_product, invalid_model, invalid_request};
 
@@ -98,6 +98,9 @@ pub(super) fn conv_output_len(
     Ok(((padded - kernel) / stride) + 1)
 }
 
+/// Host-resident `layer_norm`. Kept as the parity oracle for `layer_norm_d`
+/// and exercised by the existing scalar tests.
+#[allow(dead_code)]
 pub(super) fn layer_norm(
     x: &[f32],
     rows: usize,
@@ -157,7 +160,7 @@ pub(super) fn layer_norm(
 /// rows, 1536 ffn = ~37 MB per layer in the old vec-returning version).
 /// This matches the kernel-crate `mlp_gated_silu` convention and prepares
 /// the call sites for the upcoming `linear_d` device-resident migration.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn mlp_gelu(
     kernels: &dyn KernelBackend,
     x: &[f32],
@@ -219,7 +222,7 @@ pub(super) fn mlp_gelu(
 /// no internal allocation. Used by `mlp_gelu` to write into pre-allocated
 /// scratch and output buffers, and available for future call sites that
 /// want to skip the `Vec` round-trip.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn linear_into(
     kernels: &dyn KernelBackend,
     x: &[f32],
@@ -274,7 +277,7 @@ pub(super) fn linear_into(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn attention(
     kernels: &dyn KernelBackend,
     x: &[f32],
@@ -318,7 +321,7 @@ pub(super) fn attention(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn attention_with_precomputed_kv(
     kernels: &dyn KernelBackend,
     x: &[f32],
@@ -346,7 +349,7 @@ pub(super) fn attention_with_precomputed_kv(
 /// context decoder attention has short q_seq and stays serial.
 const PARALLEL_ATTENTION_MIN_Q: usize = 32;
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn attention_from_projected(
     kernels: &dyn KernelBackend,
     q: &[f32],
@@ -358,6 +361,27 @@ pub(super) fn attention_from_projected(
     heads: usize,
     out_w: &[f32],
     out_b: &[f32],
+    causal: bool,
+) -> Result<Vec<f32>> {
+    let context = attention_body_host(kernels, q, q_seq, k, v, kv_seq, state, heads, causal)?;
+    linear(kernels, &context, q_seq, state, out_w, state, Some(out_b))
+}
+
+/// Host-only attention body: produces the `context` activation (length
+/// `q_seq * state`) without the trailing out-projection. Used by both
+/// `attention_from_projected` and the GW.4-2B device-resident encoder/decoder
+/// paths — the device path does its own `linear_d` for the out projection on
+/// the device side so the only host bounce is the scalar attention math.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attention_body_host(
+    kernels: &dyn KernelBackend,
+    q: &[f32],
+    q_seq: usize,
+    k: &[f32],
+    v: &[f32],
+    kv_seq: usize,
+    state: usize,
+    heads: usize,
     causal: bool,
 ) -> Result<Vec<f32>> {
     if heads == 0 {
@@ -445,7 +469,7 @@ pub(super) fn attention_from_projected(
         }
     }
 
-    linear(kernels, &context, q_seq, state, out_w, state, Some(out_b))
+    Ok(context)
 }
 
 /// Per-Q-row attention body that borrows its `scores` scratch from the
@@ -511,7 +535,7 @@ fn dot_unrolled_4(a: &[f32], b: &[f32]) -> f32 {
     acc
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(super) fn attention_incremental_from_projected(
     kernels: &dyn KernelBackend,
     q: &[f32],
@@ -524,6 +548,27 @@ pub(super) fn attention_incremental_from_projected(
     heads: usize,
     out_w: &[f32],
     out_b: &[f32],
+) -> Result<Vec<f32>> {
+    let context = attention_incremental_body_host(
+        q, new_k, new_v, past_k, past_v, past_seq, state, heads,
+    )?;
+    linear(kernels, &context, 1, state, out_w, state, Some(out_b))
+}
+
+/// Host-only single-token incremental attention body: produces the `context`
+/// activation (length `state`) without the trailing out-projection. GW.4-2B
+/// device-resident decoder calls this from the host bounce point and then
+/// runs the out-projection as a `linear_d` on the device side.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attention_incremental_body_host(
+    q: &[f32],
+    new_k: &[f32],
+    new_v: &[f32],
+    past_k: &[f32],
+    past_v: &[f32],
+    past_seq: usize,
+    state: usize,
+    heads: usize,
 ) -> Result<Vec<f32>> {
     if heads == 0 {
         return Err(invalid_model("attention.heads", "must be > 0"));
@@ -603,9 +648,13 @@ pub(super) fn attention_incremental_from_projected(
         }
     }
 
-    linear(kernels, &context, 1, state, out_w, state, Some(out_b))
+    Ok(context)
 }
 
+/// Host-resident `linear`. Kept as the parity oracle for `linear_d` and
+/// exercised by the legacy attention helpers below; not on the GW.4-2B
+/// device-resident forward path.
+#[allow(dead_code)]
 pub(super) fn linear(
     kernels: &dyn KernelBackend,
     x: &[f32],
@@ -711,9 +760,224 @@ pub(super) fn add_positional_embedding(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(super) fn add_inplace(lhs: &mut [f32], rhs: &[f32]) {
     debug_assert_eq!(lhs.len(), rhs.len());
     for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
         *lhs += rhs;
     }
+}
+
+// =====================================================================
+// GW.4-2B device-resident wrappers
+// =====================================================================
+//
+// The wrappers below add the same shape-checking layer that the host
+// `linear` / `layer_norm` / `mlp_gelu` primitives apply, and then hand off
+// to `KernelBackend`'s device-resident `*_d` methods. The encoder/decoder
+// forward paths in `encode.rs` / `decode.rs` call these so every linear,
+// layer norm, residual add, and MLP step stays on the device for the
+// duration of a layer. The only host bounces are at the scalar attention
+// bodies (`attention_body_host`, `attention_incremental_body_host`) and at
+// the final logits readback for sampling. Search for `to_host_owned()` in
+// `decode.rs` / `encode.rs` to grep every bounce point.
+
+/// Device-resident linear projection. Caller-supplied `out` lets the
+/// encoder/decoder pool scratch across layers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn linear_d(
+    kernels: &dyn KernelBackend,
+    x: &DeviceTensor,
+    rows: usize,
+    in_features: usize,
+    weight_out_by_in: &DeviceTensor,
+    out_features: usize,
+    bias: Option<&DeviceTensor>,
+    out: &DeviceTensor,
+) -> Result<()> {
+    let x_expected = checked_len_product("linear.x", &[rows, in_features])?;
+    if x.len() != x_expected {
+        return Err(invalid_request(
+            "linear.x",
+            &format!("expected input length {x_expected}, got {}", x.len()),
+        ));
+    }
+    let weight_expected = checked_len_product("linear.weight", &[out_features, in_features])?;
+    if weight_out_by_in.len() != weight_expected {
+        return Err(invalid_model(
+            "linear.weight",
+            &format!(
+                "expected [out,in] weight length {weight_expected}, got {}",
+                weight_out_by_in.len()
+            ),
+        ));
+    }
+    if let Some(bias) = bias {
+        if bias.len() != out_features {
+            return Err(invalid_model(
+                "linear.bias",
+                &format!("expected bias length {out_features}, got {}", bias.len()),
+            ));
+        }
+    }
+    let out_expected = checked_len_product("linear.out", &[rows, out_features])?;
+    if out.len() != out_expected {
+        return Err(invalid_request(
+            "linear.out",
+            &format!("expected output length {out_expected}, got {}", out.len()),
+        ));
+    }
+
+    kernels.linear_d(
+        x,
+        rows,
+        in_features,
+        weight_out_by_in,
+        out_features,
+        bias,
+        out,
+    )
+}
+
+/// Device-resident LayerNorm with caller-supplied output.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn layer_norm_d(
+    kernels: &dyn KernelBackend,
+    x: &DeviceTensor,
+    rows: usize,
+    cols: usize,
+    weight: &DeviceTensor,
+    bias: &DeviceTensor,
+    eps: f32,
+    out: &DeviceTensor,
+) -> Result<()> {
+    let expected = checked_len_product("layer_norm.x", &[rows, cols])?;
+    if x.len() != expected {
+        return Err(invalid_request(
+            "layer_norm.x",
+            &format!("expected input length {expected}, got {}", x.len()),
+        ));
+    }
+    if weight.len() != cols {
+        return Err(invalid_model(
+            "layer_norm.weight",
+            &format!("expected weight length {cols}, got {}", weight.len()),
+        ));
+    }
+    if bias.len() != cols {
+        return Err(invalid_model(
+            "layer_norm.bias",
+            &format!("expected bias length {cols}, got {}", bias.len()),
+        ));
+    }
+    if out.len() != expected {
+        return Err(invalid_request(
+            "layer_norm.out",
+            &format!("expected output length {expected}, got {}", out.len()),
+        ));
+    }
+    kernels.layer_norm_d(x, rows, cols, weight, bias, eps, out)
+}
+
+/// Device-resident `lhs += rhs`. Lengths must match.
+pub(super) fn add_inplace_d(
+    kernels: &dyn KernelBackend,
+    lhs: &DeviceTensor,
+    rhs: &DeviceTensor,
+) -> Result<()> {
+    if lhs.len() != rhs.len() {
+        return Err(invalid_request(
+            "add_inplace.rhs",
+            &format!(
+                "length mismatch: lhs={} rhs={}",
+                lhs.len(),
+                rhs.len()
+            ),
+        ));
+    }
+    kernels.add_inplace_d(lhs, rhs)
+}
+
+/// Device-resident elementwise GELU.
+pub(super) fn gelu_inplace_d(kernels: &dyn KernelBackend, x: &DeviceTensor) -> Result<()> {
+    kernels.gelu_inplace_d(x)
+}
+
+/// Device-resident positional-embedding add. `pe` is the full positional
+/// table; `start_pos` is the offset into that table. `pe_rows` must equal
+/// the table height so the kernel can bounds-check.
+///
+/// Reserved for the GW.4-2.5+ encoder/decoder migration that moves
+/// embedding gather and positional add onto the device. GW.4-2B keeps both
+/// on host (cold path, one-shot per 30 s window) and uploads the post-add
+/// activation in a single pass.
+#[allow(dead_code)]
+pub(super) fn add_positional_embedding_d(
+    kernels: &dyn KernelBackend,
+    x: &DeviceTensor,
+    rows: usize,
+    cols: usize,
+    pe: &DeviceTensor,
+    pe_rows: usize,
+    start_pos: usize,
+) -> Result<()> {
+    if rows > pe_rows {
+        return Err(invalid_request(
+            "positional_embedding",
+            &format!("rows {rows} exceeds max rows {pe_rows}"),
+        ));
+    }
+    let expected_pe = checked_len_product("positional_embedding", &[pe_rows, cols])?;
+    if pe.len() != expected_pe {
+        return Err(invalid_model(
+            "positional_embedding",
+            &format!(
+                "expected positional embedding length {expected_pe}, got {}",
+                pe.len()
+            ),
+        ));
+    }
+    kernels.add_positional_embedding_d(x, rows, cols, pe, pe_rows, start_pos)
+}
+
+/// Device-resident `mlp_gelu`: `linear_d → gelu_inplace_d → linear_d`.
+/// `hidden_act` is a caller-supplied scratch of length `rows * ffn`; `out`
+/// is the `rows * hidden` projection back to model width. Both are reused
+/// across encoder / decoder layers to keep scratch allocation off the hot
+/// path.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mlp_gelu_d(
+    kernels: &dyn KernelBackend,
+    x: &DeviceTensor,
+    rows: usize,
+    hidden: usize,
+    ffn: usize,
+    fc1_w: &DeviceTensor,
+    fc1_b: &DeviceTensor,
+    fc2_w: &DeviceTensor,
+    fc2_b: &DeviceTensor,
+    hidden_act: &DeviceTensor,
+    out: &DeviceTensor,
+) -> Result<()> {
+    linear_d(
+        kernels,
+        x,
+        rows,
+        hidden,
+        fc1_w,
+        ffn,
+        Some(fc1_b),
+        hidden_act,
+    )?;
+    gelu_inplace_d(kernels, hidden_act)?;
+    linear_d(
+        kernels,
+        hidden_act,
+        rows,
+        ffn,
+        fc2_w,
+        hidden,
+        Some(fc2_b),
+        out,
+    )
 }
