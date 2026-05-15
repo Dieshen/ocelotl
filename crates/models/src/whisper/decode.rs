@@ -21,10 +21,13 @@
 //!
 //! GW.4-5B: self-attention bodies (causal full-context and incremental
 //! single-token) are now device-resident via `attention_decoder_causal_d`
-//! and `attention_decoder_incremental_d`. Cross-attention stays on host
-//! (its K/V are already device-resident but the dot-product math is still
-//! a host bounce; that is a separate follow-up). Search `to_host_owned()`
-//! in this file to grep every remaining host bounce.
+//! and `attention_decoder_incremental_d`.
+//!
+//! GW.4-5C: cross-attention is now device-resident via
+//! `attention_decoder_cross_d`. Q, K, and V all remain on device through
+//! the attention body and the out projection. Search `to_host_owned()` in
+//! this file to grep every remaining host bounce (KV cache readbacks and
+//! final logits only).
 
 use ocelotl_core::{Result, TokenId};
 
@@ -34,13 +37,8 @@ use super::model::{
     validate_decoder_tokens, validate_encoded_audio, validate_forward_request,
 };
 use super::primitives::{
-    add_inplace_d,
-    attention_body_host, // still used for cross-attention (non-causal)
-    attention_decoder_causal_d,
-    attention_decoder_incremental_d,
-    layer_norm_d,
-    linear_d,
-    mlp_gelu_d,
+    add_inplace_d, attention_decoder_causal_d, attention_decoder_cross_d,
+    attention_decoder_incremental_d, layer_norm_d, linear_d, mlp_gelu_d,
 };
 use super::state::{WhisperDecoderState, WhisperEncodedAudio, WhisperSelfAttentionCache};
 
@@ -259,38 +257,38 @@ fn decode_tokens_with_self_attention_cache(
             Some(cross_q_b),
             &cross_q_d,
         )?;
-        // Host bounce: read the cross-Q back and the cross-K/V from the
-        // device cache, run scalar cross-attention (non-causal), upload the
-        // result for the on-device out projection.
+        // GW.4-5C: device-resident cross-attention. Q is already on device
+        // in cross_q_d. K/V come from the precomputed encoder cache in
+        // WhisperEncodedAudio::cross_attention — also device-resident (GW.4-2B).
+        // No causal mask; all audio_seq encoder positions are visible.
         let cross_cache = &audio.cross_attention[layer];
-        let cross_q_host = cross_q_d.to_host_owned()?;
-        let cross_k_host = cross_cache.key.to_host_owned()?;
-        let cross_v_host = cross_cache.value.to_host_owned()?;
-        let cross_ctx_host = attention_body_host(
+        let head_dim_cross = text_state / heads;
+        let scale_cross = 1.0_f32 / (head_dim_cross as f32).sqrt();
+        attention_decoder_cross_d(
             kernels,
-            &cross_q_host,
+            &cross_q_d,
+            &cross_cache.key,
+            &cross_cache.value,
             seq,
-            &cross_k_host,
-            &cross_v_host,
             audio_seq,
-            text_state,
             heads,
-            false,
+            head_dim_cross,
+            scale_cross,
+            &cross_out_d,
         )?;
-        cross_q_d.write_from_host_slice(&cross_ctx_host)?;
         let cross_out_w = model.device_weight(&format!("{prefix}.cross_attn.out.weight"))?;
         let cross_out_b = model.device_weight(&format!("{prefix}.cross_attn.out.bias"))?;
         linear_d(
             kernels,
-            &cross_q_d,
+            &cross_out_d,
             seq,
             text_state,
             cross_out_w,
             text_state,
             Some(cross_out_b),
-            &cross_out_d,
+            &cross_q_d,
         )?;
-        add_inplace_d(kernels, &x_d, &cross_out_d)?;
+        add_inplace_d(kernels, &x_d, &cross_q_d)?;
 
         let mlp_ln_w = model.device_weight(&format!("{prefix}.mlp_ln.weight"))?;
         let mlp_ln_b = model.device_weight(&format!("{prefix}.mlp_ln.bias"))?;
@@ -498,40 +496,40 @@ fn decode_appended_token(
             Some(cross_q_b),
             &cross_q_d,
         )?;
-        // Host bounce: read cross-Q + device-resident cross-K/V cache, run
-        // scalar cross-attention. The cross cache being device-resident is
-        // the GW.4-2B headline win — it's still bounced here because the
-        // attention body itself is host, but the upload-once / read-many
-        // shape collapses the per-token re-projection cost.
+        // GW.4-5C: device-resident cross-attention for the single-token
+        // incremental path. Q is in cross_q_d (seq=1). K/V are the
+        // precomputed per-layer encoder cache in WhisperEncodedAudio —
+        // already device-resident from GW.4-2B. No causal mask; all
+        // audio.frames() encoder positions are visible.
         let cross_cache = &audio.cross_attention[layer];
-        let cross_q_host = cross_q_d.to_host_owned()?;
-        let cross_k_host = cross_cache.key.to_host_owned()?;
-        let cross_v_host = cross_cache.value.to_host_owned()?;
-        let cross_ctx_host = attention_body_host(
+        let head_dim_cross = text_state / heads;
+        let scale_cross = 1.0_f32 / (head_dim_cross as f32).sqrt();
+        let audio_frames = audio.frames();
+        attention_decoder_cross_d(
             kernels,
-            &cross_q_host,
+            &cross_q_d,
+            &cross_cache.key,
+            &cross_cache.value,
             1,
-            &cross_k_host,
-            &cross_v_host,
-            audio.frames(),
-            text_state,
+            audio_frames,
             heads,
-            false,
+            head_dim_cross,
+            scale_cross,
+            &cross_out_d,
         )?;
-        cross_q_d.write_from_host_slice(&cross_ctx_host)?;
         let cross_out_w = model.device_weight(&format!("{prefix}.cross_attn.out.weight"))?;
         let cross_out_b = model.device_weight(&format!("{prefix}.cross_attn.out.bias"))?;
         linear_d(
             kernels,
-            &cross_q_d,
+            &cross_out_d,
             1,
             text_state,
             cross_out_w,
             text_state,
             Some(cross_out_b),
-            &cross_out_d,
+            &cross_q_d,
         )?;
-        add_inplace_d(kernels, &x_d, &cross_out_d)?;
+        add_inplace_d(kernels, &x_d, &cross_q_d)?;
 
         let mlp_ln_w = model.device_weight(&format!("{prefix}.mlp_ln.weight"))?;
         let mlp_ln_b = model.device_weight(&format!("{prefix}.mlp_ln.bias"))?;

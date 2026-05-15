@@ -1038,6 +1038,60 @@ pub(super) fn attention_decoder_incremental_d(
     )
 }
 
+/// Device-resident decoder cross-attention (encoder-decoder attention).
+///
+/// Q: `[q_seq, state]` from decoder hidden state. K/V: `[kv_seq, state]`
+/// from precomputed encoder output (`WhisperEncodedAudio::cross_attention`).
+/// No causal mask — every decoder query row attends all `kv_seq` encoder
+/// positions freely. `output`: `[q_seq, state]`.
+///
+/// `q_seq` may be 1 (incremental append path) or > 1 (full-context path).
+/// `kv_seq` is the number of encoder frames for this audio window.
+///
+/// GW.4-5C: replaces the `attention_body_host(causal=false)` host bounce
+/// in both `decode_tokens_with_self_attention_cache` and
+/// `decode_appended_token`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attention_decoder_cross_d(
+    kernels: &dyn KernelBackend,
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    v: &DeviceTensor,
+    q_seq: usize,
+    kv_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    output: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(invalid_model("attention.heads", "must be > 0"));
+    }
+    if head_dim == 0 {
+        return Err(invalid_model("attention.head_dim", "must be > 0"));
+    }
+    let state = checked_len_product("attention.state", &[n_head, head_dim])?;
+    let q_expected = checked_len_product("attention.q", &[q_seq, state])?;
+    for (label, len) in [("attention.q", q.len()), ("attention.out", output.len())] {
+        if len != q_expected {
+            return Err(invalid_request(
+                label,
+                &format!("expected length {q_expected}, got {len}"),
+            ));
+        }
+    }
+    let kv_expected = checked_len_product("attention.kv", &[kv_seq, state])?;
+    for (label, len) in [("attention.k", k.len()), ("attention.v", v.len())] {
+        if len != kv_expected {
+            return Err(invalid_request(
+                label,
+                &format!("expected length {kv_expected}, got {len}"),
+            ));
+        }
+    }
+    kernels.attention_decoder_cross_d(q, k, v, q_seq, kv_seq, n_head, head_dim, scale, output)
+}
+
 /// Device-resident Whisper encoder self-attention. Encoder-only: no
 /// causal mask, no GQA, all of `q`/`k`/`v` are `[seq, state]` row-major
 /// where `state == n_head * head_dim`. Computes the same math as
