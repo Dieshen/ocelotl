@@ -295,9 +295,7 @@ impl KernelBackend for CubeClKernelBackend {
     fn add_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
         #[cfg(feature = "cubecl-wgpu")]
         {
-            if let (Some(lhs_buf), Some(rhs_buf)) =
-                (extract_wgpu_buf(lhs), extract_wgpu_buf(rhs))
-            {
+            if let (Some(lhs_buf), Some(rhs_buf)) = (extract_wgpu_buf(lhs), extract_wgpu_buf(rhs)) {
                 return run_add_inplace_d_wgpu(lhs_buf, rhs_buf);
             }
         }
@@ -368,7 +366,13 @@ impl KernelBackend for CubeClKernelBackend {
         let b_host = bias.to_host_owned()?;
         let mut out_buf = vec![0.0_f32; rows * hidden];
         crate::layer_norm_whisper_scalar(
-            &x_host, rows, hidden, &w_host, &b_host, eps, &mut out_buf,
+            &x_host,
+            rows,
+            hidden,
+            &w_host,
+            &b_host,
+            eps,
+            &mut out_buf,
         );
         out.write_from_host_slice(&out_buf)
     }
@@ -416,7 +420,14 @@ impl KernelBackend for CubeClKernelBackend {
         let v_host = v.to_host_owned()?;
         let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
         crate::attention_encoder_scalar(
-            &q_host, &k_host, &v_host, seq, n_head, head_dim, scale, &mut out_buf,
+            &q_host,
+            &k_host,
+            &v_host,
+            seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
         );
         output.write_from_host_slice(&out_buf)
     }
@@ -433,15 +444,11 @@ impl KernelBackend for CubeClKernelBackend {
         pe_rows: usize,
         start_pos: usize,
     ) -> Result<()> {
-        crate::validate_add_positional_embedding_shapes(
-            x, rows, cols, pe, pe_rows, start_pos,
-        )?;
+        crate::validate_add_positional_embedding_shapes(x, rows, cols, pe, pe_rows, start_pos)?;
         #[cfg(feature = "cubecl-wgpu")]
         {
             if let (Some(x_buf), Some(pe_buf)) = (extract_wgpu_buf(x), extract_wgpu_buf(pe)) {
-                return run_add_positional_embedding_d_wgpu(
-                    x_buf, rows, cols, pe_buf, start_pos,
-                );
+                return run_add_positional_embedding_d_wgpu(x_buf, rows, cols, pe_buf, start_pos);
             }
         }
         let mut x_host = x.to_host_owned()?;
@@ -454,6 +461,127 @@ impl KernelBackend for CubeClKernelBackend {
             }
         }
         x.write_from_host_slice(&x_host)
+    }
+
+    /// Device-resident decoder causal self-attention (full-context). When
+    /// every operand is a `WgpuDeviceBuffer`, launch the fused cube kernel.
+    /// Falls back to the trait default (readback → scalar → writeback) when
+    /// the adapter is unavailable or any operand is not on the WGPU runtime.
+    ///
+    /// GW.4-5B: lifts the full-context causal decode path onto device so
+    /// the host bounce at `attention_body_host(causal=true)` in
+    /// `decode_tokens_with_self_attention_cache` can be removed.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_causal_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        crate::validate_attention_decoder_causal_shapes(q, k, v, seq, n_head, head_dim, output)?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(k),
+                extract_wgpu_buf(v),
+                extract_wgpu_buf(output),
+            ) {
+                return run_attention_decoder_causal_d_wgpu(
+                    q_buf, k_buf, v_buf, seq, n_head, head_dim, scale, out_buf,
+                );
+            }
+        }
+        // Default: readback + scalar causal decoder attention + writeback.
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; seq * n_head * head_dim];
+        crate::attention_decoder_causal_scalar(
+            &q_host,
+            &k_host,
+            &v_host,
+            seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
+
+    /// Device-resident incremental decoder self-attention (single token).
+    /// When every operand is a `WgpuDeviceBuffer`, launch the fused cube
+    /// kernel. Falls back to the trait default otherwise.
+    ///
+    /// GW.4-5B: lifts the single-token incremental path onto device so the
+    /// host bounce at `attention_incremental_body_host` in
+    /// `decode_appended_token` can be removed.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_d(
+        &self,
+        q: &DeviceTensor,
+        past_k: &DeviceTensor,
+        past_v: &DeviceTensor,
+        new_k: &DeviceTensor,
+        new_v: &DeviceTensor,
+        past_seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        crate::validate_attention_decoder_incremental_shapes(
+            q, past_k, past_v, new_k, new_v, past_seq, n_head, head_dim, output,
+        )?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (
+                Some(q_buf),
+                Some(pk_buf),
+                Some(pv_buf),
+                Some(nk_buf),
+                Some(nv_buf),
+                Some(out_buf),
+            ) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(past_k),
+                extract_wgpu_buf(past_v),
+                extract_wgpu_buf(new_k),
+                extract_wgpu_buf(new_v),
+                extract_wgpu_buf(output),
+            ) {
+                return run_attention_decoder_incremental_d_wgpu(
+                    q_buf, pk_buf, pv_buf, nk_buf, nv_buf, past_seq, n_head, head_dim, scale,
+                    out_buf,
+                );
+            }
+        }
+        // Default: readback + scalar incremental attention + writeback.
+        let q_host = q.to_host_owned()?;
+        let past_k_host = past_k.to_host_owned()?;
+        let past_v_host = past_v.to_host_owned()?;
+        let new_k_host = new_k.to_host_owned()?;
+        let new_v_host = new_v.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; n_head * head_dim];
+        crate::attention_decoder_incremental_scalar(
+            &q_host,
+            &past_k_host,
+            &past_v_host,
+            &new_k_host,
+            &new_v_host,
+            past_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
     }
 }
 
@@ -795,9 +923,9 @@ fn run_add_positional_embedding_d_wgpu(
             x.len_f32()
         )));
     }
-    let offset_elems = start_pos
-        .checked_mul(cols)
-        .ok_or_else(|| cubecl_wgpu_err("add_positional_embedding_d start_pos*cols overflowed usize"))?;
+    let offset_elems = start_pos.checked_mul(cols).ok_or_else(|| {
+        cubecl_wgpu_err("add_positional_embedding_d start_pos*cols overflowed usize")
+    })?;
     if offset_elems + len > pe.len_f32() {
         return Err(cubecl_wgpu_err(format!(
             "add_positional_embedding_d pe window {}..{} exceeds pe len {}",
@@ -1043,8 +1171,346 @@ fn run_attention_encoder_d_wgpu(
         );
     }
 
-    *out
-        .handle
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GW.4-5B: fused decoder self-attention kernels.
+//
+// Two kernels to match the two host paths in decode.rs:
+//
+//   1. `attention_decoder_causal_f32`: full-context causal self-attention.
+//      Maps one thread per `(query_row, head)`. Row `qi` attends keys
+//      `0..=qi`. Layout: `[seq, state]` row-major, same as encoder.
+//      Scores live in shared memory (same slab strategy as encoder).
+//
+//   2. `attention_decoder_incremental_f32`: single-token incremental.
+//      Maps one thread per head. Q is `[state]`, K/V comes from
+//      `concat(past_k, new_k)` of length `visible = past_seq + 1`.
+//      Because `visible` is not comptime, scores are stored in a
+//      caller-supplied scratch `Array<f32>` of length `n_head * visible`,
+//      with each thread's row at `head * visible`.
+// ---------------------------------------------------------------------------
+
+/// Fused causal decoder self-attention. One thread per `(query_row, head)`.
+///
+/// Layout: `q`, `k`, `v`, `output` are `[seq, state]` row-major,
+/// `state == n_head * head_dim`. Row `qi` attends keys `0..=qi` only.
+///
+/// Shared memory slab: `wg_size * seq` floats, one row per intra-workgroup
+/// thread — same design as the encoder kernel.
+#[cube(launch_unchecked)]
+fn attention_decoder_causal_f32(
+    q: &Array<f32>,
+    k: &Array<f32>,
+    v: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] seq: usize,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    #[comptime] wg_size: usize,
+    scale: f32,
+) {
+    #[allow(clippy::unnecessary_cast)]
+    let pos = ABSOLUTE_POS as usize;
+    let total = seq * n_head;
+    if pos >= total {
+        terminate!();
+    }
+
+    let query_row = pos / n_head;
+    let head = pos - query_row * n_head;
+    let state = n_head * head_dim;
+    // Row `query_row` may attend keys `0..=query_row` (causal mask).
+    let visible = query_row + 1;
+
+    // Shared-memory slab: same shape as encoder kernel.
+    let mut scores = SharedMemory::<f32>::new(wg_size * seq);
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let lane_base = lane * seq;
+
+    let q_base = query_row * state + head * head_dim;
+
+    // Pass 1: scaled dot products for the causally-visible keys only.
+    // Uninitialised slots beyond `visible` are never read by the softmax or
+    // accumulation passes, so we leave them as allocated (zero-init is not
+    // guaranteed by CubeCL shared memory, but we never read past `visible`).
+    let mut row_max = f32::new(0.0);
+    for j in 0..seq {
+        if j < visible {
+            let k_base = j * state + head * head_dim;
+            let mut acc = f32::new(0.0);
+            for d in 0..head_dim {
+                acc += q[q_base + d] * k[k_base + d];
+            }
+            let scaled = acc * scale;
+            scores[lane_base + j] = scaled;
+            if j == 0 || scaled > row_max {
+                row_max = scaled;
+            }
+        }
+    }
+
+    // Pass 2: numerically stable softmax over the `visible` scores.
+    let mut denom = f32::new(0.0);
+    for j in 0..seq {
+        if j < visible {
+            let e = f32::exp(scores[lane_base + j] - row_max);
+            scores[lane_base + j] = e;
+            denom += e;
+        }
+    }
+    let inv_denom = f32::new(1.0) / denom;
+    for j in 0..seq {
+        if j < visible {
+            scores[lane_base + j] = scores[lane_base + j] * inv_denom;
+        }
+    }
+
+    // Pass 3: probability-weighted accumulation of V (visible tokens only).
+    let out_base = query_row * state + head * head_dim;
+    for d in 0..head_dim {
+        let mut ctx = f32::new(0.0);
+        for j in 0..seq {
+            if j < visible {
+                let v_base = j * state + head * head_dim;
+                ctx += scores[lane_base + j] * v[v_base + d];
+            }
+        }
+        output[out_base + d] = ctx;
+    }
+}
+
+/// Launch helper for the fused decoder causal self-attention kernel.
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_decoder_causal_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    k: &WgpuDeviceBuffer,
+    v: &WgpuDeviceBuffer,
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        cubecl_wgpu_err("attention_decoder_causal_d n_head*head_dim overflowed usize")
+    })?;
+    let expected = seq
+        .checked_mul(state)
+        .ok_or_else(|| cubecl_wgpu_err("attention_decoder_causal_d seq*state overflowed usize"))?;
+    for (label, len) in [
+        ("q", q.len_f32()),
+        ("k", k.len_f32()),
+        ("v", v.len_f32()),
+        ("out", out.len_f32()),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_decoder_causal_d {label} len {len} != seq*state {expected}"
+            )));
+        }
+    }
+
+    let total = u32::try_from(seq * n_head).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_decoder_causal_d thread count {} exceeds CubeCL u32 launch limit",
+            seq * n_head
+        ))
+    })?;
+    // Reuse the same workgroup size as the encoder kernel.
+    let workgroup_count = total.div_ceil(ENC_ATTN_WG).max(1);
+
+    let client = q.client();
+    let out_handle = client.empty(expected * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_decoder_causal_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(ENC_ATTN_WG),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(k.clone_handle(), k.len_f32()),
+            ArrayArg::from_raw_parts(v.clone_handle(), v.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), expected),
+            seq,
+            n_head,
+            head_dim,
+            ENC_ATTN_WG as usize,
+            scale,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+/// Fused incremental decoder self-attention (single new token).
+///
+/// One thread per head. Q: `[state]`, past_kv: `[past_seq, state]`,
+/// new_kv: `[state]`. `visible = past_seq + 1`. `scores`: caller-supplied
+/// scratch of length `n_head * visible` — each thread at head `h` owns
+/// row `h * visible`. Output: `[state]`.
+///
+/// Because `visible` is not comptime, scores cannot live in shared memory
+/// of a fixed comptime size. A caller-supplied global scratch is the
+/// simplest device-side alternative without an extra runtime allocation
+/// inside the kernel.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn attention_decoder_incremental_f32(
+    q: &Array<f32>,
+    past_k: &Array<f32>,
+    past_v: &Array<f32>,
+    new_k: &Array<f32>,
+    new_v: &Array<f32>,
+    scores_scratch: &mut Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    visible: u32,
+    scale: f32,
+) {
+    #[allow(clippy::unnecessary_cast)]
+    let head = ABSOLUTE_POS as usize;
+    if head >= n_head {
+        terminate!();
+    }
+
+    let state = n_head * head_dim;
+    let visible_us = visible as usize;
+    let past_seq = visible_us - 1;
+    let q_base = head * head_dim;
+    let scores_base = head * visible_us;
+
+    // Pass 1: scaled dot products over concat(past_k, new_k).
+    for ki in 0..visible_us {
+        let mut acc = f32::new(0.0);
+        for d in 0..head_dim {
+            let key = if ki < past_seq {
+                past_k[ki * state + head * head_dim + d]
+            } else {
+                new_k[head * head_dim + d]
+            };
+            acc += q[q_base + d] * key;
+        }
+        scores_scratch[scores_base + ki] = acc * scale;
+    }
+
+    // Pass 2: numerically stable softmax over scores_scratch[scores_base..scores_base+visible].
+    let mut row_max = scores_scratch[scores_base];
+    for ki in 1..visible_us {
+        if scores_scratch[scores_base + ki] > row_max {
+            row_max = scores_scratch[scores_base + ki];
+        }
+    }
+    let mut denom = f32::new(0.0);
+    for ki in 0..visible_us {
+        let e = f32::exp(scores_scratch[scores_base + ki] - row_max);
+        scores_scratch[scores_base + ki] = e;
+        denom += e;
+    }
+    let inv_denom = f32::new(1.0) / denom;
+    for ki in 0..visible_us {
+        scores_scratch[scores_base + ki] = scores_scratch[scores_base + ki] * inv_denom;
+    }
+
+    // Pass 3: P · V accumulation.
+    let out_base = head * head_dim;
+    for d in 0..head_dim {
+        let mut acc = f32::new(0.0);
+        for ki in 0..visible_us {
+            let value = if ki < past_seq {
+                past_v[ki * state + head * head_dim + d]
+            } else {
+                new_v[head * head_dim + d]
+            };
+            acc += scores_scratch[scores_base + ki] * value;
+        }
+        output[out_base + d] = acc;
+    }
+}
+
+/// Launch helper for the fused incremental decoder self-attention kernel.
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_decoder_incremental_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    past_k: &WgpuDeviceBuffer,
+    past_v: &WgpuDeviceBuffer,
+    new_k: &WgpuDeviceBuffer,
+    new_v: &WgpuDeviceBuffer,
+    past_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        cubecl_wgpu_err("attention_decoder_incremental_d n_head*head_dim overflowed usize")
+    })?;
+    let visible = past_seq + 1;
+
+    // Validate operand lengths.
+    for (label, len, expected) in [
+        ("q", q.len_f32(), state),
+        ("new_k", new_k.len_f32(), state),
+        ("new_v", new_v.len_f32(), state),
+        ("out", out.len_f32(), state),
+        ("past_k", past_k.len_f32(), past_seq * state),
+        ("past_v", past_v.len_f32(), past_seq * state),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_decoder_incremental_d {label} len {len} != expected {expected}"
+            )));
+        }
+    }
+
+    let visible_u32 = u32::try_from(visible).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_decoder_incremental_d visible {} exceeds u32",
+            visible
+        ))
+    })?;
+    let n_head_u32 = u32::try_from(n_head).map_err(|_| {
+        cubecl_wgpu_err("attention_decoder_incremental_d n_head exceeds u32".to_string())
+    })?;
+
+    let client = q.client();
+    // Scores scratch: n_head * visible floats, zeroed so uninitialised reads
+    // in the boundary case (past_seq == 0, visible == 1) are 0.0.
+    let scores_len = n_head * visible;
+    let scores_handle = client.empty(scores_len * std::mem::size_of::<f32>());
+    let out_handle = client.empty(state * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_decoder_incremental_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(n_head_u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(past_k.clone_handle(), past_k.len_f32().max(1)),
+            ArrayArg::from_raw_parts(past_v.clone_handle(), past_v.len_f32().max(1)),
+            ArrayArg::from_raw_parts(new_k.clone_handle(), new_k.len_f32()),
+            ArrayArg::from_raw_parts(new_v.clone_handle(), new_v.len_f32()),
+            ArrayArg::from_raw_parts(scores_handle.clone(), scores_len),
+            ArrayArg::from_raw_parts(out_handle.clone(), state),
+            n_head,
+            head_dim,
+            visible_u32,
+            scale,
+        );
+    }
+
+    *out.handle
         .lock()
         .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
     Ok(())
@@ -1367,9 +1833,8 @@ fn prepare_linear_launch(
             "out_features {out_features} exceeds CubeCL u32 launch limit"
         ))
     })?;
-    u32::try_from(rows).map_err(|_| {
-        cubecl_err(format!("rows {rows} exceeds CubeCL u32 launch limit"))
-    })?;
+    u32::try_from(rows)
+        .map_err(|_| cubecl_err(format!("rows {rows} exceeds CubeCL u32 launch limit")))?;
     let total_cells = u32::try_from(rows * out_features).map_err(|_| {
         cubecl_err(format!(
             "linear_out_by_in cell count {} exceeds CubeCL u32 launch limit",
@@ -1382,8 +1847,7 @@ fn prepare_linear_launch(
         ));
     }
 
-    let cube_count_x =
-        (out_features as u32).div_ceil(LINEAR_TILE_N as u32).max(1);
+    let cube_count_x = (out_features as u32).div_ceil(LINEAR_TILE_N as u32).max(1);
     let cube_count_y = (rows as u32).div_ceil(LINEAR_TILE_M as u32).max(1);
     Ok((cube_count_x, cube_count_y))
 }
@@ -1411,8 +1875,7 @@ fn launch_linear_out_by_in_kernel<R: Runtime>(
     in_features: usize,
     out_features: usize,
 ) -> Result<()> {
-    let (cube_count_x, cube_count_y) =
-        prepare_linear_launch(rows, in_features, out_features)?;
+    let (cube_count_x, cube_count_y) = prepare_linear_launch(rows, in_features, out_features)?;
 
     unsafe {
         linear_out_by_in_tiled_f32::launch_unchecked::<R>(
@@ -1838,27 +2301,27 @@ mod tests {
 
         let mut scalar = vec![0.0_f32; rows * out_features];
         CpuKernelBackend::scalar()
-            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut scalar)
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut scalar,
+            )
             .expect("scalar linear_out_by_in must succeed");
 
         let mut gpu = vec![0.0_f32; rows * out_features];
-        if let Err(err) = linear_out_by_in_wgpu(
-            &x,
-            rows,
-            in_features,
-            &w,
-            out_features,
-            Some(&b),
-            &mut gpu,
-        ) {
+        if let Err(err) =
+            linear_out_by_in_wgpu(&x, rows, in_features, &w, out_features, Some(&b), &mut gpu)
+        {
             // No usable WGPU adapter on this host — skip rather than fail. This
             // mirrors `wgpu_rope_matches_cpu_reference_for_position_one`, which
             // is `#[ignore]` for the same reason but in a coarser way; here we
             // would rather run the test when an adapter is present and skip
             // cleanly when it is not.
-            eprintln!(
-                "skipping wgpu_linear_out_by_in_matches_scalar_within_tolerance: {err:?}"
-            );
+            eprintln!("skipping wgpu_linear_out_by_in_matches_scalar_within_tolerance: {err:?}");
             return;
         }
 
@@ -1898,19 +2361,21 @@ mod tests {
 
         let mut scalar = vec![0.0_f32; rows * out_features];
         CpuKernelBackend::scalar()
-            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut scalar)
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut scalar,
+            )
             .expect("scalar linear_out_by_in must succeed");
 
         let mut gpu = vec![0.0_f32; rows * out_features];
-        if let Err(err) = linear_out_by_in_wgpu(
-            &x,
-            rows,
-            in_features,
-            &w,
-            out_features,
-            Some(&b),
-            &mut gpu,
-        ) {
+        if let Err(err) =
+            linear_out_by_in_wgpu(&x, rows, in_features, &w, out_features, Some(&b), &mut gpu)
+        {
             eprintln!(
                 "skipping wgpu_linear_out_by_in_tiled_aligned_matches_scalar_within_tolerance: {err:?}"
             );
@@ -1946,7 +2411,15 @@ mod tests {
         // Reference: scalar CPU path.
         let mut scalar = vec![0.0_f32; rows * out_features];
         CpuKernelBackend::scalar()
-            .linear_out_by_in(&x, rows, in_features, &w, out_features, Some(&b), &mut scalar)
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut scalar,
+            )
             .expect("scalar linear_out_by_in must succeed");
 
         // Skip cleanly when there's no usable WGPU adapter — same pattern
@@ -1976,9 +2449,7 @@ mod tests {
         let x_d = backend.upload(&x).expect("upload x");
         let w_d = backend.upload(&w).expect("upload weight");
         let b_d = backend.upload(&b).expect("upload bias");
-        let out_d = backend
-            .alloc(rows * out_features)
-            .expect("alloc output");
+        let out_d = backend.alloc(rows * out_features).expect("alloc output");
 
         assert!(matches!(
             x_d.residency(),
@@ -1990,7 +2461,15 @@ mod tests {
         ));
 
         backend
-            .linear_d(&x_d, rows, in_features, &w_d, out_features, Some(&b_d), &out_d)
+            .linear_d(
+                &x_d,
+                rows,
+                in_features,
+                &w_d,
+                out_features,
+                Some(&b_d),
+                &out_d,
+            )
             .expect("device-resident linear_d must succeed");
 
         let gpu = out_d.to_host_owned().expect("readback output");
@@ -2014,15 +2493,7 @@ mod tests {
         // the simplest probe is to ask the legacy slice path to do *any*
         // GPU work — if that errors we know we can't run the round-trip.
         let mut probe = vec![0.0_f32; 1];
-        if let Err(err) = linear_out_by_in_wgpu(
-            &[1.0_f32],
-            1,
-            1,
-            &[1.0_f32],
-            1,
-            None,
-            &mut probe,
-        ) {
+        if let Err(err) = linear_out_by_in_wgpu(&[1.0_f32], 1, 1, &[1.0_f32], 1, None, &mut probe) {
             eprintln!("skipping wgpu_device_buffer_round_trips_through_to_host: {err:?}");
             return;
         }
@@ -2146,9 +2617,7 @@ mod tests {
         let bias: Vec<f32> = (0..hidden).map(|i| (i as f32) * -0.005).collect();
 
         let mut expected = vec![0.0_f32; rows * hidden];
-        crate::layer_norm_whisper_scalar(
-            &x_vec, rows, hidden, &weight, &bias, eps, &mut expected,
-        );
+        crate::layer_norm_whisper_scalar(&x_vec, rows, hidden, &weight, &bias, eps, &mut expected);
 
         let backend = CubeClKernelBackend::new_gpu(0);
         let x_d = backend.upload(&x_vec).expect("upload x");
@@ -2233,6 +2702,250 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // GW.4-5B: fused decoder causal self-attention parity tests.
+    //
+    // Two scenarios match the two host paths in decode.rs:
+    //   1. Full-context causal: Q/K/V all [seq_q, state], row qi sees keys
+    //      0..=qi (the `decode_tokens_with_self_attention_cache` path).
+    //   2. Incremental (single token): Q is [1, state], K/V = concat
+    //      (past_K/past_V, new_k/new_v) (the `decode_appended_token` path).
+    //
+    // CPU oracle: `attention_decoder_causal_scalar` for case 1 and
+    // `attention_decoder_incremental_scalar` for case 2 (both defined below).
+    // Both are the same math as `attention_body_host` / `attention_incremental_body_host`
+    // in `crates/models/src/whisper/primitives.rs`.
+    // -----------------------------------------------------------------------
+
+    /// Scalar reference for causal decoder self-attention.
+    /// Q/K/V: `[seq, state]` row-major, `state == n_head * head_dim`.
+    /// Row `qi` attends keys 0..=qi only. Writes `[seq, state]` into `out`.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_causal_scalar(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) {
+        let state = n_head * head_dim;
+        assert_eq!(q.len(), seq * state);
+        assert_eq!(k.len(), seq * state);
+        assert_eq!(v.len(), seq * state);
+        assert_eq!(out.len(), seq * state);
+        let mut scores = vec![0.0_f32; seq];
+        for qi in 0..seq {
+            let visible = qi + 1; // causal mask
+            for head in 0..n_head {
+                let q_base = qi * state + head * head_dim;
+                for (ki, score) in scores.iter_mut().enumerate().take(visible) {
+                    let k_base = ki * state + head * head_dim;
+                    let mut acc = 0.0_f32;
+                    for d in 0..head_dim {
+                        acc += q[q_base + d] * k[k_base + d];
+                    }
+                    *score = acc * scale;
+                }
+                crate::softmax(&mut scores[..visible]);
+                let out_base = qi * state + head * head_dim;
+                for d in 0..head_dim {
+                    out[out_base + d] = 0.0;
+                }
+                for (ki, &p) in scores.iter().enumerate().take(visible) {
+                    let v_base = ki * state + head * head_dim;
+                    for d in 0..head_dim {
+                        out[out_base + d] += p * v[v_base + d];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scalar reference for incremental decoder self-attention (single token).
+    /// Q: `[state]`, past_k/past_v: `[past_seq, state]`, new_k/new_v: `[state]`.
+    /// Visible = past_seq + 1. Writes `[state]` into `out`.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_scalar(
+        q: &[f32],
+        past_k: &[f32],
+        past_v: &[f32],
+        new_k: &[f32],
+        new_v: &[f32],
+        past_seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) {
+        let state = n_head * head_dim;
+        let visible = past_seq + 1;
+        assert_eq!(q.len(), state);
+        assert_eq!(past_k.len(), past_seq * state);
+        assert_eq!(past_v.len(), past_seq * state);
+        assert_eq!(new_k.len(), state);
+        assert_eq!(new_v.len(), state);
+        assert_eq!(out.len(), state);
+        let mut scores = vec![0.0_f32; visible];
+        for head in 0..n_head {
+            let q_base = head * head_dim;
+            for (ki, score) in scores.iter_mut().enumerate() {
+                let mut acc = 0.0_f32;
+                for d in 0..head_dim {
+                    let key = if ki < past_seq {
+                        past_k[ki * state + head * head_dim + d]
+                    } else {
+                        new_k[head * head_dim + d]
+                    };
+                    acc += q[q_base + d] * key;
+                }
+                *score = acc * scale;
+            }
+            crate::softmax(&mut scores);
+            let out_base = head * head_dim;
+            for d in 0..head_dim {
+                let mut acc = 0.0_f32;
+                for (ki, &p) in scores.iter().enumerate() {
+                    let value = if ki < past_seq {
+                        past_v[ki * state + head * head_dim + d]
+                    } else {
+                        new_v[head * head_dim + d]
+                    };
+                    acc += p * value;
+                }
+                out[out_base + d] = acc;
+            }
+        }
+    }
+
+    /// GW.4-5B GPU parity gate: the fused decoder causal self-attention
+    /// kernel must match `attention_decoder_causal_scalar` within `1e-4`
+    /// rel/abs. Shape (seq=6, n_head=2, head_dim=4) exercises the causal
+    /// mask across multiple heads and the softmax stability path.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_decoder_causal_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_decoder_causal_d_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let seq = 6usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; seq * state];
+        attention_decoder_causal_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut expected);
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_decoder_causal_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("device attention_decoder_causal_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU causal decoder attention drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    /// GW.4-5B GPU parity gate: the fused decoder incremental (single-token)
+    /// attention kernel must match `attention_decoder_incremental_scalar` within
+    /// `1e-4` rel/abs. Exercises past_seq=4 so the concat(past, new) boundary
+    /// is not at position 0.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_decoder_incremental_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_decoder_incremental_d_matches_scalar_within_tolerance: no adapter"
+            );
+            return;
+        }
+
+        let past_seq = 4usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let past_k: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let past_v: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.019).sin())
+            .collect();
+        let new_k: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.027).cos()).collect();
+        let new_v: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.033).sin()).collect();
+
+        let mut expected = vec![0.0_f32; state];
+        attention_decoder_incremental_scalar(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let past_k_d = backend.upload(&past_k).expect("upload past_k");
+        let past_v_d = backend.upload(&past_v).expect("upload past_v");
+        let new_k_d = backend.upload(&new_k).expect("upload new_k");
+        let new_v_d = backend.upload(&new_v).expect("upload new_v");
+        let out_d = backend.alloc(state).expect("alloc out");
+        backend
+            .attention_decoder_incremental_d(
+                &q_d, &past_k_d, &past_v_d, &new_k_d, &new_v_d, past_seq, n_head, head_dim, scale,
+                &out_d,
+            )
+            .expect("device attention_decoder_incremental_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU incremental decoder attention drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
     /// GW.4-5A parity gate: the fused encoder-attention kernel must match
     /// the scalar reference within `1e-4` rel/abs on a small but
     /// non-trivial shape that exercises the head/seq indexing, the
@@ -2256,21 +2969,18 @@ mod tests {
         let state = n_head * head_dim;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
-        let q: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.013).sin()).collect();
-        let k: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.019).cos()).collect();
-        let v: Vec<f32> = (0..seq * state).map(|i| ((i as f32) * 0.023).sin()).collect();
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
 
         let mut expected = vec![0.0_f32; seq * state];
-        crate::attention_encoder_scalar(
-            &q,
-            &k,
-            &v,
-            seq,
-            n_head,
-            head_dim,
-            scale,
-            &mut expected,
-        );
+        crate::attention_encoder_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut expected);
 
         let backend = CubeClKernelBackend::new_gpu(0);
         let q_d = backend.upload(&q).expect("upload q");

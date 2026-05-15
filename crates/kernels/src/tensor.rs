@@ -354,7 +354,9 @@ mod tests {
     #[test]
     fn write_from_host_slice_rejects_length_mismatch() {
         let t = DeviceTensor::host_zeros(3);
-        let err = t.write_from_host_slice(&[1.0, 2.0]).expect_err("must reject");
+        let err = t
+            .write_from_host_slice(&[1.0, 2.0])
+            .expect_err("must reject");
         assert!(matches!(err, OcelotlError::Kernel(_)));
     }
 
