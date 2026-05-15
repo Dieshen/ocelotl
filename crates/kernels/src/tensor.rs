@@ -58,6 +58,13 @@ pub trait DeviceBuffer: Send + Sync + Debug {
     /// Overwrite the buffer contents from a host slice. `src.len()` must
     /// equal `len_f32()`.
     fn write_from_host(&self, src: &[f32]) -> Result<()>;
+
+    /// Type-erased downcast hatch. GPU backends implement this so that
+    /// in-backend overrides (e.g. `CubeClKernelBackend::linear_d`) can
+    /// recognise their own buffers and run a device-resident launch
+    /// without a host round-trip. The default returns `&self as &dyn Any`
+    /// so the kernels crate doesn't need a `dyn Any` supertrait bound.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[derive(Debug)]
@@ -234,6 +241,17 @@ impl DeviceTensor {
             DeviceTensorInner::View { .. } => Err(tensor_err(
                 "DeviceTensor::write_from_host_slice: views are read-only",
             )),
+        }
+    }
+
+    /// If the backing is a `Device` variant, borrow the underlying
+    /// `DeviceBuffer`. Returns `None` for `Host` and `View` variants.
+    /// Backend overrides use this to recognise their own buffer type via
+    /// `DeviceBuffer::as_any` and skip the host round-trip.
+    pub fn try_as_device_buffer(&self) -> Option<&dyn DeviceBuffer> {
+        match self.inner.as_ref() {
+            DeviceTensorInner::Device { buf } => Some(buf.as_ref()),
+            DeviceTensorInner::Host(_) | DeviceTensorInner::View { .. } => None,
         }
     }
 

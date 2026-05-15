@@ -39,7 +39,9 @@ mod cpu_avx2;
 #[cfg(feature = "cubecl")]
 pub mod cubecl_backend;
 #[cfg(feature = "cubecl-wgpu")]
-pub use cubecl_backend::{linear_out_by_in_wgpu, rope_apply_inplace_wgpu};
+pub use cubecl_backend::{
+    CUBECL_WGPU_BACKEND, WgpuDeviceBuffer, linear_out_by_in_wgpu, rope_apply_inplace_wgpu,
+};
 #[cfg(feature = "cubecl")]
 pub use cubecl_backend::{
     CubeClKernelBackend, linear_out_by_in_cubecl, rope_apply_inplace_cubecl,
