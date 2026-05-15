@@ -450,8 +450,18 @@ pub(super) fn attention_body_host(
                             let ctx_row =
                                 &mut ctx_chunk[local_row * state..(local_row + 1) * state];
                             compute_attention_row_with_scratch(
-                                qi, q, k, v, kv_seq, state, heads, head_dim, scale, causal,
-                                ctx_row, &mut scores,
+                                qi,
+                                q,
+                                k,
+                                v,
+                                kv_seq,
+                                state,
+                                heads,
+                                head_dim,
+                                scale,
+                                causal,
+                                ctx_row,
+                                &mut scores,
                             );
                         }
                     });
@@ -462,7 +472,17 @@ pub(super) fn attention_body_host(
             for qi in 0..q_seq {
                 let ctx_row = &mut context[qi * state..(qi + 1) * state];
                 compute_attention_row_with_scratch(
-                    qi, q, k, v, kv_seq, state, heads, head_dim, scale, causal, ctx_row,
+                    qi,
+                    q,
+                    k,
+                    v,
+                    kv_seq,
+                    state,
+                    heads,
+                    head_dim,
+                    scale,
+                    causal,
+                    ctx_row,
                     &mut scores,
                 );
             }
@@ -549,9 +569,8 @@ pub(super) fn attention_incremental_from_projected(
     out_w: &[f32],
     out_b: &[f32],
 ) -> Result<Vec<f32>> {
-    let context = attention_incremental_body_host(
-        q, new_k, new_v, past_k, past_v, past_seq, state, heads,
-    )?;
+    let context =
+        attention_incremental_body_host(q, new_k, new_v, past_k, past_v, past_seq, state, heads)?;
     linear(kernels, &context, 1, state, out_w, state, Some(out_b))
 }
 
@@ -651,9 +670,11 @@ pub(super) fn attention_incremental_body_host(
     Ok(context)
 }
 
-/// Host-resident `linear`. Kept as the parity oracle for `linear_d` and
-/// exercised by the legacy attention helpers below; not on the GW.4-2B
-/// device-resident forward path.
+/// Host-resident `linear`. Thin wrapper over `linear_d` that lifts host
+/// slices into host-resident `DeviceTensor`s so all validation and compute
+/// go through the single canonical device-resident path. Kept for the
+/// legacy host-only attention helpers used in parity tests; not on the
+/// GW.4-2B production forward path.
 #[allow(dead_code)]
 pub(super) fn linear(
     kernels: &dyn KernelBackend,
@@ -664,44 +685,22 @@ pub(super) fn linear(
     out_features: usize,
     bias: Option<&[f32]>,
 ) -> Result<Vec<f32>> {
-    let x_expected = checked_len_product("linear.x", &[rows, in_features])?;
-    if x.len() != x_expected {
-        return Err(invalid_request(
-            "linear.x",
-            &format!("expected input length {x_expected}, got {}", x.len()),
-        ));
-    }
-    let weight_expected = checked_len_product("linear.weight", &[out_features, in_features])?;
-    if weight_out_by_in.len() != weight_expected {
-        return Err(invalid_model(
-            "linear.weight",
-            &format!(
-                "expected [out,in] weight length {weight_expected}, got {}",
-                weight_out_by_in.len()
-            ),
-        ));
-    }
-    if let Some(bias) = bias {
-        if bias.len() != out_features {
-            return Err(invalid_model(
-                "linear.bias",
-                &format!("expected bias length {out_features}, got {}", bias.len()),
-            ));
-        }
-    }
-
     let out_len = checked_len_product("linear.out", &[rows, out_features])?;
-    let mut out = vec![0.0_f32; out_len];
-    kernels.linear_out_by_in(
-        x,
+    let x_d = DeviceTensor::from_host(x.to_vec());
+    let w_d = DeviceTensor::from_host(weight_out_by_in.to_vec());
+    let b_d = bias.map(|b| DeviceTensor::from_host(b.to_vec()));
+    let out_d = DeviceTensor::host_zeros(out_len);
+    linear_d(
+        kernels,
+        &x_d,
         rows,
         in_features,
-        weight_out_by_in,
+        &w_d,
         out_features,
-        bias,
-        &mut out,
+        b_d.as_ref(),
+        &out_d,
     )?;
-    Ok(out)
+    out_d.to_host_owned()
 }
 
 pub(super) fn gelu_inplace(x: &mut [f32]) {
@@ -888,11 +887,7 @@ pub(super) fn add_inplace_d(
     if lhs.len() != rhs.len() {
         return Err(invalid_request(
             "add_inplace.rhs",
-            &format!(
-                "length mismatch: lhs={} rhs={}",
-                lhs.len(),
-                rhs.len()
-            ),
+            &format!("length mismatch: lhs={} rhs={}", lhs.len(), rhs.len()),
         ));
     }
     kernels.add_inplace_d(lhs, rhs)
@@ -940,6 +935,109 @@ pub(super) fn add_positional_embedding_d(
     kernels.add_positional_embedding_d(x, rows, cols, pe, pe_rows, start_pos)
 }
 
+/// Device-resident decoder causal self-attention (full-context).
+///
+/// `q`, `k`, `v`: `[seq, state]` row-major where `state == n_head * head_dim`.
+/// Row `qi` attends only keys `0..=qi` (causal mask). `output`: `[seq, state]`.
+///
+/// GW.4-5B: replaces the `attention_body_host(causal=true)` host bounce
+/// in `decode_tokens_with_self_attention_cache` so the full-context decode
+/// path stays on device between Q/K/V projections and the out projection.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attention_decoder_causal_d(
+    kernels: &dyn KernelBackend,
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    v: &DeviceTensor,
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    output: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(invalid_model("attention.heads", "must be > 0"));
+    }
+    if head_dim == 0 {
+        return Err(invalid_model("attention.head_dim", "must be > 0"));
+    }
+    let state = checked_len_product("attention.state", &[n_head, head_dim])?;
+    let expected = checked_len_product("attention.q", &[seq, state])?;
+    for (label, len) in [
+        ("attention.q", q.len()),
+        ("attention.k", k.len()),
+        ("attention.v", v.len()),
+        ("attention.out", output.len()),
+    ] {
+        if len != expected {
+            return Err(invalid_request(
+                label,
+                &format!("expected length {expected}, got {len}"),
+            ));
+        }
+    }
+    kernels.attention_decoder_causal_d(q, k, v, seq, n_head, head_dim, scale, output)
+}
+
+/// Device-resident incremental decoder self-attention (single new token).
+///
+/// `q`: `[state]`, `past_k`/`past_v`: `[past_seq, state]`,
+/// `new_k`/`new_v`: `[state]`. Visible = `past_seq + 1`. `output`: `[state]`.
+///
+/// GW.4-5B: replaces the `attention_incremental_body_host` host bounce
+/// in `decode_appended_token` so the single-token incremental path stays
+/// on device.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attention_decoder_incremental_d(
+    kernels: &dyn KernelBackend,
+    q: &DeviceTensor,
+    past_k: &DeviceTensor,
+    past_v: &DeviceTensor,
+    new_k: &DeviceTensor,
+    new_v: &DeviceTensor,
+    past_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    output: &DeviceTensor,
+) -> Result<()> {
+    if n_head == 0 {
+        return Err(invalid_model("attention.heads", "must be > 0"));
+    }
+    if head_dim == 0 {
+        return Err(invalid_model("attention.head_dim", "must be > 0"));
+    }
+    let state = checked_len_product("attention.state", &[n_head, head_dim])?;
+    for (label, len) in [
+        ("attention.q", q.len()),
+        ("attention.new_k", new_k.len()),
+        ("attention.new_v", new_v.len()),
+        ("attention.out", output.len()),
+    ] {
+        if len != state {
+            return Err(invalid_request(
+                label,
+                &format!("expected length {state}, got {len}"),
+            ));
+        }
+    }
+    let past_expected = checked_len_product("attention.past", &[past_seq, state])?;
+    for (label, len) in [
+        ("attention.past_k", past_k.len()),
+        ("attention.past_v", past_v.len()),
+    ] {
+        if len != past_expected {
+            return Err(invalid_request(
+                label,
+                &format!("expected length {past_expected}, got {len}"),
+            ));
+        }
+    }
+    kernels.attention_decoder_incremental_d(
+        q, past_k, past_v, new_k, new_v, past_seq, n_head, head_dim, scale, output,
+    )
+}
+
 /// Device-resident Whisper encoder self-attention. Encoder-only: no
 /// causal mask, no GQA, all of `q`/`k`/`v` are `[seq, state]` row-major
 /// where `state == n_head * head_dim`. Computes the same math as
@@ -947,10 +1045,9 @@ pub(super) fn add_positional_embedding_d(
 /// device — no host bounce between Q/K/V projections and the out
 /// projection.
 ///
-/// Decoder paths (causal self-attention with KV cache, cross-attention)
-/// stay on host for now — their shapes and scratch patterns are different
-/// enough that a fused kernel was deferred until the encoder bottleneck
-/// closes.
+/// GW.4-5B: decoder paths (causal self-attention with KV cache,
+/// cross-attention) now have device-resident analogues via
+/// `attention_decoder_causal_d` and `attention_decoder_incremental_d`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attention_encoder_d(
     kernels: &dyn KernelBackend,

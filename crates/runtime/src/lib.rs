@@ -490,5 +490,4 @@ mod tests {
         }
         assert_eq!(allocator.free_page_count(), 3);
     }
-
 }

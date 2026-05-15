@@ -16,9 +16,15 @@
 //! GW.4-2B: the per-layer linear / layer-norm / MLP / residual-add ops run
 //! over `DeviceTensor` handles via the `*_d` primitives. Token embedding
 //! gather (a host table lookup), the self-attention KV cache append
-//! (`Vec::extend_from_slice` per Stage 2.5 deferral), the scalar attention
-//! bodies, and the final logits readback for sampling remain host events.
-//! Search `to_host_owned()` in this file to grep every host bounce.
+//! (`Vec::extend_from_slice` per Stage 2.5 deferral), and the final logits
+//! readback for sampling remain host events.
+//!
+//! GW.4-5B: self-attention bodies (causal full-context and incremental
+//! single-token) are now device-resident via `attention_decoder_causal_d`
+//! and `attention_decoder_incremental_d`. Cross-attention stays on host
+//! (its K/V are already device-resident but the dot-product math is still
+//! a host bounce; that is a separate follow-up). Search `to_host_owned()`
+//! in this file to grep every remaining host bounce.
 
 use ocelotl_core::{Result, TokenId};
 
@@ -28,7 +34,12 @@ use super::model::{
     validate_decoder_tokens, validate_encoded_audio, validate_forward_request,
 };
 use super::primitives::{
-    add_inplace_d, attention_body_host, attention_incremental_body_host, layer_norm_d, linear_d,
+    add_inplace_d,
+    attention_body_host, // still used for cross-attention (non-causal)
+    attention_decoder_causal_d,
+    attention_decoder_incremental_d,
+    layer_norm_d,
+    linear_d,
     mlp_gelu_d,
 };
 use super::state::{WhisperDecoderState, WhisperEncodedAudio, WhisperSelfAttentionCache};
@@ -168,14 +179,7 @@ fn decode_tokens_with_self_attention_cache(
             &q_proj_d,
         )?;
         linear_d(
-            kernels,
-            &attn_ln_d,
-            seq,
-            text_state,
-            k_w,
-            text_state,
-            None,
-            &k_proj_d,
+            kernels, &attn_ln_d, seq, text_state, k_w, text_state, None, &k_proj_d,
         )?;
         linear_d(
             kernels,
@@ -188,41 +192,48 @@ fn decode_tokens_with_self_attention_cache(
             &v_proj_d,
         )?;
 
-        // Host bounce: read Q/K/V back, run scalar self-attention (causal),
-        // push K/V to the host self-attention cache for later token append.
-        let q_host = q_proj_d.to_host_owned()?;
+        // GW.4-5B: device-resident causal self-attention. Avoids the
+        // host bounce that read Q/K/V back, ran scalar attention, and
+        // re-uploaded the context. K/V are still read back to host to
+        // populate the self-attention cache for later token appends —
+        // that read is the only remaining bounce in this block.
+        let head_dim = text_state / heads;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        // Reuse v_proj_d as the context output scratch (same shape, and
+        // v_proj is not needed after the attention body).
+        attention_decoder_causal_d(
+            kernels,
+            &q_proj_d,
+            &k_proj_d,
+            &v_proj_d,
+            seq,
+            heads,
+            head_dim,
+            scale,
+            &proj_out_d,
+        )?;
+        // Cache K/V on host for later incremental appends.
         let key_host = k_proj_d.to_host_owned()?;
         let value_host = v_proj_d.to_host_owned()?;
-        let context_host = attention_body_host(
-            kernels,
-            &q_host,
-            seq,
-            &key_host,
-            &value_host,
-            seq,
-            text_state,
-            heads,
-            true,
-        )?;
-        // Reuse q_proj scratch for the uploaded context.
-        q_proj_d.write_from_host_slice(&context_host)?;
         let out_w = model.device_weight(&format!("{prefix}.attn.out.weight"))?;
         let out_b = model.device_weight(&format!("{prefix}.attn.out.bias"))?;
         linear_d(
             kernels,
-            &q_proj_d,
+            &proj_out_d,
             seq,
             text_state,
             out_w,
             text_state,
             Some(out_b),
-            &proj_out_d,
+            // Reuse q_proj scratch for the output projection result.
+            &q_proj_d,
         )?;
         self_attention.push(WhisperSelfAttentionCache {
             key: key_host,
             value: value_host,
         });
-        add_inplace_d(kernels, &x_d, &proj_out_d)?;
+        // Out-projection result is in q_proj_d (see linear_d above).
+        add_inplace_d(kernels, &x_d, &q_proj_d)?;
 
         let cross_ln_w = model.device_weight(&format!("{prefix}.cross_attn_ln.weight"))?;
         let cross_ln_b = model.device_weight(&format!("{prefix}.cross_attn_ln.bias"))?;
@@ -402,14 +413,7 @@ fn decode_appended_token(
             &q_proj_d,
         )?;
         linear_d(
-            kernels,
-            &attn_ln_d,
-            1,
-            text_state,
-            k_w,
-            text_state,
-            None,
-            &k_proj_d,
+            kernels, &attn_ln_d, 1, text_state, k_w, text_state, None, &k_proj_d,
         )?;
         linear_d(
             kernels,
@@ -422,41 +426,53 @@ fn decode_appended_token(
             &v_proj_d,
         )?;
 
-        // Host bounce: incremental self-attention reads past K/V from the
-        // host cache plus the new K/V projection, runs scalar attention,
-        // uploads the context for the out projection.
-        let q_host = q_proj_d.to_host_owned()?;
+        // GW.4-5B: device-resident incremental self-attention. Upload the
+        // host-resident past K/V cache, run the incremental kernel on device,
+        // then read back new_k/new_v for the cache append. The cache upload
+        // is the only host-to-device transfer per token per layer; it is
+        // proportional to `past_seq * state` and grows by one row each step.
+        let past_seq = state.tokens.len();
+        let head_dim = text_state / heads;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let cache = &state.self_attention[layer];
+        let past_k_d = kernels.upload(&cache.key)?;
+        let past_v_d = kernels.upload(&cache.value)?;
+        // `k_proj_d` and `v_proj_d` hold the current step's new K/V.
+        // Attention context goes into `proj_out_d` (seq=1, state shape).
+        attention_decoder_incremental_d(
+            kernels,
+            &q_proj_d,
+            &past_k_d,
+            &past_v_d,
+            &k_proj_d,
+            &v_proj_d,
+            past_seq,
+            heads,
+            head_dim,
+            scale,
+            &proj_out_d,
+        )?;
+        // Read the new single-token K/V back to host for the cache append.
         let key_host = k_proj_d.to_host_owned()?;
         let value_host = v_proj_d.to_host_owned()?;
-        let cache = &state.self_attention[layer];
-        let context_host = attention_incremental_body_host(
-            &q_host,
-            &key_host,
-            &value_host,
-            &cache.key,
-            &cache.value,
-            state.tokens.len(),
-            text_state,
-            heads,
-        )?;
-        q_proj_d.write_from_host_slice(&context_host)?;
         let out_w = model.device_weight(&format!("{prefix}.attn.out.weight"))?;
         let out_b = model.device_weight(&format!("{prefix}.attn.out.bias"))?;
         linear_d(
             kernels,
-            &q_proj_d,
+            &proj_out_d,
             1,
             text_state,
             out_w,
             text_state,
             Some(out_b),
-            &proj_out_d,
+            &q_proj_d,
         )?;
         next_self_attention.push(WhisperSelfAttentionCache {
             key: key_host,
             value: value_host,
         });
-        add_inplace_d(kernels, &x_d, &proj_out_d)?;
+        // Out-projection result is in q_proj_d (see linear_d above).
+        add_inplace_d(kernels, &x_d, &q_proj_d)?;
 
         let cross_ln_w = model.device_weight(&format!("{prefix}.cross_attn_ln.weight"))?;
         let cross_ln_b = model.device_weight(&format!("{prefix}.cross_attn_ln.bias"))?;

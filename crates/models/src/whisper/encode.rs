@@ -172,10 +172,7 @@ fn encode_audio(
     let ffn = config.audio_ffn_size;
     let n_head = config.audio_attention_heads;
     if n_head == 0 {
-        return Err(invalid_model(
-            "config.audio_attention_heads",
-            "must be > 0",
-        ));
+        return Err(invalid_model("config.audio_attention_heads", "must be > 0"));
     }
     if state % n_head != 0 {
         return Err(invalid_model(
@@ -231,16 +228,7 @@ fn encode_audio(
             Some(q_b),
             &q_proj_d,
         )?;
-        linear_d(
-            kernels,
-            &attn_ln_d,
-            seq,
-            state,
-            k_w,
-            state,
-            None,
-            &k_proj_d,
-        )?;
+        linear_d(kernels, &attn_ln_d, seq, state, k_w, state, None, &k_proj_d)?;
         linear_d(
             kernels,
             &attn_ln_d,
@@ -346,14 +334,7 @@ fn precompute_cross_attention(
         let value = kernels.alloc(audio_seq * state)?;
         let key_w = model.device_weight(&format!("{prefix}.key.weight"))?;
         linear_d(
-            kernels,
-            encoded_d,
-            audio_seq,
-            state,
-            key_w,
-            state,
-            None,
-            &key,
+            kernels, encoded_d, audio_seq, state, key_w, state, None, &key,
         )?;
         let value_w = model.device_weight(&format!("{prefix}.value.weight"))?;
         let value_b = model.device_weight(&format!("{prefix}.value.bias"))?;

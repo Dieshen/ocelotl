@@ -5,9 +5,9 @@ use std::{
 };
 
 use ocelotl_core::TokenId;
-use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode, KernelBackend};
 #[cfg(feature = "cubecl-wgpu")]
 use ocelotl_kernels::CubeClKernelBackend;
+use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode, KernelBackend};
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 use ocelotl_models::whisper::{
     WhisperAudioEncodeTimings, WhisperConfig, WhisperEncodedAudio, WhisperModel,
@@ -301,9 +301,9 @@ fn build_cubecl_wgpu_backend() -> Result<Arc<dyn KernelBackend>, String> {
 }
 
 fn parse_cpu_threads(value: &str) -> Result<usize, String> {
-    let parsed: usize = value
-        .parse()
-        .map_err(|_| format!("invalid --cpu-threads value {value:?}; expected a positive integer"))?;
+    let parsed: usize = value.parse().map_err(|_| {
+        format!("invalid --cpu-threads value {value:?}; expected a positive integer")
+    })?;
     if parsed == 0 {
         return Err("--cpu-threads must be >= 1".to_string());
     }

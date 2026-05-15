@@ -10,10 +10,10 @@ use std::collections::{BTreeMap, btree_map::Entry};
 use ocelotl_core::Result;
 use ocelotl_loader::LoadedTensor;
 
-use super::{WhisperConfig, required_whisper_tensor_names};
 use super::{
     CONV_KERNEL_WIDTH, checked_len_product, dtype_matches, invalid_model, supported_dtype_name,
 };
+use super::{WhisperConfig, required_whisper_tensor_names};
 
 #[derive(Debug, Clone)]
 pub struct WhisperWeights {

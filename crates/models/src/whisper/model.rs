@@ -11,9 +11,9 @@ use ocelotl_core::{Result, TokenId};
 use ocelotl_kernels::{DeviceTensor, KernelBackend, default_kernel_backend};
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 
-use super::{WhisperConfig, parse_whisper_config_json, required_whisper_tensor_names};
 use super::state::{WhisperDecoderState, WhisperEncodedAudio};
 use super::weights::WhisperWeights;
+use super::{WhisperConfig, parse_whisper_config_json, required_whisper_tensor_names};
 use super::{checked_len_product, invalid_model, invalid_request};
 
 #[derive(Debug, Clone)]
