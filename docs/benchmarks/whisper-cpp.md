@@ -1261,3 +1261,127 @@ with CPU AVX2 + threads.
   and indexed per-thread by `UNIT_POS`. Workgroup size has to be small
   enough that the slab fits in shared memory; for Whisper-small that
   capped us at `ENC_ATTN_WG = 4`.
+
+## GW.4-bench-decoder Long-output decoder characterization (2026-05-20)
+
+Two findings from GW.4-bench drove this follow-up: the GW.4 size matrix
+used reference fixtures of 3-26 tokens, so the GPU decoder was
+essentially uncharacterized (only tiny.en's 26-token run gave any
+decoder signal, and it lost wall-time +8%); and the existing
+whisper.cpp comparison was CPU-only (W-ASR.24 captured `-t 4` AVX2
+runs), so every GW.4 "Nx faster" was anchored to Ocelotl-CPU-scalar
+not to a competing GPU. This section measures the GPU decoder at
+realistic output length and anchors to whisper.cpp on the same audio.
+
+### Fixture
+
+`local-artifacts/whisper_tiny_en/reference/sample_long_16khz_mono.wav`
+- original JFK 11s sample concatenated ~2.64x to **29.00 s**
+(464,000 frames at 16 kHz mono PCM16, just below Whisper's hard
+30 s / 1500-conv-output ceiling). A 3x concat (33 s) was rejected by
+the model with `convolution output length 2200 exceeds
+audio_context_length 1500`, which is the in-model 30 s window; longer
+audio requires chunking and is out of GW scope.
+
+Ground-truth token files are captured from Ocelotl CPU-scalar (the
+parity authority) by running with an oversized placeholder
+expected-tokens array, reading the actual generated tokens from JSON
+stdout, then overwriting the fixture:
+
+- `local-artifacts/whisper_tiny_en/reference/expected_tokens_long.json`
+  (107 tokens, ends in EOT 50256)
+- `local-artifacts/whisper_small_en/reference/expected_tokens_long.json`
+  (70 tokens, ends in EOT 50256)
+
+Both CPU-scalar and GPU runs assert `matches_expected: true` against
+the captured ground truth - **parity is intact at long output for both
+model sizes**.
+
+### Long-output table — Ocelotl on the long fixture
+
+All matches_expected:true. Total/encoder/decode_total in ms; per-tok is
+the median element of the bench's `timings_ms.decode_token` array.
+
+| Size     | Backend             | total  | encoder | x-attn pre | decode_total | tokens | per-tok median |
+| -------- | ------------------- | ------ | ------- | ---------- | ------------ | ------ | -------------- |
+| tiny.en  | CPU scalar 1-thread | 5,418  | 3,381   | 122        | 1,687        | 107    | 15.0 ms        |
+| tiny.en  | GPU cubecl-wgpu     | 7,314  | 906     | 0          | 5,737        | 107    | **54.0 ms**    |
+| small.en | CPU scalar 1-thread | 32,440 | 25,240  | 1,449      | 5,102        | 70     | 73.0 ms        |
+| small.en | GPU cubecl-wgpu     | 15,547 | 2,998   | 0          | 11,288       | 70     | **161.5 ms**   |
+
+- **GPU decoder is 3.6x slower per token at tiny.en (54 vs 15 ms)
+  and 2.2x slower at small.en (162 vs 73 ms).**
+- **Per-token rate grew 2.5x with sequence**: tiny.en GPU was
+  ~22 ms/tok at the 26-token short bench, 54 ms/tok at the 107-token
+  long bench. Per-token rate is not flat - the GPU autoregressive step
+  has unamortized per-step overhead (kernel-launch floor or
+  non-incremental self-attn KV traffic).
+- **Walltime crossover** sits between tiny.en (GPU loses 35%) and
+  small.en (GPU wins 2.1x). Encoder mass dominates net walltime for
+  small.en+.
+
+### Long-output table — whisper.cpp CPU on the same fixture
+
+`local-artifacts/whisper_cpp/whisper-cli.exe -bs 1 -bo 1 -nf -nt`,
+default `-t 4` (4 threads, AVX2/FMA enabled). The bundled binary
+prints `whisper_backend_init_gpu: no GPU found` at startup despite
+`use gpu = 1` in the config block - **only one backend (CPU) was
+compiled in**; this is a CPU-only build masquerading with GPU flags.
+A real whisper.cpp-GPU column requires building from source with
+Vulkan or CUDA (recipe below).
+
+| Size     | total | encode | decode | sample/batched | per-tok (decode) |
+| -------- | ----- | ------ | ------ | -------------- | ---------------- |
+| tiny.en  | 461   | 211    | 138    | 22 (78 runs)   | **1.77 ms**      |
+| small.en | 2,926 | 1,900  | 657    | 29 (66 runs)   | **9.95 ms**      |
+
+### Cross-anchor: Ocelotl GPU vs whisper.cpp CPU
+
+| Backend                          | tiny.en wall | tiny.en per-tok | small.en wall | small.en per-tok |
+| -------------------------------- | ------------ | --------------- | ------------- | ---------------- |
+| Ocelotl CPU scalar 1-thread      | 5,418        | 15.0 ms         | 32,440        | 73.0 ms          |
+| Ocelotl GPU cubecl-wgpu          | 7,314        | 54.0 ms         | 15,547        | 161.5 ms         |
+| whisper.cpp CPU `-t 4` (AVX2)    | 461          | 1.77 ms         | 2,926         | 9.95 ms          |
+| Ocelotl GPU vs whisper.cpp CPU   | **15.9x slower** | **30.5x slower per-tok** | **5.3x slower** | **16.2x slower per-tok** |
+
+The "Nx faster than CPU" claims from GW.4 were Ocelotl-GPU vs
+Ocelotl-CPU-scalar-1-thread. Anchored to whisper.cpp CPU on the same
+long audio, **the GPU path is currently slower at both measured sizes**.
+The encoder gap is the smaller one (1.58x slower at small.en;
+4.3x slower at tiny.en); the per-token decoder gap (16-30x) is the
+dominant production-readiness blocker.
+
+### whisper.cpp-GPU build gap (deferred)
+
+The bundled binary is CPU-only. Producing a real GPU column requires
+either:
+
+- **Vulkan (recommended on DX12 boxes without CUDA):**
+  1. Install LunarG Vulkan SDK
+  2. `git clone https://github.com/ggerganov/whisper.cpp; cd whisper.cpp`
+  3. `cmake -B build -DGGML_VULKAN=ON`
+  4. `cmake --build build --config Release -j`
+  5. Drop the produced `whisper-cli.exe` + `*.dll` into a sibling dir
+- **CUDA / cuBLAS** (only if NVIDIA + CUDA toolkit present):
+  `-DGGML_CUDA=ON` instead.
+
+This is deferred under **PostGW.2** rather than fabricated; the board
+escape hatch in the GW.4-bench-decoder scope explicitly allows
+shipping the long-output decoder numbers without a fabricated GPU
+baseline if the GPU build can't be produced on this machine.
+
+### Actionable follow-ups (post-GW investigations)
+
+- **PostGW.1** GPU decoder per-token amortization: investigate the
+  ~50 ms/tok floor and the 2.5x per-token growth with sequence. Likely
+  sources: WGPU kernel-launch overhead per autoregressive step,
+  non-incremental self-attn KV append patterns, possible GPU->host
+  sync per logit readback for the greedy sampler. Goal: flatten the
+  per-token curve; flat is achievable (whisper.cpp shows 1.77 ms/tok
+  flat).
+- **PostGW.2** whisper.cpp-GPU baseline: build whisper.cpp with Vulkan
+  per the recipe above and add the GPU column to the cross-anchor
+  table.
+
+These are tracked in `projects/ocelotl/devs/assignments.md` post-GW
+section.
