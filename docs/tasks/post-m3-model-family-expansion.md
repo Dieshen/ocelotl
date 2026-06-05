@@ -146,6 +146,13 @@ and does not modify the closed M3.6 MLP task.
   Gemma4 Q4_K_M GGUF execution remains rejected because multimodal,
   sliding-window, shared-KV, softcap, mixed width, and quantized-origin
   execution policies are not complete.
+- `Follow-up`: Gemma4 real-shaped dequantized text weight adapter landed
+  2026-06-05. `Gemma4TextWeights::from_loaded_tensors` now separates
+  tensor-to-weight mapping from the executable text-forward feature gate, so a
+  dequantized real-shaped bundle can map SWA and global attention layers with
+  layer-specific q/k/v/norm widths. `Gemma4TextModel::new` still rejects that
+  config before compute for multimodal, sliding-window, shared-KV, softcap,
+  quantized-origin, and mixed-width execution semantics.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 

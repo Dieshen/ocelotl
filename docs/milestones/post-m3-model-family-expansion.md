@@ -101,6 +101,11 @@ Gemma4:
   contract for the subset. This does not enable the selected real Q4_K_M GGUF
   artifact; multimodal, sliding-window/shared-KV, softcap, mixed-width, and
   quantized-origin execution features remain rejected before compute.
+- A follow-up real-shaped adapter slice separates Gemma4 text weight mapping
+  from the executable feature gate. Dequantized tensors with SWA/global
+  layer-specific q/k/v/norm widths can now map into `Gemma4TextWeights`, while
+  `Gemma4TextModel::new` continues to reject those real-artifact features
+  before compute.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8
