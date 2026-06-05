@@ -114,14 +114,11 @@ impl Gemma4Config {
         if self.quantization != Gemma4Quantization::Unquantized {
             requested.push(format!("quantization={}", self.quantization.label()));
         }
-        if self.attention_key_length != self.attention_key_length_swa {
-            requested.push("mixed_swa_global_key_widths".to_string());
-        }
-        if self.attention_value_length != self.attention_value_length_swa {
-            requested.push("mixed_swa_global_value_widths".to_string());
-        }
         if self.attention_key_length != self.attention_value_length {
-            requested.push("distinct_key_value_widths".to_string());
+            requested.push("distinct_global_key_value_widths".to_string());
+        }
+        if self.attention_key_length_swa != self.attention_value_length_swa {
+            requested.push("distinct_swa_key_value_widths".to_string());
         }
         if self.rope_dimension_count != self.attention_key_length
             || self.rope_dimension_count_swa != self.attention_key_length_swa
@@ -137,7 +134,7 @@ impl Gemma4Config {
             feature: "gemma4.text_forward_features".to_string(),
             requested: Some(requested.join(",")),
             supported: vec![
-                "text-only unquantized dense F32 synthetic subset with uniform full attention"
+                "text-only unquantized dense F32 synthetic subset with full attention and layer-specific SWA/global widths"
                     .to_string(),
             ],
         }))
@@ -730,13 +727,9 @@ impl Gemma4TextModel {
         let h = cfg.embedding_length;
         let q_heads = cfg.attention_head_count;
         let kv_heads = cfg.attention_head_count_kv;
-        let head_dim = cfg.attention_key_length;
-        let q_out = q_heads * head_dim;
-        let kv_out = kv_heads * head_dim;
         let f = cfg.feed_forward_length;
         let vocab = cfg.tokenizer_token_count;
         let eps = cfg.rms_norm_eps;
-        let theta = cfg.rope_freq_base;
 
         let mut hidden = vec![0.0_f32; seq * h];
         for (pos, token) in tokens.iter().enumerate() {
@@ -746,19 +739,29 @@ impl Gemma4TextModel {
         }
 
         let mut norm_buf = vec![0.0_f32; seq * h];
-        let mut q_buf = vec![0.0_f32; seq * q_out];
-        let mut k_buf = vec![0.0_f32; seq * kv_out];
-        let mut q_norm_buf = vec![0.0_f32; seq * q_out];
-        let mut k_norm_buf = vec![0.0_f32; seq * kv_out];
-        let mut v_buf = vec![0.0_f32; seq * kv_out];
-        let mut attn_out = vec![0.0_f32; seq * q_out];
         let mut o_buf = vec![0.0_f32; seq * h];
         let mut residual_buf = vec![0.0_f32; seq * h];
         let mut gate_buf = vec![0.0_f32; seq * f];
         let mut up_buf = vec![0.0_f32; seq * f];
         let mut mlp_out = vec![0.0_f32; seq * h];
 
-        for layer in &self.weights.layers {
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let attention = gemma4_layer_attention_dims(cfg, layer_idx, None)?;
+            let head_dim = attention.key_length;
+            let q_out = attention.q_width;
+            let kv_out = attention.k_width;
+            let theta = if gemma4_uses_global_attention(layer_idx) {
+                cfg.rope_freq_base
+            } else {
+                cfg.rope_freq_base_swa
+            };
+            let mut q_buf = vec![0.0_f32; seq * q_out];
+            let mut k_buf = vec![0.0_f32; seq * kv_out];
+            let mut q_norm_buf = vec![0.0_f32; seq * q_out];
+            let mut k_norm_buf = vec![0.0_f32; seq * kv_out];
+            let mut v_buf = vec![0.0_f32; seq * attention.v_width];
+            let mut attn_out = vec![0.0_f32; seq * q_out];
+
             residual_buf.copy_from_slice(&hidden);
 
             self.kernels
@@ -1925,6 +1928,37 @@ mod tests {
         }
     }
 
+    fn tiny_mixed_attention_text_config() -> Gemma4Config {
+        Gemma4Config {
+            context_length: 16,
+            block_count: 6,
+            embedding_length: 8,
+            embedding_length_per_layer_input: 8,
+            feed_forward_length: 16,
+            attention_head_count: 4,
+            attention_head_count_kv: 2,
+            attention_key_length: 4,
+            attention_value_length: 4,
+            attention_key_length_swa: 2,
+            attention_value_length_swa: 2,
+            rope_dimension_count: 4,
+            rope_dimension_count_swa: 2,
+            rope_freq_base: 1_000_000.0,
+            rope_freq_base_swa: 10_000.0,
+            rms_norm_eps: 1e-6,
+            attention_sliding_window: None,
+            attention_shared_kv_layers: None,
+            attention_sliding_window_pattern_len: None,
+            final_logit_softcap: None,
+            tokenizer_model: Some("gemma4".to_string()),
+            tokenizer_token_count: 12,
+            quantization: Gemma4Quantization::Unquantized,
+            has_quantized_tensors: false,
+            tensor_count: 108,
+            multimodal: false,
+        }
+    }
+
     fn complete_inventory_manifest(config: &Gemma4Config) -> GgufManifest {
         let mut manifest = fixture_manifest();
         manifest.tensors = required_gemma4_tensor_specs(config)
@@ -1972,9 +2006,6 @@ mod tests {
     fn complete_text_loaded_tensors(config: &Gemma4Config) -> Vec<LoadedTensor> {
         let h = config.embedding_length;
         let vocab = config.tokenizer_token_count;
-        let head_dim = config.attention_key_length;
-        let q_out = config.attention_head_count * head_dim;
-        let kv_out = config.attention_head_count_kv * head_dim;
         let f = config.feed_forward_length;
         let mut tensors = vec![
             text_loaded_tensor("token_embd.weight", &[h, vocab], 0.01),
@@ -1983,14 +2014,15 @@ mod tests {
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             let name = |suffix: &str| format!("{prefix}.{suffix}");
+            let attention = gemma4_layer_attention_dims(config, layer, None).unwrap();
             tensors.extend([
                 text_loaded_tensor(&name("attn_norm.weight"), &[h], 1.0),
-                text_loaded_tensor(&name("attn_q.weight"), &[h, q_out], 0.02),
-                text_loaded_tensor(&name("attn_k.weight"), &[h, kv_out], 0.03),
-                text_loaded_tensor(&name("attn_v.weight"), &[h, kv_out], 0.04),
-                text_loaded_tensor(&name("attn_output.weight"), &[q_out, h], 0.05),
-                text_loaded_tensor(&name("attn_q_norm.weight"), &[head_dim], 1.0),
-                text_loaded_tensor(&name("attn_k_norm.weight"), &[head_dim], 1.0),
+                text_loaded_tensor(&name("attn_q.weight"), &[h, attention.q_width], 0.02),
+                text_loaded_tensor(&name("attn_k.weight"), &[h, attention.k_width], 0.03),
+                text_loaded_tensor(&name("attn_v.weight"), &[h, attention.v_width], 0.04),
+                text_loaded_tensor(&name("attn_output.weight"), &[attention.q_width, h], 0.05),
+                text_loaded_tensor(&name("attn_q_norm.weight"), &[attention.key_length], 1.0),
+                text_loaded_tensor(&name("attn_k_norm.weight"), &[attention.key_length], 1.0),
                 text_loaded_tensor(&name("ffn_norm.weight"), &[h], 1.0),
                 text_loaded_tensor(&name("ffn_gate.weight"), &[h, f], 0.06),
                 text_loaded_tensor(&name("ffn_up.weight"), &[h, f], 0.07),
@@ -2579,10 +2611,35 @@ mod tests {
                 assert!(requested.contains("final_logit_softcap"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
-                assert!(requested.contains("mixed_swa_global_key_widths"));
             }
             other => panic!("expected Unsupported for real Gemma4 text forward, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gemma4_text_prefill_accepts_mixed_swa_global_widths_without_other_real_features() {
+        let cfg = tiny_mixed_attention_text_config();
+        let tensors = complete_dequantized_loaded_tensors(&cfg);
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("mixed-width synthetic Gemma4 text tensors must map into weights");
+
+        assert_eq!(
+            weights.layers[0].attn_q_w.len(),
+            cfg.embedding_length * cfg.attention_head_count * cfg.attention_key_length_swa
+        );
+        assert_eq!(
+            weights.layers[5].attn_q_w.len(),
+            cfg.embedding_length * cfg.attention_head_count * cfg.attention_key_length
+        );
+
+        let model = Gemma4TextModel::new(cfg.clone(), weights)
+            .expect("mixed SWA/global widths must not reject when no other real features are set");
+        let logits = model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("mixed-width Gemma4 text prefill must execute");
+
+        assert_eq!(logits.len(), cfg.tokenizer_token_count);
+        assert!(logits.iter().all(|value| value.is_finite()));
     }
 
     #[test]

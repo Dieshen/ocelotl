@@ -143,16 +143,23 @@ and does not modify the closed M3.6 MLP task.
   `fixtures/logits/gemma4_tiny_synthetic_text_prefill.json`, including
   `expected_decode_token = 7`. Runtime builder tests prove CPU selection and
   the no-launch CubeCL/WGPU backend contract for the supported subset. Real
-  Gemma4 Q4_K_M GGUF execution remains rejected because multimodal,
-  sliding-window, shared-KV, softcap, mixed width, and quantized-origin
-  execution policies are not complete.
+  At initial landing, Gemma4 Q4_K_M GGUF execution remained rejected because
+  multimodal, sliding-window, shared-KV, softcap, mixed width, and
+  quantized-origin execution policies were not complete.
 - `Follow-up`: Gemma4 real-shaped dequantized text weight adapter landed
   2026-06-05. `Gemma4TextWeights::from_loaded_tensors` now separates
   tensor-to-weight mapping from the executable text-forward feature gate, so a
   dequantized real-shaped bundle can map SWA and global attention layers with
   layer-specific q/k/v/norm widths. `Gemma4TextModel::new` still rejects that
   config before compute for multimodal, sliding-window, shared-KV, softcap,
-  quantized-origin, and mixed-width execution semantics.
+  quantized-origin, and mixed-width execution semantics before the later
+  mixed-width forward slice.
+- `Follow-up`: Gemma4 mixed SWA/global width text forward landed 2026-06-05.
+  The synthetic text-only forward path now computes each decoder layer with its
+  own SWA or global q/k/v widths and RoPE base. This lifts the mixed-width
+  blocker only for unquantized dense F32, full-attention synthetic configs;
+  multimodal, sliding-window masking, shared-KV, final-logit softcap, and
+  quantized-origin real-artifact execution remain rejected before compute.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 

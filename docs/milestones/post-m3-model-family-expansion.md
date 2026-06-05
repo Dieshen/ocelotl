@@ -98,14 +98,20 @@ Gemma4:
   greedy decode token `TokenId(7)` in
   `fixtures/logits/gemma4_tiny_synthetic_text_prefill.json`. Runtime builder
   tests also prove CPU backend selection and the no-launch CubeCL/WGPU backend
-  contract for the subset. This does not enable the selected real Q4_K_M GGUF
-  artifact; multimodal, sliding-window/shared-KV, softcap, mixed-width, and
-  quantized-origin execution features remain rejected before compute.
+  contract for the subset. At initial landing this did not enable the selected
+  real Q4_K_M GGUF artifact; multimodal, sliding-window/shared-KV, softcap,
+  mixed-width, and quantized-origin execution features remained rejected before
+  compute.
 - A follow-up real-shaped adapter slice separates Gemma4 text weight mapping
   from the executable feature gate. Dequantized tensors with SWA/global
   layer-specific q/k/v/norm widths can now map into `Gemma4TextWeights`, while
   `Gemma4TextModel::new` continues to reject those real-artifact features
   before compute.
+- A follow-up text-forward slice makes the CPU/reference model loop
+  layer-aware for SWA/global attention widths and RoPE bases. Mixed SWA/global
+  widths are now executable only for the text-only unquantized dense F32
+  full-attention subset; multimodal, sliding-window/shared-KV, softcap,
+  quantized-origin, and reference real-artifact parity remain open.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

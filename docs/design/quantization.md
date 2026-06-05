@@ -55,9 +55,10 @@ from `ggml/src/ggml-common.h` and `ggml/src/ggml-quants.c`. Default tests pin
 small exact dequantized vectors for each format, including Q4/Q5 scale/min
 packing, Q5 high-bit lanes, and Q6 signed scales. This is still a loader value
 contract, not a real Gemma4 Q4_K_M execution claim. MF.7 adds only an
-unquantized dense F32 synthetic text subset; real Gemma4 Q4_K_M execution
-remains blocked until sliding-window/shared-KV, softcap, mixed-width, quantized
-origin, and reference parity tests exist.
+unquantized dense F32 synthetic text subset; a follow-up text-forward slice
+handles mixed SWA/global layer widths for that subset. Real Gemma4 Q4_K_M
+execution remains blocked until sliding-window/shared-KV, softcap,
+quantized-origin, and reference parity tests exist.
 
 ## Kernel Contract
 
