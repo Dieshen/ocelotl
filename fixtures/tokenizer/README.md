@@ -89,3 +89,52 @@ a breaking-change event per `docs/model-target.md`), re-run the
 `expected_token_ids` and `decoded` in the JSON, and bump the manifest +
 `docs/model-target.md` in the same dedicated commit so
 `git log -- docs/model-target.md` records every revision change.
+
+## `gemma4_gguf_basic_prompt.json` (Post-M3 MF.6)
+
+Exact local-backend encode/decode fixture for the pinned Gemma4 E4B IT GGUF
+candidate (`bartowski/google_gemma-4-E4B-it-GGUF`, revision
+`c04cb322fd63e347db759a08b6249b867488ccf8`; see
+`fixtures/manifest/post_m3_model_family_targets.json`). The real GGUF file is
+not committed and lives under
+`local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf`, or is
+selected with `OCELOTL_GEMMA4_GGUF_PATH`.
+
+### Pinned expectations
+
+- `encode("Hello")` -> `[TokenId(9259)]`
+- `encode_with_configured_bos("Hello")` -> `[TokenId(2), TokenId(9259)]`
+- `decode([TokenId(9259)])` -> `"Hello"`
+
+Plain `encode` intentionally omits BOS to match the Ocelotl `Tokenizer` trait
+contract and to avoid double-BOS when a Gemma4 chat template already renders
+`bos_token`. The configured-BOS helper pins GGUF `add_bos_token = true`
+separately.
+
+### Test surfaces
+
+Two test surfaces exercise this fixture in `src/gemma4.rs`:
+
+1. `gemma4_gguf_tokenizer_fixture_is_well_formed_and_populated` runs by
+   default and verifies the fixture names the pinned GGUF revision and has
+   populated ID fields.
+2. `local_gemma4_q4_k_m_gguf_tokenizer_builds_from_embedded_metadata` is
+   `#[ignore]`'d by default. It extracts embedded GGUF tokenizer metadata,
+   maps it through the root crate into `ocelotl-tokenizer`'s `GgufBpeTokenizer`,
+   and asserts the real artifact matches the fixture.
+
+Run the opt-in proof with:
+
+```text
+cargo test -p ocelotl local_gemma4_q4_k_m_gguf_tokenizer_builds_from_embedded_metadata -- --ignored --nocapture
+```
+
+### Regeneration
+
+If the pinned GGUF artifact or GGUF tokenizer backend intentionally changes,
+run the ignored proof against the selected artifact and update
+`expected_token_ids`, `expected_with_bos_token_ids`, and `decoded` together.
+This fixture is currently an Ocelotl backend regression pin. A local llama.cpp
+tokenizer command was not available when it was captured, so independent
+external-reference parity remains a follow-up before claiming full tokenizer
+parity with llama.cpp.

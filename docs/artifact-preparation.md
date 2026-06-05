@@ -275,13 +275,17 @@ $env:OCELOTL_GEMMA4_GGUF_PATH="D:\path\to\google_gemma-4-E4B-it-Q4_K_M.gguf"
 cargo test -p ocelotl-loader local_gemma4_q4_k_m_gguf_header_contract_is_well_formed -- --ignored --nocapture
 cargo test -p ocelotl-loader local_gemma4_q4_k_m_gguf_tokenizer_metadata_is_extractable -- --ignored --nocapture
 cargo test -p ocelotl-models local_gemma4_q4_k_m_gguf_header_converts_to_gemma4_config -- --ignored --nocapture
+cargo test -p ocelotl local_gemma4_q4_k_m_gguf_tokenizer_builds_from_embedded_metadata -- --ignored --nocapture
 ```
 
 The tokenizer-metadata test proves the pinned GGUF carries extractable embedded
 tokens, scores, token types, merges, special token IDs, chat-template text, and
-BOS/space-prefix flags. It does **not** prove exact encode/decode token IDs yet;
-that requires a GGUF tokenizer backend in `ocelotl-tokenizer` or a pinned local
-reference tokenizer command.
+BOS/space-prefix flags. The root-crate tokenizer proof builds the
+`ocelotl-tokenizer` GGUF BPE backend from that embedded metadata and compares
+`fixtures/tokenizer/gemma4_gguf_basic_prompt.json` against the local artifact:
+plain `Hello` encodes to `[9259]`, and the configured-BOS path encodes to
+`[2, 9259]`. A pinned local llama.cpp tokenizer command is still needed before
+those IDs can be described as independent external-reference parity.
 
 ## 6. Keeping Artifacts Out Of Git
 

@@ -1,0 +1,12 @@
+{
+  "fixture_version": 1,
+  "name": "gemma4_gguf_basic_prompt",
+  "source": "bartowski/google_gemma-4-E4B-it-GGUF google_gemma-4-E4B-it-Q4_K_M.gguf at revision c04cb322fd63e347db759a08b6249b867488ccf8; embedded GGUF tokenizer metadata loaded by Ocelotl GgufBpeTokenizer.",
+  "input": "Hello",
+  "expected_token_ids": [9259],
+  "expected_with_bos_token_ids": [2, 9259],
+  "decoded": "Hello",
+  "reference_status": "Implementation regression fixture captured from Ocelotl's GGUF BPE backend on 2026-06-05. A local llama.cpp tokenizer command was not available, so external reference parity remains a follow-up.",
+  "regeneration": "Run `cargo test -p ocelotl local_gemma4_q4_k_m_gguf_tokenizer_builds_from_embedded_metadata -- --ignored --nocapture` with OCELOTL_GEMMA4_GGUF_PATH or local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf. If the selected artifact or tokenizer backend intentionally changes, update expected_token_ids, expected_with_bos_token_ids, decoded, and docs/validation/test-matrix.md together.",
+  "notes": "Plain encode intentionally omits BOS to match the Ocelotl Tokenizer trait contract and avoid double-BOS when a Gemma4 chat template already renders bos_token. expected_with_bos_token_ids pins the GGUF add_bos_token path separately."
+}

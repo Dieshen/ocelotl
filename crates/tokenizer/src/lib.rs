@@ -6,8 +6,10 @@ pub use ocelotl_core::TokenId;
 use ocelotl_core::{OcelotlError, Result, TokenizerError, UnsupportedError};
 
 mod chat_template;
+mod gguf_bpe;
 mod whisper;
 pub use chat_template::{ChatMessage, ChatTemplate, ChatTemplateOptions};
+pub use gguf_bpe::{GgufBpeTokenizer, GgufBpeTokenizerSpec, GgufSpecialTokens, GgufTokenType};
 pub use whisper::{
     WHISPER_TIMESTAMP_STEP_SECONDS, WhisperDecodeMask, WhisperStartupTokens, WhisperTimestampMode,
     WhisperTimestampedSegment, WhisperTokenMaskDecision, WhisperTokenRole,

@@ -77,9 +77,15 @@ Gemma4:
   GGUF tokenizer tokens, scores, token types, merges, special-token IDs,
   chat-template text, and BOS/space-prefix flags. This keeps the default
   `inspect_gguf` manifest header-only and array-summarized, while giving the
-  Gemma4 tokenizer track a tested bridge toward exact ID parity. Exact Gemma4
-  encode/decode IDs remain pending until Ocelotl has a GGUF tokenizer backend
-  or a pinned local reference tokenizer command.
+  Gemma4 tokenizer track a tested bridge toward exact ID parity.
+- A follow-up GGUF tokenizer backend slice adds `GgufBpeTokenizer` in
+  `ocelotl-tokenizer` and root-crate Gemma4 composition helpers. The backend
+  builds byte-level BPE tokenization from embedded GGUF tokens/merges, honors
+  `add_space_prefix`, keeps plain `encode` BOS-free, provides an explicit
+  configured-BOS path, and uses GGUF token types to register control/unknown and
+  user-defined tokens. `fixtures/tokenizer/gemma4_gguf_basic_prompt.json` pins
+  local backend IDs for `Hello`; an external llama.cpp tokenizer command remains
+  pending before the fixture can claim independent reference parity.
 - MF.7 adds the first Gemma4 execution subset: `Gemma4TextModel` runs a
   text-only, unquantized, dense F32 synthetic decoder-core path through
   `ocelotl_runtime::gemma::{prefill, decode_one_token}`, with pinned logits and

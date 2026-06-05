@@ -104,8 +104,19 @@ and does not modify the closed M3.6 MLP task.
   synthetic GGUF metadata fixture and malformed array typing; the ignored local
   Gemma4 proof passed against
   `D:\Dev\ideas\04-granola-ai-clone\models\google_gemma-4-E4B-it-Q4_K_M.gguf`
-  on 2026-06-05. Exact tokenizer ID fixtures remain pending for Gemma4 until a
-  GGUF tokenizer backend or pinned local reference tokenizer command exists.
+  on 2026-06-05.
+- `Follow-up`: Gemma4 GGUF BPE tokenizer backend landed 2026-06-05.
+  `ocelotl-tokenizer` constructs a byte-level BPE tokenizer from tokenizer-owned
+  GGUF metadata parts, honors `add_space_prefix`, keeps plain `encode` BOS-free,
+  exposes `encode_with_configured_bos`, registers control/unknown token types as
+  skipped specials, and registers user-defined token types as literal added
+  tokens. The root crate composes loader metadata into that tokenizer without
+  adding a tokenizer-to-loader dependency. `fixtures/tokenizer/gemma4_gguf_basic_prompt.json`
+  pins the selected GGUF backend's local `Hello` IDs as `[9259]` and configured
+  BOS IDs as `[2, 9259]`; the ignored local proof passed against
+  `D:\Dev\ideas\04-granola-ai-clone\models\google_gemma-4-E4B-it-Q4_K_M.gguf`
+  on 2026-06-05. A pinned external llama.cpp tokenizer command remains a
+  follow-up before this fixture can claim independent reference parity.
 
 ## MF.7 Add Tiny Synthetic Forward Per Supported Subset
 
