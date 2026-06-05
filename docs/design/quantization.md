@@ -32,6 +32,31 @@ Quantized formats should describe:
 The loader should not simply expose opaque bytes. It should validate that the
 runtime and kernels understand the quantization format before model execution.
 
+### Current GGUF K-Quant Value Policy
+
+As of 2026-06-05, GGUF inspection knows the selected Gemma4 Q4_K_M artifact's
+ggml K-quant layouts and the loader has an explicit dequantizing value API:
+
+| GGML type | Elements per block | Bytes per block | Value status | Execution status |
+| --- | ---: | ---: | --- | --- |
+| `Q4K` | 256 | 144 | exact dequant tested | rejected |
+| `Q5K` | 256 | 176 | exact dequant tested | rejected |
+| `Q6K` | 256 | 210 | exact dequant tested | rejected |
+
+`inspect_gguf` rejects Q4K/Q5K/Q6K tensors whose element count is not divisible
+by 256, and validates the computed byte range against the file length.
+`load_gguf_tensor_f32` stays dense-only and still rejects quantized payloads with
+a typed `Unsupported` error. Callers that intend to materialize quantized values
+must use `load_gguf_tensor_dequantized_f32` or
+`load_gguf_tensors_dequantized_f32`.
+
+The Q4K/Q5K/Q6K dequantizers use ggml's current K-quant layouts and bit packing
+from `ggml/src/ggml-common.h` and `ggml/src/ggml-quants.c`. Default tests pin
+small exact dequantized vectors for each format, including Q4/Q5 scale/min
+packing, Q5 high-bit lanes, and Q6 signed scales. This is still a loader value
+contract, not a Gemma4 execution claim; model execution remains blocked until
+family forward-path, sliding-window/shared-KV, softcap, and parity tests exist.
+
 ## Kernel Contract
 
 Quantized kernels should document whether they dequantize eagerly, dequantize on

@@ -22,7 +22,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["fancy-re
 # imports `minijinja`. Sandbox is enabled by default (no filesystem access,
 # no arbitrary code), and `add_template_owned` keeps the source string-owned
 # so we do not surface minijinja lifetimes across the boundary.
-minijinja = { version = "2.19", default-features = false, features = ["builtins", "serde"] }
+minijinja = { version = "2.19", default-features = false, features = ["builtins", "macros", "serde"] }
 # `serde` is needed by minijinja's `serde` feature and by `ChatMessage`'s
 # derive in the chat-template module. Production code depends on it; not
 # limited to dev-dependencies.

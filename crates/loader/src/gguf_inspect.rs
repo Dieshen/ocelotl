@@ -130,6 +130,12 @@ pub struct GgufTensorEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GgmlQuantLayout {
+    pub block_element_count: u64,
+    pub block_byte_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlTensorType {
     F32,
     F16,
@@ -205,17 +211,84 @@ impl GgmlTensorType {
         }
     }
 
+    pub fn quant_layout(self) -> Option<GgmlQuantLayout> {
+        // Current ggml K-quant constants, verified against
+        // ggml/src/ggml-common.h on 2026-06-05:
+        // QK_K = 256, K_SCALE_SIZE = 12.
+        //
+        // block_q4_K = 2 * half + K_SCALE_SIZE + QK_K / 2 = 144 bytes.
+        // block_q5_K = 2 * half + K_SCALE_SIZE + QK_K / 2 + QK_K / 8 = 176 bytes.
+        // block_q6_K = half + QK_K / 16 + 3 * QK_K / 4 = 210 bytes.
+        match self {
+            Self::Q4K => Some(GgmlQuantLayout {
+                block_element_count: 256,
+                block_byte_len: 144,
+            }),
+            Self::Q5K => Some(GgmlQuantLayout {
+                block_element_count: 256,
+                block_byte_len: 176,
+            }),
+            Self::Q6K => Some(GgmlQuantLayout {
+                block_element_count: 256,
+                block_byte_len: 210,
+            }),
+            _ => None,
+        }
+    }
+
     fn fixed_element_size(self) -> Option<u64> {
         match self {
             Self::F32 | Self::I32 => Some(4),
             Self::F16 | Self::BF16 | Self::I16 => Some(2),
             Self::I8 => Some(1),
             Self::I64 | Self::F64 => Some(8),
-            // Quantized GGML types are block encoded. MF.2 only needs to
-            // inspect and preserve those type tags; byte-exact dequant sizing
-            // belongs with the later quantization policy.
             _ => None,
         }
+    }
+
+    fn byte_len_for_element_count(
+        self,
+        element_count: u64,
+        path: &Path,
+        tensor_name: &str,
+    ) -> Result<Option<u64>> {
+        if let Some(elem_size) = self.fixed_element_size() {
+            return element_count
+                .checked_mul(elem_size)
+                .ok_or_else(|| {
+                    invalid_gguf(
+                        path,
+                        Some(tensor_name),
+                        format!("GGUF tensor `{tensor_name}` byte length overflows u64"),
+                    )
+                })
+                .map(Some);
+        }
+
+        if let Some(layout) = self.quant_layout() {
+            if element_count % layout.block_element_count != 0 {
+                return Err(invalid_gguf(
+                    path,
+                    Some(tensor_name),
+                    format!(
+                        "GGUF tensor `{tensor_name}` element count {element_count} is not divisible by {:?} quant block size {}",
+                        self, layout.block_element_count
+                    ),
+                ));
+            }
+            return (element_count / layout.block_element_count)
+                .checked_mul(layout.block_byte_len)
+                .ok_or_else(|| {
+                    invalid_gguf(
+                        path,
+                        Some(tensor_name),
+                        format!("GGUF tensor `{tensor_name}` byte length overflows u64"),
+                    )
+                })
+                .map(Some);
+        }
+
+        Ok(None)
     }
 }
 
@@ -328,18 +401,7 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
                 format!("GGUF tensor `{name}` offset {offset} is not aligned to {alignment} bytes"),
             ));
         }
-        let byte_len = tensor_type
-            .fixed_element_size()
-            .map(|elem_size| {
-                element_count.checked_mul(elem_size).ok_or_else(|| {
-                    invalid_gguf(
-                        path,
-                        Some(&name),
-                        format!("GGUF tensor `{name}` byte length overflows u64"),
-                    )
-                })
-            })
-            .transpose()?;
+        let byte_len = tensor_type.byte_len_for_element_count(element_count, path, &name)?;
 
         tensors.push(GgufTensorEntry {
             name,
@@ -779,6 +841,24 @@ mod tests {
     }
 
     fn write_minimal_fixture(path: &Path, tensor_offset: u64, tensor_data_len: usize) {
+        write_single_tensor_fixture(
+            path,
+            "blk.0.attn_q.weight",
+            &[2, 2],
+            0,
+            tensor_offset,
+            tensor_data_len,
+        );
+    }
+
+    fn write_single_tensor_fixture(
+        path: &Path,
+        tensor_name: &str,
+        shape: &[u64],
+        raw_tensor_type: u32,
+        tensor_offset: u64,
+        tensor_data_len: usize,
+    ) {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(GGUF_MAGIC);
         write_u32(&mut bytes, SUPPORTED_GGUF_VERSION);
@@ -790,11 +870,12 @@ mod tests {
         write_u32_metadata(&mut bytes, "general.alignment", 32);
         write_string_array_metadata(&mut bytes, "tokenizer.ggml.tokens", &["<bos>", "<eos>"]);
 
-        write_string(&mut bytes, "blk.0.attn_q.weight");
-        write_u32(&mut bytes, 2);
-        write_u64(&mut bytes, 2);
-        write_u64(&mut bytes, 2);
-        write_u32(&mut bytes, 0);
+        write_string(&mut bytes, tensor_name);
+        write_u32(&mut bytes, shape.len() as u32);
+        for dim in shape {
+            write_u64(&mut bytes, *dim);
+        }
+        write_u32(&mut bytes, raw_tensor_type);
         write_u64(&mut bytes, tensor_offset);
 
         while bytes.len() % 32 != 0 {
@@ -834,6 +915,95 @@ mod tests {
         assert_eq!(tensor.offset, 0);
         assert_eq!(tensor.byte_len, Some(16));
         assert_eq!(tensor.file_offset, manifest.data_start);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ggml_k_quant_layouts_match_current_ggml_common_h_contract() {
+        assert_eq!(
+            GgmlTensorType::Q4K.quant_layout(),
+            Some(GgmlQuantLayout {
+                block_element_count: 256,
+                block_byte_len: 144
+            })
+        );
+        assert_eq!(
+            GgmlTensorType::Q5K.quant_layout(),
+            Some(GgmlQuantLayout {
+                block_element_count: 256,
+                block_byte_len: 176
+            })
+        );
+        assert_eq!(
+            GgmlTensorType::Q6K.quant_layout(),
+            Some(GgmlQuantLayout {
+                block_element_count: 256,
+                block_byte_len: 210
+            })
+        );
+        assert_eq!(GgmlTensorType::F32.quant_layout(), None);
+    }
+
+    #[test]
+    fn inspect_gguf_computes_q4_q5_q6_k_quantized_byte_lengths() {
+        for (suffix, raw_type, tensor_type, expected_byte_len) in [
+            ("q4k", 12, GgmlTensorType::Q4K, 144),
+            ("q5k", 13, GgmlTensorType::Q5K, 176),
+            ("q6k", 14, GgmlTensorType::Q6K, 210),
+        ] {
+            let path = tmp_path(suffix);
+            write_single_tensor_fixture(
+                &path,
+                "blk.0.attn_q.weight",
+                &[256],
+                raw_type,
+                0,
+                expected_byte_len as usize,
+            );
+
+            let manifest = inspect_gguf(&path).expect("K-quant fixture must inspect");
+            let tensor = &manifest.tensors[0];
+            assert_eq!(tensor.tensor_type, tensor_type);
+            assert_eq!(tensor.byte_len, Some(expected_byte_len));
+
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn inspect_gguf_rejects_k_quant_tensor_with_non_block_multiple_elements() {
+        let path = tmp_path("q4k_bad_block_count");
+        write_single_tensor_fixture(&path, "blk.0.attn_q.weight", &[255], 12, 0, 144);
+
+        let err = inspect_gguf(&path).expect_err("bad K-quant block count must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("blk.0.attn_q.weight"));
+                assert!(invalid.message.contains("not divisible"));
+                assert!(invalid.message.contains("256"));
+            }
+            other => panic!("expected InvalidModel for bad K-quant block count, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inspect_gguf_rejects_short_k_quant_payload_with_byte_range_error() {
+        let path = tmp_path("q6k_short_payload");
+        write_single_tensor_fixture(&path, "blk.0.attn_q.weight", &[256], 14, 0, 209);
+
+        let err = inspect_gguf(&path).expect_err("short Q6_K payload must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("blk.0.attn_q.weight"));
+                assert!(invalid.message.contains("exceeds file length"));
+            }
+            other => panic!("expected InvalidModel for short K-quant payload, got {other:?}"),
+        }
 
         let _ = std::fs::remove_file(path);
     }
@@ -996,11 +1166,18 @@ mod tests {
             "Gemma4 GGUF should declare tensor descriptors"
         );
         assert!(
+            manifest.tensors.iter().any(|tensor| matches!(
+                tensor.tensor_type,
+                GgmlTensorType::Q4K | GgmlTensorType::Q5K | GgmlTensorType::Q6K
+            ) && tensor.byte_len.is_some()),
+            "Q4_K_M Gemma4 GGUF should include K-quantized tensors with validated byte lengths"
+        );
+        assert!(
             manifest
                 .tensors
                 .iter()
-                .any(|tensor| tensor.byte_len.is_none()),
-            "Q4_K_M Gemma4 GGUF should include block-quantized tensors that MF.2 preserves but does not execute"
+                .all(|tensor| tensor.byte_len.is_some()),
+            "selected Gemma4 Q4_K_M artifact should contain only dense or Q4_K/Q5_K/Q6_K tensor types whose byte ranges Ocelotl validates"
         );
     }
 }

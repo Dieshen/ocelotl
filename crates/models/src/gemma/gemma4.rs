@@ -6,7 +6,15 @@
 //! path is allowed to run.
 
 use ocelotl_core::{InvalidModelError, OcelotlError, Result, UnsupportedError};
-use ocelotl_loader::{GgmlTensorType, GgufManifest, GgufMetadataType, GgufMetadataValue};
+use ocelotl_loader::{
+    GgmlTensorType, GgufManifest, GgufMetadataType, GgufMetadataValue, GgufTensorEntry,
+    LoadedTensor, SupportedDtype, inspect_gguf, load_gguf_tensors_dequantized_f32,
+    load_gguf_tensors_f32,
+};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    path::Path,
+};
 
 const GEMMA4_ARCHITECTURE: &str = "gemma4";
 const GGUF_FILE_TYPE_Q4_K_M: u32 = 15;
@@ -38,14 +46,22 @@ pub struct Gemma4Config {
     pub context_length: usize,
     pub block_count: usize,
     pub embedding_length: usize,
+    pub embedding_length_per_layer_input: usize,
     pub feed_forward_length: usize,
     pub attention_head_count: usize,
     pub attention_head_count_kv: usize,
+    pub attention_key_length: usize,
+    pub attention_value_length: usize,
+    pub attention_key_length_swa: usize,
+    pub attention_value_length_swa: usize,
     pub rope_dimension_count: usize,
+    pub rope_dimension_count_swa: usize,
     pub rope_freq_base: f32,
+    pub rope_freq_base_swa: f32,
     pub rms_norm_eps: f32,
     pub attention_sliding_window: Option<usize>,
     pub attention_shared_kv_layers: Option<usize>,
+    pub attention_sliding_window_pattern_len: Option<usize>,
     pub final_logit_softcap: Option<f32>,
     pub tokenizer_model: Option<String>,
     pub tokenizer_token_count: usize,
@@ -110,11 +126,20 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
         let context_length = required_usize(manifest, "gemma4.context_length")?;
         let block_count = required_usize(manifest, "gemma4.block_count")?;
         let embedding_length = required_usize(manifest, "gemma4.embedding_length")?;
+        let embedding_length_per_layer_input =
+            required_usize(manifest, "gemma4.embedding_length_per_layer_input")?;
         let feed_forward_length = required_usize(manifest, "gemma4.feed_forward_length")?;
         let attention_head_count = required_usize(manifest, "gemma4.attention.head_count")?;
         let attention_head_count_kv = required_usize(manifest, "gemma4.attention.head_count_kv")?;
+        let attention_key_length = required_usize(manifest, "gemma4.attention.key_length")?;
+        let attention_value_length = required_usize(manifest, "gemma4.attention.value_length")?;
+        let attention_key_length_swa = required_usize(manifest, "gemma4.attention.key_length_swa")?;
+        let attention_value_length_swa =
+            required_usize(manifest, "gemma4.attention.value_length_swa")?;
         let rope_dimension_count = required_usize(manifest, "gemma4.rope.dimension_count")?;
+        let rope_dimension_count_swa = required_usize(manifest, "gemma4.rope.dimension_count_swa")?;
         let rope_freq_base = required_f32(manifest, "gemma4.rope.freq_base")?;
+        let rope_freq_base_swa = required_f32(manifest, "gemma4.rope.freq_base_swa")?;
         let rms_norm_eps = required_f32(manifest, "gemma4.attention.layer_norm_rms_epsilon")?;
         let quantization =
             Gemma4Quantization::from_file_type(required_u32(manifest, "general.file_type")?);
@@ -122,11 +147,24 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
         validate_positive("gemma4.context_length", context_length)?;
         validate_positive("gemma4.block_count", block_count)?;
         validate_positive("gemma4.embedding_length", embedding_length)?;
+        validate_positive(
+            "gemma4.embedding_length_per_layer_input",
+            embedding_length_per_layer_input,
+        )?;
         validate_positive("gemma4.feed_forward_length", feed_forward_length)?;
         validate_positive("gemma4.attention.head_count", attention_head_count)?;
         validate_positive("gemma4.attention.head_count_kv", attention_head_count_kv)?;
+        validate_positive("gemma4.attention.key_length", attention_key_length)?;
+        validate_positive("gemma4.attention.value_length", attention_value_length)?;
+        validate_positive("gemma4.attention.key_length_swa", attention_key_length_swa)?;
+        validate_positive(
+            "gemma4.attention.value_length_swa",
+            attention_value_length_swa,
+        )?;
         validate_positive("gemma4.rope.dimension_count", rope_dimension_count)?;
+        validate_positive("gemma4.rope.dimension_count_swa", rope_dimension_count_swa)?;
         validate_finite_positive("gemma4.rope.freq_base", rope_freq_base)?;
+        validate_finite_positive("gemma4.rope.freq_base_swa", rope_freq_base_swa)?;
         validate_finite_positive("gemma4.attention.layer_norm_rms_epsilon", rms_norm_eps)?;
 
         if attention_head_count % attention_head_count_kv != 0 {
@@ -142,6 +180,11 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
         let attention_sliding_window = optional_usize(manifest, "gemma4.attention.sliding_window")?;
         let attention_shared_kv_layers =
             optional_usize(manifest, "gemma4.attention.shared_kv_layers")?;
+        let attention_sliding_window_pattern_len = optional_array_len(
+            manifest,
+            "gemma4.attention.sliding_window_pattern",
+            GgufMetadataType::Bool,
+        )?;
         let final_logit_softcap = optional_f32(manifest, "gemma4.final_logit_softcapping")?;
 
         if let Some(value) = attention_sliding_window {
@@ -158,14 +201,22 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
             context_length,
             block_count,
             embedding_length,
+            embedding_length_per_layer_input,
             feed_forward_length,
             attention_head_count,
             attention_head_count_kv,
+            attention_key_length,
+            attention_value_length,
+            attention_key_length_swa,
+            attention_value_length_swa,
             rope_dimension_count,
+            rope_dimension_count_swa,
             rope_freq_base,
+            rope_freq_base_swa,
             rms_norm_eps,
             attention_sliding_window,
             attention_shared_kv_layers,
+            attention_sliding_window_pattern_len,
             final_logit_softcap,
             tokenizer_model: optional_string(manifest, "tokenizer.ggml.model"),
             tokenizer_token_count,
@@ -177,6 +228,584 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
             tensor_count: manifest.tensors.len(),
             multimodal: true,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4TensorKind {
+    F32,
+    BF16,
+    KQuantized,
+}
+
+struct Gemma4TensorSpec {
+    name: String,
+    shape: Vec<usize>,
+    kind: Gemma4TensorKind,
+}
+
+impl Gemma4TensorKind {
+    fn is_dense(self) -> bool {
+        matches!(self, Self::F32 | Self::BF16)
+    }
+}
+
+/// Build the canonical, ordered list of GGUF tensor names required by the
+/// selected Gemma4 E4B Q4_K_M artifact.
+pub fn required_gemma4_tensor_names(config: &Gemma4Config) -> Vec<String> {
+    required_gemma4_tensor_specs(config)
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// Build the subset of required Gemma4 tensor names whose GGUF payloads can be
+/// loaded losslessly into `LoadedTensor` today.
+pub fn required_gemma4_dense_tensor_names(config: &Gemma4Config) -> Vec<String> {
+    required_gemma4_tensor_specs(config)
+        .into_iter()
+        .filter(|spec| spec.kind.is_dense())
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// Load the dense F32/BF16 Gemma4 tensors from a local GGUF artifact. This is
+/// the first value-loading step toward Gemma4 execution; block-quantized matrix
+/// tensors remain behind the explicit dequant policy gate.
+pub fn load_gemma4_dense_tensors_from_gguf(
+    path: impl AsRef<Path>,
+) -> Result<(Gemma4Config, Vec<LoadedTensor>)> {
+    let path = path.as_ref();
+    let manifest = inspect_gguf(path)?;
+    let config = Gemma4Config::try_from(&manifest)?;
+    validate_gemma4_tensor_inventory(&manifest, &config, Some(path))?;
+
+    let names = required_gemma4_dense_tensor_names(&config);
+    let tensors = load_gguf_tensors_f32(path, &names)?;
+    validate_gemma4_dense_tensors(&config, &tensors, Some(path))?;
+    Ok((config, tensors))
+}
+
+/// Load all required Gemma4 GGUF tensors into F32 value space, dequantizing
+/// Q4_K/Q5_K/Q6_K matrices through the explicit loader API.
+///
+/// This proves the artifact can be read as values; it does not make Gemma4
+/// executable. `Gemma4Config::ensure_supported_for_execution` remains the
+/// execution gate for multimodal, sliding-window/shared-KV, softcap, and family
+/// forward-path support.
+pub fn load_gemma4_dequantized_tensors_from_gguf(
+    path: impl AsRef<Path>,
+) -> Result<(Gemma4Config, Vec<LoadedTensor>)> {
+    let path = path.as_ref();
+    let manifest = inspect_gguf(path)?;
+    let config = Gemma4Config::try_from(&manifest)?;
+    validate_gemma4_tensor_inventory(&manifest, &config, Some(path))?;
+
+    let names = required_gemma4_tensor_names(&config);
+    let tensors = load_gguf_tensors_dequantized_f32(path, &names)?;
+    validate_gemma4_dequantized_tensors(&config, &tensors, Some(path))?;
+    Ok((config, tensors))
+}
+
+/// Validate the selected Gemma4 GGUF header's required tensor inventory without
+/// claiming those tensors can execute yet.
+pub fn validate_gemma4_tensor_inventory(
+    manifest: &GgufManifest,
+    config: &Gemma4Config,
+    path: Option<&Path>,
+) -> Result<()> {
+    validate_gemma4_tensor_dimensions(config, path)?;
+    for spec in required_gemma4_tensor_specs(config) {
+        check_gguf_tensor(manifest, &spec, path)?;
+    }
+    Ok(())
+}
+
+/// Validate loaded dense Gemma4 values against the same model-family contract
+/// used for GGUF header inspection.
+pub fn validate_gemma4_dense_tensors(
+    config: &Gemma4Config,
+    tensors: &[LoadedTensor],
+    path: Option<&Path>,
+) -> Result<()> {
+    validate_gemma4_tensor_dimensions(config, path)?;
+
+    let mut by_name = BTreeMap::new();
+    for tensor in tensors {
+        match by_name.entry(tensor.name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(tensor);
+            }
+            Entry::Occupied(_) => {
+                return Err(invalid_at(
+                    path,
+                    &tensor.name,
+                    "duplicate Gemma4 dense tensor supplied",
+                ));
+            }
+        }
+    }
+
+    for spec in required_gemma4_tensor_specs(config)
+        .into_iter()
+        .filter(|spec| spec.kind.is_dense())
+    {
+        let tensor = by_name.remove(&spec.name).ok_or_else(|| {
+            invalid_at(path, &spec.name, "required Gemma4 dense tensor is missing")
+        })?;
+        check_loaded_dense_tensor(tensor, &spec, path)?;
+    }
+
+    Ok(())
+}
+
+/// Validate all loaded Gemma4 values after explicit K-quant dequantization.
+pub fn validate_gemma4_dequantized_tensors(
+    config: &Gemma4Config,
+    tensors: &[LoadedTensor],
+    path: Option<&Path>,
+) -> Result<()> {
+    validate_gemma4_tensor_dimensions(config, path)?;
+
+    let mut by_name = BTreeMap::new();
+    for tensor in tensors {
+        match by_name.entry(tensor.name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(tensor);
+            }
+            Entry::Occupied(_) => {
+                return Err(invalid_at(
+                    path,
+                    &tensor.name,
+                    "duplicate Gemma4 tensor supplied",
+                ));
+            }
+        }
+    }
+
+    for spec in required_gemma4_tensor_specs(config) {
+        let tensor = by_name
+            .remove(&spec.name)
+            .ok_or_else(|| invalid_at(path, &spec.name, "required Gemma4 tensor is missing"))?;
+        check_loaded_dequantized_tensor(tensor, &spec, path)?;
+    }
+
+    Ok(())
+}
+
+/// Validate tensors for execution. This is intentionally stricter than
+/// inventory validation: Q4_K_M carries quantized block tensors, and Ocelotl
+/// does not have a Gemma4 dequant policy yet.
+pub fn validate_gemma4_tensors(
+    manifest: &GgufManifest,
+    config: &Gemma4Config,
+    path: Option<&Path>,
+) -> Result<()> {
+    validate_gemma4_tensor_inventory(manifest, config, path)?;
+    if required_gemma4_tensor_specs(config)
+        .into_iter()
+        .any(|spec| spec.kind == Gemma4TensorKind::KQuantized)
+    {
+        return Err(OcelotlError::from(UnsupportedError {
+            feature: "gemma4.quantized_tensors".to_string(),
+            requested: Some(config.quantization.label()),
+            supported: vec!["no Gemma4 dequant policy yet".to_string()],
+        }));
+    }
+    Ok(())
+}
+
+fn required_gemma4_tensor_specs(config: &Gemma4Config) -> Vec<Gemma4TensorSpec> {
+    let per_layer_width = config
+        .block_count
+        .saturating_mul(config.embedding_length_per_layer_input);
+    let mut specs =
+        Vec::with_capacity(6usize.saturating_add(config.block_count.saturating_mul(17)));
+
+    specs.push(tensor_spec(
+        "token_embd.weight",
+        &[config.embedding_length, config.tokenizer_token_count],
+        Gemma4TensorKind::KQuantized,
+    ));
+    specs.push(tensor_spec(
+        "output_norm.weight",
+        &[config.embedding_length],
+        Gemma4TensorKind::F32,
+    ));
+    specs.push(tensor_spec(
+        "rope_freqs.weight",
+        &[config.rope_dimension_count_swa],
+        Gemma4TensorKind::F32,
+    ));
+    specs.push(tensor_spec(
+        "per_layer_model_proj.weight",
+        &[config.embedding_length, per_layer_width],
+        Gemma4TensorKind::BF16,
+    ));
+    specs.push(tensor_spec(
+        "per_layer_proj_norm.weight",
+        &[config.embedding_length_per_layer_input],
+        Gemma4TensorKind::F32,
+    ));
+    specs.push(tensor_spec(
+        "per_layer_token_embd.weight",
+        &[per_layer_width, config.tokenizer_token_count],
+        Gemma4TensorKind::KQuantized,
+    ));
+
+    for layer in 0..config.block_count {
+        let is_global_attention = gemma4_uses_global_attention(layer);
+        let (key_length, value_length) = if is_global_attention {
+            (config.attention_key_length, config.attention_value_length)
+        } else {
+            (
+                config.attention_key_length_swa,
+                config.attention_value_length_swa,
+            )
+        };
+        let q_width = config.attention_head_count.saturating_mul(key_length);
+        let k_width = config.attention_head_count_kv.saturating_mul(key_length);
+        let v_width = config.attention_head_count_kv.saturating_mul(value_length);
+
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.attn_norm.weight"),
+            &[config.embedding_length],
+            Gemma4TensorKind::F32,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.attn_q.weight"),
+            &[config.embedding_length, q_width],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.attn_k.weight"),
+            &[config.embedding_length, k_width],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.attn_v.weight"),
+            &[config.embedding_length, v_width],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.attn_output.weight"),
+            &[q_width, config.embedding_length],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.attn_q_norm.weight"),
+            &[key_length],
+            Gemma4TensorKind::F32,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.attn_k_norm.weight"),
+            &[key_length],
+            Gemma4TensorKind::F32,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.ffn_norm.weight"),
+            &[config.embedding_length],
+            Gemma4TensorKind::F32,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.ffn_gate.weight"),
+            &[config.embedding_length, config.feed_forward_length],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.ffn_up.weight"),
+            &[config.embedding_length, config.feed_forward_length],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.ffn_down.weight"),
+            &[config.feed_forward_length, config.embedding_length],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.inp_gate.weight"),
+            &[
+                config.embedding_length,
+                config.embedding_length_per_layer_input,
+            ],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.proj.weight"),
+            &[
+                config.embedding_length_per_layer_input,
+                config.embedding_length,
+            ],
+            Gemma4TensorKind::KQuantized,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.layer_output_scale.weight"),
+            &[1],
+            Gemma4TensorKind::F32,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.post_attention_norm.weight"),
+            &[config.embedding_length],
+            Gemma4TensorKind::F32,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.post_ffw_norm.weight"),
+            &[config.embedding_length],
+            Gemma4TensorKind::F32,
+        ));
+        specs.push(tensor_spec(
+            &format!("blk.{layer}.post_norm.weight"),
+            &[config.embedding_length],
+            Gemma4TensorKind::F32,
+        ));
+    }
+
+    specs
+}
+
+fn tensor_spec(name: &str, shape: &[usize], kind: Gemma4TensorKind) -> Gemma4TensorSpec {
+    Gemma4TensorSpec {
+        name: name.to_string(),
+        shape: shape.to_vec(),
+        kind,
+    }
+}
+
+fn gemma4_uses_global_attention(layer: usize) -> bool {
+    layer % 6 == 5
+}
+
+fn validate_gemma4_tensor_dimensions(config: &Gemma4Config, path: Option<&Path>) -> Result<()> {
+    checked_dim_product(
+        "gemma4.block_count * gemma4.embedding_length_per_layer_input",
+        config.block_count,
+        config.embedding_length_per_layer_input,
+        path,
+    )?;
+    checked_dim_product(
+        "gemma4.attention.head_count * gemma4.attention.key_length",
+        config.attention_head_count,
+        config.attention_key_length,
+        path,
+    )?;
+    checked_dim_product(
+        "gemma4.attention.head_count_kv * gemma4.attention.key_length",
+        config.attention_head_count_kv,
+        config.attention_key_length,
+        path,
+    )?;
+    checked_dim_product(
+        "gemma4.attention.head_count_kv * gemma4.attention.value_length",
+        config.attention_head_count_kv,
+        config.attention_value_length,
+        path,
+    )?;
+    checked_dim_product(
+        "gemma4.attention.head_count * gemma4.attention.key_length_swa",
+        config.attention_head_count,
+        config.attention_key_length_swa,
+        path,
+    )?;
+    checked_dim_product(
+        "gemma4.attention.head_count_kv * gemma4.attention.key_length_swa",
+        config.attention_head_count_kv,
+        config.attention_key_length_swa,
+        path,
+    )?;
+    checked_dim_product(
+        "gemma4.attention.head_count_kv * gemma4.attention.value_length_swa",
+        config.attention_head_count_kv,
+        config.attention_value_length_swa,
+        path,
+    )?;
+    Ok(())
+}
+
+fn checked_dim_product(
+    field: &str,
+    left: usize,
+    right: usize,
+    path: Option<&Path>,
+) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| invalid_at(path, field, &format!("{left} * {right} overflows usize")))
+}
+
+fn check_gguf_tensor(
+    manifest: &GgufManifest,
+    spec: &Gemma4TensorSpec,
+    path: Option<&Path>,
+) -> Result<()> {
+    let tensor = manifest
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == spec.name)
+        .ok_or_else(|| {
+            OcelotlError::from(InvalidModelError {
+                path: path.map(|p| p.to_path_buf()),
+                field: Some(spec.name.clone()),
+                message: format!("tensor `{}` not found in GGUF header", spec.name),
+            })
+        })?;
+    if tensor.shape != spec.shape {
+        return Err(OcelotlError::from(InvalidModelError {
+            path: path.map(|p| p.to_path_buf()),
+            field: Some(spec.name.clone()),
+            message: format!(
+                "tensor `{}` has shape {:?}, expected {:?}",
+                spec.name, tensor.shape, spec.shape,
+            ),
+        }));
+    }
+    if !tensor_kind_matches(tensor, spec.kind) {
+        return Err(OcelotlError::from(InvalidModelError {
+            path: path.map(|p| p.to_path_buf()),
+            field: Some(spec.name.clone()),
+            message: format!(
+                "tensor `{}` has type {:?}, expected {}",
+                spec.name,
+                tensor.tensor_type,
+                tensor_kind_label(spec.kind),
+            ),
+        }));
+    }
+    Ok(())
+}
+
+fn check_loaded_dense_tensor(
+    tensor: &LoadedTensor,
+    spec: &Gemma4TensorSpec,
+    path: Option<&Path>,
+) -> Result<()> {
+    if tensor.shape != spec.shape {
+        return Err(invalid_at(
+            path,
+            &spec.name,
+            &format!(
+                "tensor `{}` has shape {:?}, expected {:?}",
+                spec.name, tensor.shape, spec.shape,
+            ),
+        ));
+    }
+    if !loaded_dense_kind_matches(tensor.dtype, spec.kind) {
+        return Err(invalid_at(
+            path,
+            &spec.name,
+            &format!(
+                "tensor `{}` has dtype {:?}, expected {}",
+                spec.name,
+                tensor.dtype,
+                tensor_kind_label(spec.kind),
+            ),
+        ));
+    }
+
+    let expected_len = checked_shape_len(&spec.name, &spec.shape, path)?;
+    if tensor.values.len() != expected_len {
+        return Err(invalid_at(
+            path,
+            &spec.name,
+            &format!(
+                "tensor `{}` has {} values, expected {expected_len}",
+                spec.name,
+                tensor.values.len(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn check_loaded_dequantized_tensor(
+    tensor: &LoadedTensor,
+    spec: &Gemma4TensorSpec,
+    path: Option<&Path>,
+) -> Result<()> {
+    if tensor.shape != spec.shape {
+        return Err(invalid_at(
+            path,
+            &spec.name,
+            &format!(
+                "tensor `{}` has shape {:?}, expected {:?}",
+                spec.name, tensor.shape, spec.shape,
+            ),
+        ));
+    }
+    if !loaded_dequantized_kind_matches(tensor.dtype, spec.kind) {
+        return Err(invalid_at(
+            path,
+            &spec.name,
+            &format!(
+                "tensor `{}` has dtype {:?}, expected {}",
+                spec.name,
+                tensor.dtype,
+                tensor_dequantized_kind_label(spec.kind),
+            ),
+        ));
+    }
+
+    let expected_len = checked_shape_len(&spec.name, &spec.shape, path)?;
+    if tensor.values.len() != expected_len {
+        return Err(invalid_at(
+            path,
+            &spec.name,
+            &format!(
+                "tensor `{}` has {} values, expected {expected_len}",
+                spec.name,
+                tensor.values.len(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_shape_len(field: &str, shape: &[usize], path: Option<&Path>) -> Result<usize> {
+    shape.iter().try_fold(1usize, |acc, dim| {
+        acc.checked_mul(*dim)
+            .ok_or_else(|| invalid_at(path, field, "tensor shape product overflows usize"))
+    })
+}
+
+fn loaded_dense_kind_matches(dtype: SupportedDtype, expected: Gemma4TensorKind) -> bool {
+    matches!(
+        (dtype, expected),
+        (SupportedDtype::F32, Gemma4TensorKind::F32)
+            | (SupportedDtype::BF16, Gemma4TensorKind::BF16)
+    )
+}
+
+fn loaded_dequantized_kind_matches(dtype: SupportedDtype, expected: Gemma4TensorKind) -> bool {
+    matches!(
+        (dtype, expected),
+        (SupportedDtype::F32, Gemma4TensorKind::F32)
+            | (SupportedDtype::BF16, Gemma4TensorKind::BF16)
+            | (SupportedDtype::F32, Gemma4TensorKind::KQuantized)
+    )
+}
+
+fn tensor_kind_matches(tensor: &GgufTensorEntry, expected: Gemma4TensorKind) -> bool {
+    match expected {
+        Gemma4TensorKind::F32 => tensor.tensor_type == GgmlTensorType::F32,
+        Gemma4TensorKind::BF16 => tensor.tensor_type == GgmlTensorType::BF16,
+        Gemma4TensorKind::KQuantized => matches!(
+            tensor.tensor_type,
+            GgmlTensorType::Q4K | GgmlTensorType::Q5K | GgmlTensorType::Q6K
+        ),
+    }
+}
+
+fn tensor_kind_label(kind: Gemma4TensorKind) -> &'static str {
+    match kind {
+        Gemma4TensorKind::F32 => "F32",
+        Gemma4TensorKind::BF16 => "BF16",
+        Gemma4TensorKind::KQuantized => "one of Q4K, Q5K, Q6K",
+    }
+}
+
+fn tensor_dequantized_kind_label(kind: Gemma4TensorKind) -> &'static str {
+    match kind {
+        Gemma4TensorKind::F32 => "F32",
+        Gemma4TensorKind::BF16 => "BF16",
+        Gemma4TensorKind::KQuantized => "F32 dequantized from one of Q4K, Q5K, Q6K",
     }
 }
 
@@ -254,6 +883,34 @@ fn optional_f32(manifest: &GgufManifest, key: &str) -> Result<Option<f32>> {
     required_f32(manifest, key).map(Some)
 }
 
+fn optional_array_len(
+    manifest: &GgufManifest,
+    key: &str,
+    expected_element_type: GgufMetadataType,
+) -> Result<Option<usize>> {
+    match manifest.metadata_value(key) {
+        None => Ok(None),
+        Some(GgufMetadataValue::Array { element_type, len })
+            if *element_type == expected_element_type =>
+        {
+            (*len)
+                .try_into()
+                .map(Some)
+                .map_err(|_| invalid(key, &format!("array length {len} does not fit in usize")))
+        }
+        Some(GgufMetadataValue::Array { element_type, .. }) => Err(invalid(
+            key,
+            &format!(
+                "must be a GGUF {expected_element_type:?} array metadata value, got {element_type:?} array",
+            ),
+        )),
+        Some(other) => Err(invalid(
+            key,
+            &format!("must be a GGUF array metadata value, got {other:?}"),
+        )),
+    }
+}
+
 fn tokenizer_token_count(manifest: &GgufManifest) -> Result<usize> {
     match manifest.metadata_value("tokenizer.ggml.tokens") {
         Some(GgufMetadataValue::Array {
@@ -315,8 +972,12 @@ fn missing(field: &str) -> OcelotlError {
 }
 
 fn invalid(field: &str, message: &str) -> OcelotlError {
+    invalid_at(None, field, message)
+}
+
+fn invalid_at(path: Option<&Path>, field: &str, message: &str) -> OcelotlError {
     OcelotlError::from(InvalidModelError {
-        path: None,
+        path: path.map(|p| p.to_path_buf()),
         field: Some(field.to_string()),
         message: message.to_string(),
     })
@@ -325,9 +986,9 @@ fn invalid(field: &str, message: &str) -> OcelotlError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocelotl_loader::{GgufMetadataEntry, GgufTensorEntry, inspect_gguf};
+    use ocelotl_loader::{GgufMetadataEntry, GgufTensorEntry};
     use serde::Deserialize;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[derive(Debug, Deserialize)]
     struct Gemma4Fixture {
@@ -402,11 +1063,14 @@ mod tests {
                         FixtureMetadataValue::F32 { value } => GgufMetadataValue::F32(value),
                         FixtureMetadataValue::String { value } => GgufMetadataValue::String(value),
                         FixtureMetadataValue::Array { element_type, len } => {
-                            assert_eq!(element_type, "string");
-                            GgufMetadataValue::Array {
-                                element_type: GgufMetadataType::String,
-                                len,
-                            }
+                            let element_type = match element_type.as_str() {
+                                "bool" => GgufMetadataType::Bool,
+                                "string" => GgufMetadataType::String,
+                                other => panic!(
+                                    "unexpected metadata array element type in fixture: {other}"
+                                ),
+                            };
+                            GgufMetadataValue::Array { element_type, len }
                         }
                     },
                 })
@@ -419,7 +1083,10 @@ mod tests {
                     name: tensor.name,
                     shape: tensor.shape,
                     tensor_type: match tensor.tensor_type.as_str() {
+                        "bf16" => GgmlTensorType::BF16,
                         "q4_k" => GgmlTensorType::Q4K,
+                        "q5_k" => GgmlTensorType::Q5K,
+                        "q6_k" => GgmlTensorType::Q6K,
                         "f32" => GgmlTensorType::F32,
                         other => panic!("unexpected tensor type in fixture: {other}"),
                     },
@@ -434,6 +1101,350 @@ mod tests {
         }
     }
 
+    fn fixture_config() -> Gemma4Config {
+        Gemma4Config::try_from(&fixture_manifest()).expect("Gemma4 GGUF fixture must convert")
+    }
+
+    fn tiny_config() -> Gemma4Config {
+        Gemma4Config {
+            context_length: 16,
+            block_count: 1,
+            embedding_length: 16,
+            embedding_length_per_layer_input: 16,
+            feed_forward_length: 16,
+            attention_head_count: 2,
+            attention_head_count_kv: 1,
+            attention_key_length: 16,
+            attention_value_length: 16,
+            attention_key_length_swa: 16,
+            attention_value_length_swa: 16,
+            rope_dimension_count: 16,
+            rope_dimension_count_swa: 16,
+            rope_freq_base: 1_000_000.0,
+            rope_freq_base_swa: 10_000.0,
+            rms_norm_eps: 1e-6,
+            attention_sliding_window: Some(4),
+            attention_shared_kv_layers: Some(1),
+            attention_sliding_window_pattern_len: Some(1),
+            final_logit_softcap: Some(30.0),
+            tokenizer_model: Some("gemma4".to_string()),
+            tokenizer_token_count: 16,
+            quantization: Gemma4Quantization::Q4KM,
+            has_quantized_tensors: true,
+            tensor_count: 23,
+            multimodal: true,
+        }
+    }
+
+    fn complete_inventory_manifest(config: &Gemma4Config) -> GgufManifest {
+        let mut manifest = fixture_manifest();
+        manifest.tensors = required_gemma4_tensor_specs(config)
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| GgufTensorEntry {
+                name: spec.name,
+                shape: spec.shape,
+                tensor_type: tensor_type_for_spec(spec.kind, index),
+                offset: 0,
+                file_offset: 0,
+                byte_len: None,
+            })
+            .collect();
+        manifest
+    }
+
+    fn tensor_type_for_spec(kind: Gemma4TensorKind, index: usize) -> GgmlTensorType {
+        match kind {
+            Gemma4TensorKind::F32 => GgmlTensorType::F32,
+            Gemma4TensorKind::BF16 => GgmlTensorType::BF16,
+            Gemma4TensorKind::KQuantized => match index % 3 {
+                0 => GgmlTensorType::Q4K,
+                1 => GgmlTensorType::Q5K,
+                _ => GgmlTensorType::Q6K,
+            },
+        }
+    }
+
+    fn complete_dense_loaded_tensors(config: &Gemma4Config) -> Vec<LoadedTensor> {
+        required_gemma4_tensor_specs(config)
+            .into_iter()
+            .filter(|spec| spec.kind.is_dense())
+            .map(|spec| loaded_tensor_for_dense_spec(&spec))
+            .collect()
+    }
+
+    fn complete_dequantized_loaded_tensors(config: &Gemma4Config) -> Vec<LoadedTensor> {
+        required_gemma4_tensor_specs(config)
+            .into_iter()
+            .map(|spec| loaded_tensor_for_dequantized_spec(&spec))
+            .collect()
+    }
+
+    fn loaded_tensor_for_dense_spec(spec: &Gemma4TensorSpec) -> LoadedTensor {
+        let len = checked_shape_len(&spec.name, &spec.shape, None).unwrap();
+        LoadedTensor {
+            name: spec.name.clone(),
+            shape: spec.shape.clone(),
+            dtype: match spec.kind {
+                Gemma4TensorKind::F32 => SupportedDtype::F32,
+                Gemma4TensorKind::BF16 => SupportedDtype::BF16,
+                Gemma4TensorKind::KQuantized => panic!("dense helper received quantized spec"),
+            },
+            values: vec![1.0; len],
+        }
+    }
+
+    fn loaded_tensor_for_dequantized_spec(spec: &Gemma4TensorSpec) -> LoadedTensor {
+        let len = checked_shape_len(&spec.name, &spec.shape, None).unwrap();
+        LoadedTensor {
+            name: spec.name.clone(),
+            shape: spec.shape.clone(),
+            dtype: match spec.kind {
+                Gemma4TensorKind::F32 | Gemma4TensorKind::KQuantized => SupportedDtype::F32,
+                Gemma4TensorKind::BF16 => SupportedDtype::BF16,
+            },
+            values: vec![
+                match spec.kind {
+                    Gemma4TensorKind::KQuantized => 0.0,
+                    _ => 1.0,
+                };
+                len
+            ],
+        }
+    }
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ocelotl_gemma4_{}_{}.gguf",
+            std::process::id(),
+            name
+        ));
+        path
+    }
+
+    fn write_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_f32(out: &mut Vec<u8>, value: f32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_string(out: &mut Vec<u8>, value: &str) {
+        write_u64(out, value.len() as u64);
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn write_string_metadata(out: &mut Vec<u8>, key: &str, value: &str) {
+        write_string(out, key);
+        write_u32(out, 8);
+        write_string(out, value);
+    }
+
+    fn write_u32_metadata(out: &mut Vec<u8>, key: &str, value: u32) {
+        write_string(out, key);
+        write_u32(out, 4);
+        write_u32(out, value);
+    }
+
+    fn write_f32_metadata(out: &mut Vec<u8>, key: &str, value: f32) {
+        write_string(out, key);
+        write_u32(out, 6);
+        write_f32(out, value);
+    }
+
+    fn write_bool_array_metadata(out: &mut Vec<u8>, key: &str, len: usize) {
+        write_string(out, key);
+        write_u32(out, 9);
+        write_u32(out, 7);
+        write_u64(out, len as u64);
+        out.extend(std::iter::repeat_n(1u8, len));
+    }
+
+    fn write_string_array_metadata(out: &mut Vec<u8>, key: &str, len: usize) {
+        write_string(out, key);
+        write_u32(out, 9);
+        write_u32(out, 8);
+        write_u64(out, len as u64);
+        for token in 0..len {
+            write_string(out, &format!("<tok{token}>"));
+        }
+    }
+
+    fn align_len(len: usize) -> usize {
+        len.next_multiple_of(32)
+    }
+
+    fn dense_payload(spec: &Gemma4TensorSpec) -> Vec<u8> {
+        let len = checked_shape_len(&spec.name, &spec.shape, None).unwrap();
+        match spec.kind {
+            Gemma4TensorKind::F32 => (0..len).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
+            Gemma4TensorKind::BF16 => (0..len).flat_map(|_| 0x3f80u16.to_le_bytes()).collect(),
+            Gemma4TensorKind::KQuantized => {
+                assert_eq!(
+                    len % 256,
+                    0,
+                    "tiny Gemma4 GGUF fixture K-quant tensor `{}` must use whole Q4_K blocks",
+                    spec.name
+                );
+                vec![0; (len / 256) * 144]
+            }
+        }
+    }
+
+    fn write_tiny_gemma4_gguf(path: &Path, config: &Gemma4Config) {
+        let specs = required_gemma4_tensor_specs(config);
+        let payloads: Vec<Vec<u8>> = specs.iter().map(dense_payload).collect();
+        let mut offsets = Vec::with_capacity(payloads.len());
+        let mut next_offset = 0usize;
+        for payload in &payloads {
+            next_offset = align_len(next_offset);
+            offsets.push(next_offset);
+            next_offset += payload.len();
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, specs.len() as u64);
+        write_u64(&mut bytes, 24);
+
+        write_string_metadata(&mut bytes, "general.architecture", "gemma4");
+        write_u32_metadata(&mut bytes, "general.file_type", 15);
+        write_u32_metadata(&mut bytes, "gemma4.block_count", config.block_count as u32);
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.context_length",
+            config.context_length as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.embedding_length",
+            config.embedding_length as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.embedding_length_per_layer_input",
+            config.embedding_length_per_layer_input as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.feed_forward_length",
+            config.feed_forward_length as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.head_count",
+            config.attention_head_count as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.head_count_kv",
+            config.attention_head_count_kv as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.key_length",
+            config.attention_key_length as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.value_length",
+            config.attention_value_length as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.key_length_swa",
+            config.attention_key_length_swa as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.value_length_swa",
+            config.attention_value_length_swa as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.rope.dimension_count",
+            config.rope_dimension_count as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.rope.dimension_count_swa",
+            config.rope_dimension_count_swa as u32,
+        );
+        write_f32_metadata(&mut bytes, "gemma4.rope.freq_base", config.rope_freq_base);
+        write_f32_metadata(
+            &mut bytes,
+            "gemma4.rope.freq_base_swa",
+            config.rope_freq_base_swa,
+        );
+        write_f32_metadata(
+            &mut bytes,
+            "gemma4.attention.layer_norm_rms_epsilon",
+            config.rms_norm_eps,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.sliding_window",
+            config.attention_sliding_window.unwrap() as u32,
+        );
+        write_u32_metadata(
+            &mut bytes,
+            "gemma4.attention.shared_kv_layers",
+            config.attention_shared_kv_layers.unwrap() as u32,
+        );
+        write_bool_array_metadata(
+            &mut bytes,
+            "gemma4.attention.sliding_window_pattern",
+            config.attention_sliding_window_pattern_len.unwrap(),
+        );
+        write_f32_metadata(
+            &mut bytes,
+            "gemma4.final_logit_softcapping",
+            config.final_logit_softcap.unwrap(),
+        );
+        write_string_metadata(&mut bytes, "tokenizer.ggml.model", "gemma4");
+        write_string_array_metadata(
+            &mut bytes,
+            "tokenizer.ggml.tokens",
+            config.tokenizer_token_count,
+        );
+
+        for (spec, offset) in specs.iter().zip(offsets.iter()) {
+            write_string(&mut bytes, &spec.name);
+            write_u32(&mut bytes, spec.shape.len() as u32);
+            for dim in &spec.shape {
+                write_u64(&mut bytes, *dim as u64);
+            }
+            write_u32(
+                &mut bytes,
+                match spec.kind {
+                    Gemma4TensorKind::F32 => 0,
+                    Gemma4TensorKind::BF16 => 30,
+                    Gemma4TensorKind::KQuantized => 12,
+                },
+            );
+            write_u64(&mut bytes, *offset as u64);
+        }
+
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        let data_start = bytes.len();
+        bytes.resize(data_start + next_offset, 0);
+        for (offset, payload) in offsets.iter().zip(payloads.iter()) {
+            let start = data_start + offset;
+            bytes[start..start + payload.len()].copy_from_slice(payload);
+        }
+
+        std::fs::write(path, bytes).expect("write tiny Gemma4 GGUF fixture");
+    }
+
     #[test]
     fn try_from_gguf_manifest_accepts_gemma4_fixture_and_preserves_features() {
         let manifest = fixture_manifest();
@@ -443,12 +1454,21 @@ mod tests {
         assert_eq!(cfg.context_length, 131_072);
         assert_eq!(cfg.block_count, 42);
         assert_eq!(cfg.embedding_length, 2_560);
+        assert_eq!(cfg.embedding_length_per_layer_input, 256);
         assert_eq!(cfg.feed_forward_length, 10_240);
         assert_eq!(cfg.attention_head_count, 8);
         assert_eq!(cfg.attention_head_count_kv, 2);
+        assert_eq!(cfg.attention_key_length, 512);
+        assert_eq!(cfg.attention_value_length, 512);
+        assert_eq!(cfg.attention_key_length_swa, 256);
+        assert_eq!(cfg.attention_value_length_swa, 256);
         assert_eq!(cfg.rope_dimension_count, 512);
+        assert_eq!(cfg.rope_dimension_count_swa, 256);
+        assert_eq!(cfg.rope_freq_base, 1_000_000.0);
+        assert_eq!(cfg.rope_freq_base_swa, 10_000.0);
         assert_eq!(cfg.attention_sliding_window, Some(512));
         assert_eq!(cfg.attention_shared_kv_layers, Some(18));
+        assert_eq!(cfg.attention_sliding_window_pattern_len, Some(42));
         assert_eq!(cfg.final_logit_softcap, Some(30.0));
         assert_eq!(cfg.tokenizer_model.as_deref(), Some("gemma4"));
         assert_eq!(cfg.tokenizer_token_count, 262_144);
@@ -456,6 +1476,344 @@ mod tests {
         assert!(cfg.has_quantized_tensors);
         assert_eq!(cfg.tensor_count, 2);
         assert!(cfg.multimodal);
+    }
+
+    #[test]
+    fn required_gemma4_tensor_names_enumerates_selected_q4_k_m_inventory() {
+        let cfg = fixture_config();
+
+        let names = required_gemma4_tensor_names(&cfg);
+
+        assert_eq!(names.len(), 720);
+        assert_eq!(names[0], "token_embd.weight");
+        assert_eq!(names[1], "output_norm.weight");
+        assert_eq!(names[2], "rope_freqs.weight");
+        assert_eq!(names[3], "per_layer_model_proj.weight");
+        assert_eq!(names[4], "per_layer_proj_norm.weight");
+        assert_eq!(names[5], "per_layer_token_embd.weight");
+        assert_eq!(names[7], "blk.0.attn_q.weight");
+        assert!(names.contains(&"blk.5.attn_q.weight".to_string()));
+        assert!(names.contains(&"blk.41.proj.weight".to_string()));
+        assert_eq!(names[719], "blk.41.post_norm.weight");
+    }
+
+    #[test]
+    fn required_gemma4_tensor_specs_model_swa_and_global_attention_widths() {
+        let cfg = fixture_config();
+        let specs = required_gemma4_tensor_specs(&cfg);
+
+        let swa_q = specs
+            .iter()
+            .find(|spec| spec.name == "blk.0.attn_q.weight")
+            .unwrap();
+        let global_q = specs
+            .iter()
+            .find(|spec| spec.name == "blk.5.attn_q.weight")
+            .unwrap();
+        let swa_k_norm = specs
+            .iter()
+            .find(|spec| spec.name == "blk.0.attn_k_norm.weight")
+            .unwrap();
+        let global_k_norm = specs
+            .iter()
+            .find(|spec| spec.name == "blk.5.attn_k_norm.weight")
+            .unwrap();
+
+        assert_eq!(swa_q.shape, vec![2_560, 2_048]);
+        assert_eq!(global_q.shape, vec![2_560, 4_096]);
+        assert_eq!(swa_k_norm.shape, vec![256]);
+        assert_eq!(global_k_norm.shape, vec![512]);
+    }
+
+    #[test]
+    fn validate_gemma4_tensor_inventory_accepts_complete_synthetic_header() {
+        let cfg = fixture_config();
+        let manifest = complete_inventory_manifest(&cfg);
+
+        validate_gemma4_tensor_inventory(&manifest, &cfg, None)
+            .expect("complete synthetic Gemma4 inventory must validate");
+
+        assert_eq!(manifest.tensors.len(), 720);
+    }
+
+    #[test]
+    fn validate_gemma4_tensor_inventory_rejects_missing_tensor_with_field_name() {
+        let cfg = fixture_config();
+        let mut manifest = complete_inventory_manifest(&cfg);
+        manifest
+            .tensors
+            .retain(|tensor| tensor.name != "blk.0.attn_q.weight");
+
+        let err = validate_gemma4_tensor_inventory(&manifest, &cfg, None)
+            .expect_err("missing tensor must fail inventory validation");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("blk.0.attn_q.weight"));
+                assert!(invalid.message.contains("not found"));
+            }
+            other => panic!("expected InvalidModel for missing tensor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gemma4_tensor_inventory_rejects_wrong_shape_with_field_name() {
+        let cfg = fixture_config();
+        let mut manifest = complete_inventory_manifest(&cfg);
+        let tensor = manifest
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.5.attn_q.weight")
+            .unwrap();
+        tensor.shape = vec![
+            cfg.embedding_length,
+            cfg.attention_head_count * cfg.attention_key_length_swa,
+        ];
+
+        let err = validate_gemma4_tensor_inventory(&manifest, &cfg, None)
+            .expect_err("wrong tensor shape must fail inventory validation");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("blk.5.attn_q.weight"));
+                assert!(invalid.message.contains("expected"));
+            }
+            other => panic!("expected InvalidModel for wrong tensor shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gemma4_tensor_inventory_rejects_wrong_tensor_type_with_field_name() {
+        let cfg = fixture_config();
+        let mut manifest = complete_inventory_manifest(&cfg);
+        let tensor = manifest
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "token_embd.weight")
+            .unwrap();
+        tensor.tensor_type = GgmlTensorType::F32;
+
+        let err = validate_gemma4_tensor_inventory(&manifest, &cfg, None)
+            .expect_err("wrong tensor type must fail inventory validation");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("token_embd.weight"));
+                assert!(invalid.message.contains("expected one of Q4K, Q5K, Q6K"));
+            }
+            other => panic!("expected InvalidModel for wrong tensor type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gemma4_tensors_rejects_quantized_without_dequant_policy() {
+        let cfg = fixture_config();
+        let manifest = complete_inventory_manifest(&cfg);
+
+        let err = validate_gemma4_tensors(&manifest, &cfg, None)
+            .expect_err("Gemma4 quantized tensors must stay execution-rejected");
+
+        match err {
+            OcelotlError::Unsupported(unsupported) => {
+                assert_eq!(unsupported.feature, "gemma4.quantized_tensors");
+                assert_eq!(unsupported.requested.as_deref(), Some("q4_k_m"));
+            }
+            other => panic!("expected Unsupported for quantized tensors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_gemma4_dense_tensor_names_enumerates_loadable_subset() {
+        let cfg = fixture_config();
+
+        let names = required_gemma4_dense_tensor_names(&cfg);
+
+        assert_eq!(names.len(), 340);
+        assert!(names.contains(&"output_norm.weight".to_string()));
+        assert!(names.contains(&"per_layer_model_proj.weight".to_string()));
+        assert!(names.contains(&"blk.0.attn_q_norm.weight".to_string()));
+        assert!(names.contains(&"blk.41.post_norm.weight".to_string()));
+        assert!(!names.contains(&"token_embd.weight".to_string()));
+        assert!(!names.contains(&"blk.0.attn_q.weight".to_string()));
+    }
+
+    #[test]
+    fn validate_gemma4_dense_tensors_accepts_complete_synthetic_values() {
+        let cfg = tiny_config();
+        let tensors = complete_dense_loaded_tensors(&cfg);
+
+        validate_gemma4_dense_tensors(&cfg, &tensors, None)
+            .expect("complete dense Gemma4 tensors must validate");
+    }
+
+    #[test]
+    fn validate_gemma4_dequantized_tensors_accepts_complete_synthetic_values() {
+        let cfg = tiny_config();
+        let tensors = complete_dequantized_loaded_tensors(&cfg);
+
+        validate_gemma4_dequantized_tensors(&cfg, &tensors, None)
+            .expect("complete dequantized Gemma4 tensors must validate");
+    }
+
+    #[test]
+    fn validate_gemma4_dequantized_tensors_rejects_quantized_tensor_not_dequantized_to_f32() {
+        let cfg = tiny_config();
+        let mut tensors = complete_dequantized_loaded_tensors(&cfg);
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "token_embd.weight")
+            .unwrap();
+        tensor.dtype = SupportedDtype::BF16;
+
+        let err = validate_gemma4_dequantized_tensors(&cfg, &tensors, None)
+            .expect_err("quantized Gemma4 tensor must be dequantized to F32");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("token_embd.weight"));
+                assert!(invalid.message.contains("F32 dequantized"));
+            }
+            other => panic!("expected InvalidModel for wrong dequant dtype, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gemma4_dense_tensors_rejects_missing_tensor_with_field_name() {
+        let cfg = tiny_config();
+        let mut tensors = complete_dense_loaded_tensors(&cfg);
+        tensors.retain(|tensor| tensor.name != "output_norm.weight");
+
+        let err = validate_gemma4_dense_tensors(&cfg, &tensors, None)
+            .expect_err("missing dense tensor must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("output_norm.weight"));
+                assert!(invalid.message.contains("missing"));
+            }
+            other => panic!("expected InvalidModel for missing dense tensor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gemma4_dense_tensors_rejects_wrong_dtype_with_field_name() {
+        let cfg = tiny_config();
+        let mut tensors = complete_dense_loaded_tensors(&cfg);
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "output_norm.weight")
+            .unwrap();
+        tensor.dtype = SupportedDtype::BF16;
+
+        let err = validate_gemma4_dense_tensors(&cfg, &tensors, None)
+            .expect_err("wrong dense dtype must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("output_norm.weight"));
+                assert!(invalid.message.contains("expected F32"));
+            }
+            other => panic!("expected InvalidModel for wrong dense dtype, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gemma4_dense_tensors_rejects_wrong_value_count() {
+        let cfg = tiny_config();
+        let mut tensors = complete_dense_loaded_tensors(&cfg);
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "output_norm.weight")
+            .unwrap();
+        tensor.values.pop();
+
+        let err = validate_gemma4_dense_tensors(&cfg, &tensors, None)
+            .expect_err("wrong dense value count must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("output_norm.weight"));
+                assert!(invalid.message.contains("expected"));
+            }
+            other => panic!("expected InvalidModel for wrong dense value count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_gemma4_dense_tensors_from_gguf_loads_tiny_synthetic_dense_subset() {
+        let cfg = tiny_config();
+        let path = tmp_path("dense_values");
+        write_tiny_gemma4_gguf(&path, &cfg);
+
+        let (loaded_cfg, tensors) = load_gemma4_dense_tensors_from_gguf(&path)
+            .expect("tiny Gemma4 GGUF dense subset must load");
+
+        assert_eq!(loaded_cfg.embedding_length, cfg.embedding_length);
+        assert_eq!(
+            tensors.len(),
+            required_gemma4_dense_tensor_names(&cfg).len()
+        );
+        let output_norm = tensors
+            .iter()
+            .find(|tensor| tensor.name == "output_norm.weight")
+            .unwrap();
+        assert_eq!(output_norm.dtype, SupportedDtype::F32);
+        assert_eq!(output_norm.values, vec![1.0; cfg.embedding_length]);
+        let per_layer_model_proj = tensors
+            .iter()
+            .find(|tensor| tensor.name == "per_layer_model_proj.weight")
+            .unwrap();
+        assert_eq!(per_layer_model_proj.dtype, SupportedDtype::BF16);
+        assert!(
+            per_layer_model_proj
+                .values
+                .iter()
+                .all(|value| *value == 1.0)
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_gemma4_dequantized_tensors_from_gguf_loads_tiny_synthetic_all_tensors() {
+        let cfg = tiny_config();
+        let path = tmp_path("dequantized_values");
+        write_tiny_gemma4_gguf(&path, &cfg);
+
+        let (loaded_cfg, tensors) = load_gemma4_dequantized_tensors_from_gguf(&path)
+            .expect("tiny Gemma4 GGUF dequantized tensor set must load");
+
+        assert_eq!(loaded_cfg.embedding_length, cfg.embedding_length);
+        assert_eq!(tensors.len(), required_gemma4_tensor_names(&cfg).len());
+
+        let token_embd = tensors
+            .iter()
+            .find(|tensor| tensor.name == "token_embd.weight")
+            .unwrap();
+        assert_eq!(token_embd.dtype, SupportedDtype::F32);
+        assert_eq!(
+            token_embd.values.len(),
+            cfg.embedding_length * cfg.tokenizer_token_count
+        );
+        assert!(token_embd.values.iter().all(|value| *value == 0.0));
+
+        let per_layer_model_proj = tensors
+            .iter()
+            .find(|tensor| tensor.name == "per_layer_model_proj.weight")
+            .unwrap();
+        assert_eq!(per_layer_model_proj.dtype, SupportedDtype::BF16);
+        assert!(
+            per_layer_model_proj
+                .values
+                .iter()
+                .all(|value| *value == 1.0)
+        );
+
+        loaded_cfg
+            .ensure_supported_for_execution()
+            .expect_err("value loading must not enable Gemma4 execution");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -564,7 +1922,40 @@ mod tests {
         assert_eq!(cfg.attention_shared_kv_layers, Some(18));
         assert_eq!(cfg.final_logit_softcap, Some(30.0));
         assert_eq!(cfg.quantization, Gemma4Quantization::Q4KM);
+        validate_gemma4_tensor_inventory(&manifest, &cfg, Some(&path))
+            .expect("local Gemma4 Q4_K_M tensor inventory must validate");
+        validate_gemma4_tensors(&manifest, &cfg, Some(&path))
+            .expect_err("local Gemma4 Q4_K_M tensors must stay rejected before dequant policy");
         cfg.ensure_supported_for_execution()
             .expect_err("local Gemma4 Q4_K_M execution must be rejected before compute");
+    }
+
+    #[test]
+    #[ignore = "requires local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf or OCELOTL_GEMMA4_GGUF_PATH"]
+    fn local_gemma4_q4_k_m_gguf_dense_subset_loads() {
+        let path = local_gemma4_gguf_path();
+        assert!(
+            path.exists(),
+            "missing Gemma4 GGUF artifact at {}; set OCELOTL_GEMMA4_GGUF_PATH or see docs/artifact-preparation.md",
+            path.display()
+        );
+
+        let (cfg, tensors) = load_gemma4_dense_tensors_from_gguf(&path)
+            .expect("local Gemma4 dense GGUF tensors must load");
+
+        assert_eq!(cfg.quantization, Gemma4Quantization::Q4KM);
+        assert_eq!(tensors.len(), 340);
+        let per_layer_model_proj = tensors
+            .iter()
+            .find(|tensor| tensor.name == "per_layer_model_proj.weight")
+            .expect("PLE projection tensor must load");
+        assert_eq!(per_layer_model_proj.dtype, SupportedDtype::BF16);
+        assert_eq!(per_layer_model_proj.shape, vec![2_560, 10_752]);
+        let output_norm = tensors
+            .iter()
+            .find(|tensor| tensor.name == "output_norm.weight")
+            .expect("output norm tensor must load");
+        assert_eq!(output_norm.dtype, SupportedDtype::F32);
+        assert_eq!(output_norm.shape, vec![2_560]);
     }
 }

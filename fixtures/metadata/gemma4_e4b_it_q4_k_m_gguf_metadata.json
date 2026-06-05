@@ -48,6 +48,13 @@
         }
       },
       {
+        "key": "gemma4.embedding_length_per_layer_input",
+        "value": {
+          "type": "u32",
+          "value": 256
+        }
+      },
+      {
         "key": "gemma4.feed_forward_length",
         "value": {
           "type": "u32",
@@ -69,6 +76,34 @@
         }
       },
       {
+        "key": "gemma4.attention.key_length",
+        "value": {
+          "type": "u32",
+          "value": 512
+        }
+      },
+      {
+        "key": "gemma4.attention.value_length",
+        "value": {
+          "type": "u32",
+          "value": 512
+        }
+      },
+      {
+        "key": "gemma4.attention.key_length_swa",
+        "value": {
+          "type": "u32",
+          "value": 256
+        }
+      },
+      {
+        "key": "gemma4.attention.value_length_swa",
+        "value": {
+          "type": "u32",
+          "value": 256
+        }
+      },
+      {
         "key": "gemma4.rope.dimension_count",
         "value": {
           "type": "u32",
@@ -76,10 +111,24 @@
         }
       },
       {
+        "key": "gemma4.rope.dimension_count_swa",
+        "value": {
+          "type": "u32",
+          "value": 256
+        }
+      },
+      {
         "key": "gemma4.rope.freq_base",
         "value": {
           "type": "f32",
           "value": 1000000.0
+        }
+      },
+      {
+        "key": "gemma4.rope.freq_base_swa",
+        "value": {
+          "type": "f32",
+          "value": 10000.0
         }
       },
       {
@@ -101,6 +150,14 @@
         "value": {
           "type": "u32",
           "value": 18
+        }
+      },
+      {
+        "key": "gemma4.attention.sliding_window_pattern",
+        "value": {
+          "type": "array",
+          "element_type": "bool",
+          "len": 42
         }
       },
       {

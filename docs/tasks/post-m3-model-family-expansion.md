@@ -57,6 +57,31 @@ and does not modify the closed M3.6 MLP task.
   Gemma4 artifact and one selected Qwen3.5 artifact.
 - `Done when`: missing tensors, wrong shapes, unsupported dtypes, and quantized
   tensors without a dequant policy fail with typed errors.
+- `Status`: Gemma4 side done 2026-06-05 for
+  `google_gemma-4-E4B-it-Q4_K_M.gguf`. `Gemma4Config` now preserves the
+  per-layer input width, SWA/global attention key/value widths, SWA RoPE facts,
+  and sliding-window pattern length needed to derive the selected artifact's
+  720 required GGUF tensor descriptors. Inventory validation accepts the real
+  local header and rejects execution until a Gemma4 dequant policy exists.
+  Qwen3.5 tensor inventory remains pending.
+- `Follow-up`: Gemma4 dense GGUF value loading landed 2026-06-05.
+  `ocelotl-loader` can load dense GGUF F32/F16/BF16 tensors into
+  `LoadedTensor`, and `ocelotl-models` can load/validate the selected Gemma4
+  artifact's 340 dense tensors, including BF16 PLE projection weights, while
+  keeping Q4K/Q5K/Q6K matrices behind the dequant policy gate.
+- `Follow-up`: GGUF Q4K/Q5K/Q6K layout policy landed 2026-06-05.
+  `ocelotl-loader` now records ggml's K-quant block contract
+  (256 elements/block; Q4K 144 bytes, Q5K 176 bytes, Q6K 210 bytes), validates
+  block-aligned element counts and byte ranges during header inspection, and
+  still returns typed `Unsupported` for quantized value loading.
+- `Follow-up`: GGUF Q4K/Q5K/Q6K dequantized value loading landed 2026-06-05.
+  The dense `load_gguf_tensor_f32` API remains dense-only, while
+  `load_gguf_tensor_dequantized_f32` and
+  `load_gguf_tensors_dequantized_f32` explicitly materialize Q4K/Q5K/Q6K
+  tensors into F32 values. Exact small-vector tests pin ggml scale/min packing,
+  Q5 high-bit lanes, and Q6 signed scales. `ocelotl-models` can now load and
+  validate all required tensors from a tiny synthetic Gemma4 GGUF through the
+  dequantized path, while Gemma4 execution remains rejected until MF.7.
 
 ## MF.6 Pin Tokenizer And Chat Template Behavior
 
@@ -65,6 +90,13 @@ and does not modify the closed M3.6 MLP task.
   tokenization and chat-template behavior.
 - `Done when`: each family has deterministic tokenizer/template fixtures without
   adding network access to default tests.
+- `Status`: Gemma4 chat-template compatibility slice landed 2026-06-05.
+  `ChatTemplate::apply_with_options` accepts serializable structured
+  messages/tools plus `bos_token` and `enable_thinking`, MiniJinja macros are
+  enabled, and default-on tests pin llama.cpp-style Gemma4 BOS, thinking,
+  assistant-as-model, multimodal placeholder, tool-call/tool-response, and
+  upstream filter-surface behavior. Exact tokenizer ID fixtures and ignored
+  real-artifact drift checks remain pending for Gemma4 and Qwen3.5.
 
 ## MF.7 Add Tiny Synthetic Forward Per Supported Subset
 

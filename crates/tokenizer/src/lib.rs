@@ -7,7 +7,7 @@ use ocelotl_core::{OcelotlError, Result, TokenizerError, UnsupportedError};
 
 mod chat_template;
 mod whisper;
-pub use chat_template::{ChatMessage, ChatTemplate};
+pub use chat_template::{ChatMessage, ChatTemplate, ChatTemplateOptions};
 pub use whisper::{
     WHISPER_TIMESTAMP_STEP_SECONDS, WhisperDecodeMask, WhisperStartupTokens, WhisperTimestampMode,
     WhisperTimestampedSegment, WhisperTokenMaskDecision, WhisperTokenRole,

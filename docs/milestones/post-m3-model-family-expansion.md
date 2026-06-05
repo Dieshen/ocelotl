@@ -52,6 +52,26 @@ Gemma4:
   preserves Gemma4 context length, sliding-window attention, shared-KV layers,
   final-logit softcapping, embedded tokenizer metadata, and Q4_K_M status while
   rejecting Gemma4 execution before compute.
+- MF.5's Gemma4 slice adds the selected Q4_K_M artifact's required GGUF tensor
+  inventory: 720 tensor descriptors covering global embeddings/projections and
+  42 decoder blocks with SWA/global attention width differences. The inventory
+  validator accepts F32 norms/scales, BF16 per-layer projection weights, and
+  Q4K/Q5K/Q6K quantized matrices from the real local header, while execution
+  remains rejected until a Gemma4 dequant policy exists.
+- A follow-up Gemma4 value-loading slice adds dense GGUF payload reads for
+  F32/F16/BF16 tensors. The selected Q4_K_M artifact's 340 dense tensors load
+  into `LoadedTensor`, including BF16 PLE projection weights.
+- A follow-up GGUF K-quant value-loading slice records the current ggml
+  Q4_K/Q5_K/Q6_K block contract in the loader: 256 elements per block, with
+  144, 176, and 210 bytes per block respectively. Parsed GGUF headers now
+  validate K-quant tensor element counts and byte ranges. The explicit
+  dequantized APIs load dense and Q4K/Q5K/Q6K tensors into F32 values, with
+  exact vector tests for each format and a tiny synthetic Gemma4 all-tensor load;
+  execution remains rejected until MF.7.
+- A Gemma4 chat-template compatibility slice expands the tokenizer renderer
+  context for current llama.cpp-style Gemma4 templates: macros are enabled in
+  MiniJinja, and render options now include `bos_token`, `enable_thinking`,
+  structured `tools`, and serializable message objects for tool/media fields.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

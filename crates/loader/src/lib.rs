@@ -9,8 +9,13 @@ use serde::Deserialize;
 
 pub mod gguf_inspect;
 pub use gguf_inspect::{
-    GgmlTensorType, GgufManifest, GgufMetadataEntry, GgufMetadataType, GgufMetadataValue,
-    GgufTensorEntry, inspect_gguf,
+    GgmlQuantLayout, GgmlTensorType, GgufManifest, GgufMetadataEntry, GgufMetadataType,
+    GgufMetadataValue, GgufTensorEntry, inspect_gguf,
+};
+pub mod gguf_values;
+pub use gguf_values::{
+    load_gguf_tensor_dequantized_f32, load_gguf_tensor_f32, load_gguf_tensors_dequantized_f32,
+    load_gguf_tensors_f32,
 };
 pub mod safetensors_inspect;
 pub use safetensors_inspect::{

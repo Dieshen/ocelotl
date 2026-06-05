@@ -29,8 +29,6 @@
 //!   execution). One new foreign-crate boundary, applied via the
 //!   external-crate-boundary pattern.
 
-use std::collections::BTreeMap;
-
 use minijinja::{Environment, ErrorKind, context};
 use ocelotl_core::{OcelotlError, Result, TokenizerError, UnsupportedError};
 use serde::{Deserialize, Serialize};
@@ -60,6 +58,19 @@ pub struct ChatTemplate {
     // source field. Lifetime parameter is `'static` because no borrowed
     // strings cross the boundary — only owned `String`s go in.
     env: Environment<'static>,
+}
+
+/// Additional variables passed to a Hugging Face chat template render.
+///
+/// The default preserves the existing Qwen2.5 behavior: no BOS token,
+/// `enable_thinking=false`, and no trailing generation prompt. Model families
+/// with richer templates, such as Gemma4, can opt into the extra variables
+/// without widening the simple `ChatMessage` path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChatTemplateOptions {
+    pub add_generation_prompt: bool,
+    pub enable_thinking: bool,
+    pub bos_token: Option<String>,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -124,11 +135,38 @@ impl ChatTemplate {
     ///   bad type, etc.) → `OcelotlError::Tokenizer` with the
     ///   minijinja error preserved as `source`.
     pub fn apply(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
-        // `tools` is referenced by the Qwen2.5 template via `{%- if tools %}`.
-        // Strict undefined would error if we omit it, so we pass an empty
-        // list — matches the Hugging Face convention where tools defaults
-        // to `[]` when not provided.
-        let tools: Vec<BTreeMap<String, String>> = Vec::new();
+        let tools: Vec<()> = Vec::new();
+        self.apply_with_options(
+            messages,
+            &tools,
+            &ChatTemplateOptions {
+                add_generation_prompt,
+                ..ChatTemplateOptions::default()
+            },
+        )
+    }
+
+    /// Render the template with arbitrary serializable messages/tools plus
+    /// model-family options.
+    ///
+    /// This is intentionally generic over `serde::Serialize` rather than
+    /// exposing a JSON value type as part of the public API. GGUF/HF chat
+    /// templates commonly expect message fields beyond the simple
+    /// string-content `ChatMessage` shape: multimodal content arrays,
+    /// `tool_calls`, `tool_responses`, `reasoning_content`, and tool schema
+    /// objects. Callers can pass Ocelotl-owned typed structs or test-local
+    /// JSON values; the renderer still keeps MiniJinja private.
+    pub fn apply_with_options<M, T>(
+        &self,
+        messages: &[M],
+        tools: &[T],
+        options: &ChatTemplateOptions,
+    ) -> Result<String>
+    where
+        M: Serialize,
+        T: Serialize,
+    {
+        let bos_token = options.bos_token.as_deref().unwrap_or("");
 
         let template = self.env.get_template(TEMPLATE_NAME).map_err(|e| {
             OcelotlError::Tokenizer(TokenizerError {
@@ -140,8 +178,10 @@ impl ChatTemplate {
         template
             .render(context! {
                 messages => messages,
-                add_generation_prompt => add_generation_prompt,
+                add_generation_prompt => options.add_generation_prompt,
                 tools => tools,
+                enable_thinking => options.enable_thinking,
+                bos_token => bos_token,
             })
             .map_err(translate_render_error)
     }
@@ -217,7 +257,9 @@ const SUPPORTED_JINJA_FEATURES: &[&str] = &[
     "set assignments",
     "string concatenation with +",
     "tojson filter",
+    "dictsort/default/trim/upper filters",
     "is defined / is not defined tests",
+    "mapping/string/sequence/boolean tests",
     "method calls on context objects",
 ];
 
@@ -314,6 +356,31 @@ mod tests {
             out, "NO",
             "lenient undefined semantics: missing_var evaluates falsy in `if`"
         );
+    }
+
+    #[test]
+    fn apply_with_options_exposes_bos_token_and_enable_thinking() {
+        let tmpl = ChatTemplate::from_jinja(
+            "{{ bos_token }}:{% if enable_thinking %}think{% else %}plain{% endif %}:{% if add_generation_prompt %}gen{% endif %}",
+        )
+        .expect("template must compile");
+
+        let out = tmpl
+            .apply_with_options(
+                &[ChatMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                }],
+                &Vec::<()>::new(),
+                &ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: true,
+                    bos_token: Some("<bos>".to_string()),
+                },
+            )
+            .expect("render must succeed");
+
+        assert_eq!(out, "<bos>:think:gen");
     }
 
     #[test]
