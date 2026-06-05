@@ -35,6 +35,7 @@
     0.0716895,
     0.1990668
   ],
+  "expected_decode_token": 7,
   "tolerance": 0.0001,
   "rationale": "MF.7 pins the first supported Gemma4 text-only dense F32 runtime prefill subset."
 }

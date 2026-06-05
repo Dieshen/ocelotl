@@ -107,14 +107,16 @@ and does not modify the closed M3.6 MLP task.
   whose metadata/tensors are already validated.
 - `Status`: Gemma4 text-only synthetic subset landed 2026-06-05.
   `Gemma4TextModel` and `Gemma4TextWeights` execute a dense F32 CPU/reference
-  decoder-core path through `ocelotl_runtime::gemma::prefill`, including
-  embedding lookup, RMSNorm, q/k/v projection, Gemma q/k RMSNorm, RoPE, full
-  attention, gated SiLU MLP, final norm, and tied-embedding logits. The pinned
-  runtime fixture is
-  `fixtures/logits/gemma4_tiny_synthetic_text_prefill.json`. Real Gemma4
-  Q4_K_M GGUF execution remains rejected because multimodal, sliding-window,
-  shared-KV, softcap, mixed width, and quantized-origin execution policies are
-  not complete.
+  decoder-core path through `ocelotl_runtime::gemma::{prefill,
+  decode_one_token}`, including embedding lookup, RMSNorm, q/k/v projection,
+  Gemma q/k RMSNorm, RoPE, full attention, gated SiLU MLP, final norm, tied
+  embedding logits, and greedy decode. The pinned runtime fixture is
+  `fixtures/logits/gemma4_tiny_synthetic_text_prefill.json`, including
+  `expected_decode_token = 7`. Runtime builder tests prove CPU selection and
+  the no-launch CubeCL/WGPU backend contract for the supported subset. Real
+  Gemma4 Q4_K_M GGUF execution remains rejected because multimodal,
+  sliding-window, shared-KV, softcap, mixed width, and quantized-origin
+  execution policies are not complete.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 

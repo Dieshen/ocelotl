@@ -74,11 +74,13 @@ Gemma4:
   structured `tools`, and serializable message objects for tool/media fields.
 - MF.7 adds the first Gemma4 execution subset: `Gemma4TextModel` runs a
   text-only, unquantized, dense F32 synthetic decoder-core path through
-  `ocelotl_runtime::gemma::prefill`, with pinned logits in
-  `fixtures/logits/gemma4_tiny_synthetic_text_prefill.json`. This does not
-  enable the selected real Q4_K_M GGUF artifact; multimodal,
-  sliding-window/shared-KV, softcap, mixed-width, and quantized-origin execution
-  features remain rejected before compute.
+  `ocelotl_runtime::gemma::{prefill, decode_one_token}`, with pinned logits and
+  greedy decode token `TokenId(7)` in
+  `fixtures/logits/gemma4_tiny_synthetic_text_prefill.json`. Runtime builder
+  tests also prove CPU backend selection and the no-launch CubeCL/WGPU backend
+  contract for the subset. This does not enable the selected real Q4_K_M GGUF
+  artifact; multimodal, sliding-window/shared-KV, softcap, mixed-width, and
+  quantized-origin execution features remain rejected before compute.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

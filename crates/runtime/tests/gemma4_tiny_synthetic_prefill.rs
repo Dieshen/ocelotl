@@ -6,11 +6,11 @@
 //! and no final-logit softcap. The real GGUF artifact remains rejected until
 //! those features are implemented and compared against a reference.
 
-use ocelotl_core::TokenId;
+use ocelotl_core::{OcelotlError, TokenId};
 use ocelotl_models::gemma::{
     Gemma4Config, Gemma4Quantization, Gemma4TextLayerWeights, Gemma4TextModel, Gemma4TextWeights,
 };
-use ocelotl_runtime::gemma::prefill;
+use ocelotl_runtime::gemma::{decode_one_token, prefill};
 
 const FIXTURE_PATH: &str = "../../fixtures/logits/gemma4_tiny_synthetic_text_prefill.json";
 const TOLERANCE: f32 = 1.0e-4;
@@ -108,12 +108,12 @@ struct LogitsFixture {
     model_shape: String,
     prompt_tokens: Vec<u32>,
     expected_logits: Vec<f32>,
+    expected_decode_token: u32,
     tolerance: f32,
     rationale: String,
 }
 
-#[test]
-fn gemma4_prefill_matches_pinned_fixture_through_runtime_path() {
+fn load_fixture() -> LogitsFixture {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR must be set when running cargo test");
     let path = std::path::Path::new(&manifest_dir).join(FIXTURE_PATH);
@@ -128,10 +128,19 @@ fn gemma4_prefill_matches_pinned_fixture_through_runtime_path() {
         "fixture tolerance ({}) must match test tolerance ({TOLERANCE})",
         fixture.tolerance
     );
+    fixture
+}
 
+fn tiny_model() -> Gemma4TextModel {
     let cfg = tiny_config();
-    let model = Gemma4TextModel::new(cfg.clone(), tiny_weights(&cfg))
-        .expect("tiny Gemma4 text model must build");
+    Gemma4TextModel::new(cfg.clone(), tiny_weights(&cfg))
+        .expect("tiny Gemma4 text model must build")
+}
+
+#[test]
+fn gemma4_prefill_matches_pinned_fixture_through_runtime_path() {
+    let fixture = load_fixture();
+    let model = tiny_model();
     let prompt: Vec<TokenId> = fixture.prompt_tokens.iter().copied().map(TokenId).collect();
 
     let logits = prefill(&model, &prompt).expect("runtime Gemma4 prefill must succeed");
@@ -153,5 +162,49 @@ fn gemma4_prefill_matches_pinned_fixture_through_runtime_path() {
             "Gemma4 logit {idx}: got {got}, want {want}, diff {diff} exceeds {TOLERANCE}\n{}",
             fixture.rationale
         );
+    }
+}
+
+#[test]
+fn gemma4_decode_one_token_matches_pinned_argmax_of_prefill_fixture() {
+    let fixture = load_fixture();
+    let model = tiny_model();
+    let prompt: Vec<TokenId> = fixture.prompt_tokens.iter().copied().map(TokenId).collect();
+
+    let max_index = fixture
+        .expected_logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(idx, _)| idx as u32)
+        .expect("fixture logits must not be empty");
+    assert_eq!(
+        fixture.expected_decode_token, max_index,
+        "fixture expected_decode_token must be the argmax of expected_logits"
+    );
+
+    let first = decode_one_token(&model, &prompt).expect("Gemma4 decode must succeed");
+    let second = decode_one_token(&model, &prompt).expect("Gemma4 decode must be repeatable");
+
+    assert_eq!(first, TokenId(fixture.expected_decode_token));
+    assert_eq!(first, second, "Gemma4 decode must be deterministic");
+}
+
+#[test]
+fn gemma4_decode_one_token_propagates_invalid_request_for_empty_prompt() {
+    let model = tiny_model();
+
+    let err = decode_one_token(&model, &[]).expect_err("empty prompt must be rejected");
+
+    match err {
+        OcelotlError::InvalidRequest(invalid) => {
+            assert_eq!(invalid.field, "tokens");
+            assert!(
+                invalid.message.contains("at least one"),
+                "expected model-boundary empty prompt message, got {:?}",
+                invalid.message
+            );
+        }
+        other => panic!("expected InvalidRequest for empty prompt, got {other:?}"),
     }
 }

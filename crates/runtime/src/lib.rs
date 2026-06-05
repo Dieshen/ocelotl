@@ -172,6 +172,72 @@ mod tests {
         (cfg, weights)
     }
 
+    fn tiny_gemma4_text_config_and_weights() -> (Gemma4Config, Gemma4TextWeights) {
+        use ocelotl_models::gemma::{Gemma4Quantization, Gemma4TextLayerWeights};
+
+        let cfg = Gemma4Config {
+            context_length: 16,
+            block_count: 1,
+            embedding_length: 4,
+            embedding_length_per_layer_input: 4,
+            feed_forward_length: 8,
+            attention_head_count: 2,
+            attention_head_count_kv: 1,
+            attention_key_length: 2,
+            attention_value_length: 2,
+            attention_key_length_swa: 2,
+            attention_value_length_swa: 2,
+            rope_dimension_count: 2,
+            rope_dimension_count_swa: 2,
+            rope_freq_base: 10_000.0,
+            rope_freq_base_swa: 10_000.0,
+            rms_norm_eps: 1e-6,
+            attention_sliding_window: None,
+            attention_shared_kv_layers: None,
+            attention_sliding_window_pattern_len: None,
+            final_logit_softcap: None,
+            tokenizer_model: Some("gemma4".to_string()),
+            tokenizer_token_count: 8,
+            quantization: Gemma4Quantization::Unquantized,
+            has_quantized_tensors: false,
+            tensor_count: 13,
+            multimodal: false,
+        };
+        let h = cfg.embedding_length;
+        let v = cfg.tokenizer_token_count;
+        let q_out = cfg.attention_head_count * cfg.attention_key_length;
+        let kv_out = cfg.attention_head_count_kv * cfg.attention_key_length;
+        let f = cfg.feed_forward_length;
+        let token_embd: Vec<f32> = (0..v * h).map(|i| (i as f32) * 0.01).collect();
+        let mut lm_head_w = vec![0.0_f32; h * v];
+        for token in 0..v {
+            for feature in 0..h {
+                lm_head_w[feature * v + token] = token_embd[token * h + feature];
+            }
+        }
+        let weights = Gemma4TextWeights {
+            token_embd,
+            layers: vec![Gemma4TextLayerWeights {
+                attn_norm_w: vec![1.0; h],
+                attn_q_w: vec![0.01; h * q_out],
+                attn_k_w: vec![0.01; h * kv_out],
+                attn_v_w: vec![0.01; h * kv_out],
+                attn_o_w: vec![0.01; q_out * h],
+                attn_q_norm_w: vec![1.0; cfg.attention_key_length],
+                attn_k_norm_w: vec![1.0; cfg.attention_key_length],
+                ffn_norm_w: vec![1.0; h],
+                ffn_gate_w: vec![0.01; h * f],
+                ffn_up_w: vec![0.01; h * f],
+                ffn_down_w: vec![0.01; f * h],
+            }],
+            output_norm_w: vec![1.0; h],
+            lm_head_w,
+            tie_word_embeddings: true,
+        };
+
+        (cfg, weights)
+    }
+
     #[test]
     fn optimized_cpu_runtime_selects_optimized_kernel_backend() {
         let runtime = Runtime::optimized_cpu();
@@ -198,6 +264,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cpu_runtime_builds_gemma4_text_model_with_selected_cpu_backend() {
+        let runtime = Runtime::optimized_cpu();
+        let (cfg, weights) = tiny_gemma4_text_config_and_weights();
+
+        let model = runtime
+            .gemma4_text_model(cfg, weights)
+            .expect("runtime should construct Gemma4 text model");
+
+        assert_eq!(model.kernel_backend().name(), "cpu");
+        assert_eq!(
+            model.execution_backend().context().device,
+            ocelotl_core::Device::Cpu
+        );
+    }
+
     #[cfg(feature = "cubecl-wgpu")]
     #[test]
     fn cubecl_wgpu_runtime_builds_qwen_model_with_gpu_execution_backend_without_launch() {
@@ -207,6 +289,23 @@ mod tests {
         let model = runtime
             .qwen2_5_model(cfg, weights)
             .expect("runtime should construct CubeCL-backed Qwen model");
+
+        assert_eq!(model.execution_backend().name(), "cubecl");
+        assert_eq!(
+            model.execution_backend().context().device,
+            ocelotl_core::Device::Gpu { ordinal: 0 }
+        );
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn cubecl_wgpu_runtime_builds_gemma4_text_model_with_gpu_backend_without_launch() {
+        let runtime = Runtime::cubecl_wgpu(0);
+        let (cfg, weights) = tiny_gemma4_text_config_and_weights();
+
+        let model = runtime
+            .gemma4_text_model(cfg, weights)
+            .expect("runtime should construct CubeCL-backed Gemma4 text model");
 
         assert_eq!(model.execution_backend().name(), "cubecl");
         assert_eq!(
