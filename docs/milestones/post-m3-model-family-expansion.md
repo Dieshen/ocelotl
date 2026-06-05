@@ -72,6 +72,13 @@ Gemma4:
   context for current llama.cpp-style Gemma4 templates: macros are enabled in
   MiniJinja, and render options now include `bos_token`, `enable_thinking`,
   structured `tools`, and serializable message objects for tool/media fields.
+- MF.7 adds the first Gemma4 execution subset: `Gemma4TextModel` runs a
+  text-only, unquantized, dense F32 synthetic decoder-core path through
+  `ocelotl_runtime::gemma::prefill`, with pinned logits in
+  `fixtures/logits/gemma4_tiny_synthetic_text_prefill.json`. This does not
+  enable the selected real Q4_K_M GGUF artifact; multimodal,
+  sliding-window/shared-KV, softcap, mixed-width, and quantized-origin execution
+  features remain rejected before compute.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8
@@ -146,6 +153,8 @@ decide whether a model is supported.
 - Unsupported hybrid/MoE/multimodal/quantized features fail explicitly before
   compute.
 - Gemma4 GGUF header metadata is normalized into an Ocelotl-owned manifest.
+- At least one explicitly supported Gemma4 subset has a pinned tiny synthetic
+  runtime prefill fixture without enabling unsupported real-artifact features.
 - Family-specific code is isolated under `qwen` and `gemma` modules.
 - No Qwen2.5 M3 parity fixture regresses.
 

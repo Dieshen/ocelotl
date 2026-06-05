@@ -6,12 +6,15 @@
 //!
 //! - `ocelotl_runtime::qwen::prefill`, `decode_one_token`, cache helpers,
 //!   `generate_qwen_batch`, `QwenGreedyModel`, `qwen2_5_kv_layout`.
+//! - `ocelotl_runtime::gemma::prefill`, `decode_one_token` for the MF.7
+//!   Gemma4 text-only synthetic subset.
 //! - `ocelotl_runtime::whisper::transcribe`, `prepare_whisper_transcription`,
 //!   `plan_transcription_chunks`, etc.
 //!
 //! Generic primitives (`greedy_sample`, KV cache structs, scheduler) live at
 //! the crate root.
 
+pub mod gemma;
 mod kv_cache;
 pub mod qwen;
 mod sampling;
@@ -31,7 +34,10 @@ use ocelotl_core::Result;
 #[cfg(feature = "cubecl-wgpu")]
 use ocelotl_kernels::CubeClKernelBackend;
 use ocelotl_kernels::{CpuKernelBackend, KernelBackend};
-use ocelotl_models::qwen::{Qwen2_5Config, Qwen2_5Model, Qwen2_5Weights};
+use ocelotl_models::{
+    gemma::{Gemma4Config, Gemma4TextModel, Gemma4TextWeights},
+    qwen::{Qwen2_5Config, Qwen2_5Model, Qwen2_5Weights},
+};
 
 /// Convenience builder that pairs a kernel backend with the factories that
 /// construct real-path models against it. Backed by `CpuKernelBackend` by
@@ -61,6 +67,14 @@ impl Runtime<CpuKernelBackend> {
     ) -> Result<Qwen2_5Model> {
         Qwen2_5Model::with_kernel_backend(config, weights, Arc::new(self.backend.clone()))
     }
+
+    pub fn gemma4_text_model(
+        &self,
+        config: Gemma4Config,
+        weights: Gemma4TextWeights,
+    ) -> Result<Gemma4TextModel> {
+        Gemma4TextModel::with_kernel_backend(config, weights, Arc::new(self.backend.clone()))
+    }
 }
 
 #[cfg(feature = "cubecl-wgpu")]
@@ -77,6 +91,14 @@ impl Runtime<CubeClKernelBackend> {
         weights: Qwen2_5Weights,
     ) -> Result<Qwen2_5Model> {
         Qwen2_5Model::with_kernel_backend(config, weights, Arc::new(self.backend.clone()))
+    }
+
+    pub fn gemma4_text_model(
+        &self,
+        config: Gemma4Config,
+        weights: Gemma4TextWeights,
+    ) -> Result<Gemma4TextModel> {
+        Gemma4TextModel::with_kernel_backend(config, weights, Arc::new(self.backend.clone()))
     }
 }
 
