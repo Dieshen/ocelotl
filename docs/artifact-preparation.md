@@ -273,8 +273,15 @@ without copying it into the repo-local artifact directory:
 ```powershell
 $env:OCELOTL_GEMMA4_GGUF_PATH="D:\path\to\google_gemma-4-E4B-it-Q4_K_M.gguf"
 cargo test -p ocelotl-loader local_gemma4_q4_k_m_gguf_header_contract_is_well_formed -- --ignored --nocapture
+cargo test -p ocelotl-loader local_gemma4_q4_k_m_gguf_tokenizer_metadata_is_extractable -- --ignored --nocapture
 cargo test -p ocelotl-models local_gemma4_q4_k_m_gguf_header_converts_to_gemma4_config -- --ignored --nocapture
 ```
+
+The tokenizer-metadata test proves the pinned GGUF carries extractable embedded
+tokens, scores, token types, merges, special token IDs, chat-template text, and
+BOS/space-prefix flags. It does **not** prove exact encode/decode token IDs yet;
+that requires a GGUF tokenizer backend in `ocelotl-tokenizer` or a pinned local
+reference tokenizer command.
 
 ## 6. Keeping Artifacts Out Of Git
 

@@ -10,7 +10,8 @@ use serde::Deserialize;
 pub mod gguf_inspect;
 pub use gguf_inspect::{
     GgmlQuantLayout, GgmlTensorType, GgufManifest, GgufMetadataEntry, GgufMetadataType,
-    GgufMetadataValue, GgufTensorEntry, inspect_gguf,
+    GgufMetadataValue, GgufTensorEntry, GgufTokenizerMetadata, inspect_gguf,
+    inspect_gguf_tokenizer,
 };
 pub mod gguf_values;
 pub use gguf_values::{

@@ -129,6 +129,29 @@ pub struct GgufTensorEntry {
     pub byte_len: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GgufTokenizerMetadata {
+    pub model: Option<String>,
+    pub tokens: Vec<String>,
+    pub scores: Vec<f32>,
+    pub token_types: Vec<i32>,
+    pub merges: Vec<String>,
+    pub chat_template: Option<String>,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+    pub unknown_token_id: Option<u32>,
+    pub padding_token_id: Option<u32>,
+    pub mask_token_id: Option<u32>,
+    pub add_bos_token: Option<bool>,
+    pub add_space_prefix: Option<bool>,
+}
+
+impl GgufTokenizerMetadata {
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GgmlQuantLayout {
     pub block_element_count: u64,
@@ -475,6 +498,166 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
     })
 }
 
+/// Extract embedded GGUF tokenizer metadata without retaining tokenizer arrays
+/// in the default `inspect_gguf` manifest path.
+///
+/// This reads only metadata entries and intentionally does not validate tensor
+/// descriptors or tensor payload ranges. Use `inspect_gguf` when the model
+/// tensor contract must also be proven.
+pub fn inspect_gguf_tokenizer(path: &Path) -> Result<GgufTokenizerMetadata> {
+    let file = File::open(path).map_err(|source| io_error(path, source))?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| io_error(path, source))?
+        .len();
+    let mut reader = GgufReader {
+        file,
+        path,
+        file_len,
+    };
+
+    let mut magic = [0u8; 4];
+    reader.read_exact_header_part(&mut magic)?;
+    if &magic != GGUF_MAGIC {
+        return Err(invalid_gguf(
+            path,
+            Some("magic"),
+            format!("invalid GGUF magic bytes: {magic:?}"),
+        ));
+    }
+
+    let version = reader.read_u32()?;
+    if version != SUPPORTED_GGUF_VERSION {
+        return Err(OcelotlError::from(UnsupportedError {
+            feature: "gguf_version".to_string(),
+            requested: Some(version.to_string()),
+            supported: vec![SUPPORTED_GGUF_VERSION.to_string()],
+        }));
+    }
+
+    let tensor_count = reader.read_u64()?;
+    let metadata_count = reader.read_u64()?;
+    if tensor_count > MAX_TENSORS {
+        return Err(invalid_gguf(
+            path,
+            Some("tensor_count"),
+            format!("GGUF tensor_count {tensor_count} exceeds max {MAX_TENSORS}"),
+        ));
+    }
+    if metadata_count > MAX_METADATA_ENTRIES {
+        return Err(invalid_gguf(
+            path,
+            Some("metadata_kv_count"),
+            format!("GGUF metadata_kv_count {metadata_count} exceeds max {MAX_METADATA_ENTRIES}"),
+        ));
+    }
+
+    let mut metadata = GgufTokenizerMetadata {
+        model: None,
+        tokens: Vec::new(),
+        scores: Vec::new(),
+        token_types: Vec::new(),
+        merges: Vec::new(),
+        chat_template: None,
+        bos_token_id: None,
+        eos_token_id: None,
+        unknown_token_id: None,
+        padding_token_id: None,
+        mask_token_id: None,
+        add_bos_token: None,
+        add_space_prefix: None,
+    };
+
+    for _ in 0..metadata_count {
+        let key = reader.read_string("metadata key", MAX_KEY_BYTES)?;
+        let raw_type = reader.read_u32()?;
+        let value_type = GgufMetadataType::from_raw(raw_type, path, &key)?;
+
+        match key.as_str() {
+            "tokenizer.ggml.tokens" => {
+                metadata.tokens = reader.read_metadata_string_array(value_type, &key)?;
+            }
+            "tokenizer.ggml.scores" => {
+                metadata.scores = reader.read_metadata_f32_array(value_type, &key)?;
+            }
+            "tokenizer.ggml.token_type" => {
+                metadata.token_types = reader.read_metadata_i32_array(value_type, &key)?;
+            }
+            "tokenizer.ggml.merges" => {
+                metadata.merges = reader.read_metadata_string_array(value_type, &key)?;
+            }
+            "tokenizer.ggml.model" => {
+                metadata.model = Some(expect_metadata_string(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.chat_template" => {
+                metadata.chat_template = Some(expect_metadata_string(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.ggml.bos_token_id" => {
+                metadata.bos_token_id = Some(expect_metadata_u32(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.ggml.eos_token_id" => {
+                metadata.eos_token_id = Some(expect_metadata_u32(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.ggml.unknown_token_id" => {
+                metadata.unknown_token_id = Some(expect_metadata_u32(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.ggml.padding_token_id" => {
+                metadata.padding_token_id = Some(expect_metadata_u32(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.ggml.mask_token_id" => {
+                metadata.mask_token_id = Some(expect_metadata_u32(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.ggml.add_bos_token" => {
+                metadata.add_bos_token = Some(expect_metadata_bool(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            "tokenizer.ggml.add_space_prefix" => {
+                metadata.add_space_prefix = Some(expect_metadata_bool(
+                    path,
+                    &key,
+                    reader.read_metadata_value(value_type, 0)?,
+                )?);
+            }
+            _ => {
+                reader.skip_metadata_value(value_type, 0)?;
+            }
+        }
+    }
+
+    Ok(metadata)
+}
+
 struct GgufReader<'a> {
     file: File,
     path: &'a Path,
@@ -619,25 +802,7 @@ impl GgufReader<'_> {
                 self.read_string("metadata string", MAX_METADATA_STRING_BYTES)?,
             ),
             GgufMetadataType::Array => {
-                let element_type =
-                    GgufMetadataType::from_raw(self.read_u32()?, self.path, "metadata array")?;
-                let len = self.read_u64()?;
-                if len > MAX_ARRAY_ELEMENTS {
-                    return Err(invalid_gguf(
-                        self.path,
-                        Some("metadata array"),
-                        format!(
-                            "GGUF metadata array length {len} exceeds max {MAX_ARRAY_ELEMENTS}"
-                        ),
-                    ));
-                }
-                if depth >= MAX_ARRAY_DEPTH {
-                    return Err(invalid_gguf(
-                        self.path,
-                        Some("metadata array"),
-                        format!("GGUF metadata array nesting exceeds max depth {MAX_ARRAY_DEPTH}"),
-                    ));
-                }
+                let (element_type, len) = self.read_array_header(depth)?;
                 for _ in 0..len {
                     self.skip_metadata_value(element_type, depth + 1)?;
                 }
@@ -665,31 +830,102 @@ impl GgufReader<'_> {
                 self.skip_string("metadata string", MAX_METADATA_STRING_BYTES)
             }
             GgufMetadataType::Array => {
-                if depth >= MAX_ARRAY_DEPTH {
-                    return Err(invalid_gguf(
-                        self.path,
-                        Some("metadata array"),
-                        format!("GGUF metadata array nesting exceeds max depth {MAX_ARRAY_DEPTH}"),
-                    ));
-                }
-                let element_type =
-                    GgufMetadataType::from_raw(self.read_u32()?, self.path, "metadata array")?;
-                let len = self.read_u64()?;
-                if len > MAX_ARRAY_ELEMENTS {
-                    return Err(invalid_gguf(
-                        self.path,
-                        Some("metadata array"),
-                        format!(
-                            "GGUF metadata array length {len} exceeds max {MAX_ARRAY_ELEMENTS}"
-                        ),
-                    ));
-                }
+                let (element_type, len) = self.read_array_header(depth)?;
                 for _ in 0..len {
                     self.skip_metadata_value(element_type, depth + 1)?;
                 }
                 Ok(())
             }
         }
+    }
+
+    fn read_metadata_string_array(
+        &mut self,
+        value_type: GgufMetadataType,
+        key: &str,
+    ) -> Result<Vec<String>> {
+        let len = self.expect_array_element_type(value_type, key, GgufMetadataType::String)?;
+        let len_usize = array_len_to_usize(self.path, key, len)?;
+        let mut values = Vec::with_capacity(len_usize);
+        for _ in 0..len {
+            values.push(self.read_string(key, MAX_METADATA_STRING_BYTES)?);
+        }
+        Ok(values)
+    }
+
+    fn read_metadata_f32_array(
+        &mut self,
+        value_type: GgufMetadataType,
+        key: &str,
+    ) -> Result<Vec<f32>> {
+        let len = self.expect_array_element_type(value_type, key, GgufMetadataType::F32)?;
+        let len_usize = array_len_to_usize(self.path, key, len)?;
+        let mut values = Vec::with_capacity(len_usize);
+        for _ in 0..len {
+            values.push(self.read_f32()?);
+        }
+        Ok(values)
+    }
+
+    fn read_metadata_i32_array(
+        &mut self,
+        value_type: GgufMetadataType,
+        key: &str,
+    ) -> Result<Vec<i32>> {
+        let len = self.expect_array_element_type(value_type, key, GgufMetadataType::I32)?;
+        let len_usize = array_len_to_usize(self.path, key, len)?;
+        let mut values = Vec::with_capacity(len_usize);
+        for _ in 0..len {
+            values.push(self.read_i32()?);
+        }
+        Ok(values)
+    }
+
+    fn expect_array_element_type(
+        &mut self,
+        value_type: GgufMetadataType,
+        key: &str,
+        expected: GgufMetadataType,
+    ) -> Result<u64> {
+        if value_type != GgufMetadataType::Array {
+            return Err(invalid_gguf(
+                self.path,
+                Some(key),
+                format!("GGUF metadata `{key}` must be an array, got {value_type:?}"),
+            ));
+        }
+        let (element_type, len) = self.read_array_header(0)?;
+        if element_type != expected {
+            return Err(invalid_gguf(
+                self.path,
+                Some(key),
+                format!(
+                    "GGUF metadata `{key}` array must contain {expected:?}, got {element_type:?}"
+                ),
+            ));
+        }
+        Ok(len)
+    }
+
+    fn read_array_header(&mut self, depth: usize) -> Result<(GgufMetadataType, u64)> {
+        if depth >= MAX_ARRAY_DEPTH {
+            return Err(invalid_gguf(
+                self.path,
+                Some("metadata array"),
+                format!("GGUF metadata array nesting exceeds max depth {MAX_ARRAY_DEPTH}"),
+            ));
+        }
+        let element_type =
+            GgufMetadataType::from_raw(self.read_u32()?, self.path, "metadata array")?;
+        let len = self.read_u64()?;
+        if len > MAX_ARRAY_ELEMENTS {
+            return Err(invalid_gguf(
+                self.path,
+                Some("metadata array"),
+                format!("GGUF metadata array length {len} exceeds max {MAX_ARRAY_ELEMENTS}"),
+            ));
+        }
+        Ok((element_type, len))
     }
 
     fn skip_bytes(&mut self, len: u64) -> Result<()> {
@@ -722,6 +958,56 @@ impl GgufReader<'_> {
             .stream_position()
             .map_err(|source| io_error(self.path, source))
     }
+}
+
+fn expect_metadata_string(path: &Path, key: &str, value: GgufMetadataValue) -> Result<String> {
+    match value {
+        GgufMetadataValue::String(value) => Ok(value),
+        other => Err(invalid_gguf(
+            path,
+            Some(key),
+            format!("GGUF metadata `{key}` must be a string, got {other:?}"),
+        )),
+    }
+}
+
+fn expect_metadata_u32(path: &Path, key: &str, value: GgufMetadataValue) -> Result<u32> {
+    match value {
+        GgufMetadataValue::U32(value) => Ok(value),
+        GgufMetadataValue::U64(value) => value.try_into().map_err(|_| {
+            invalid_gguf(
+                path,
+                Some(key),
+                format!("GGUF metadata `{key}` value {value} does not fit in u32"),
+            )
+        }),
+        other => Err(invalid_gguf(
+            path,
+            Some(key),
+            format!("GGUF metadata `{key}` must be a uint32, got {other:?}"),
+        )),
+    }
+}
+
+fn expect_metadata_bool(path: &Path, key: &str, value: GgufMetadataValue) -> Result<bool> {
+    match value {
+        GgufMetadataValue::Bool(value) => Ok(value),
+        other => Err(invalid_gguf(
+            path,
+            Some(key),
+            format!("GGUF metadata `{key}` must be a bool, got {other:?}"),
+        )),
+    }
+}
+
+fn array_len_to_usize(path: &Path, key: &str, len: u64) -> Result<usize> {
+    len.try_into().map_err(|_| {
+        invalid_gguf(
+            path,
+            Some(key),
+            format!("GGUF metadata `{key}` array length {len} does not fit in usize"),
+        )
+    })
 }
 
 fn alignment_from_metadata(path: &Path, metadata: &[GgufMetadataEntry]) -> Result<u64> {
@@ -809,6 +1095,14 @@ mod tests {
         out.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn write_i32(out: &mut Vec<u8>, value: i32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_f32(out: &mut Vec<u8>, value: f32) {
+        out.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+
     fn write_u64(out: &mut Vec<u8>, value: u64) {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -830,6 +1124,12 @@ mod tests {
         write_u32(out, value);
     }
 
+    fn write_bool_metadata(out: &mut Vec<u8>, key: &str, value: bool) {
+        write_string(out, key);
+        write_u32(out, 7);
+        out.push(u8::from(value));
+    }
+
     fn write_string_array_metadata(out: &mut Vec<u8>, key: &str, values: &[&str]) {
         write_string(out, key);
         write_u32(out, 9);
@@ -838,6 +1138,83 @@ mod tests {
         for value in values {
             write_string(out, value);
         }
+    }
+
+    fn write_f32_array_metadata(out: &mut Vec<u8>, key: &str, values: &[f32]) {
+        write_string(out, key);
+        write_u32(out, 9);
+        write_u32(out, 6);
+        write_u64(out, values.len() as u64);
+        for value in values {
+            write_f32(out, *value);
+        }
+    }
+
+    fn write_i32_array_metadata(out: &mut Vec<u8>, key: &str, values: &[i32]) {
+        write_string(out, key);
+        write_u32(out, 9);
+        write_u32(out, 5);
+        write_u64(out, values.len() as u64);
+        for value in values {
+            write_i32(out, *value);
+        }
+    }
+
+    fn write_u32_array_metadata(out: &mut Vec<u8>, key: &str, values: &[u32]) {
+        write_string(out, key);
+        write_u32(out, 9);
+        write_u32(out, 4);
+        write_u64(out, values.len() as u64);
+        for value in values {
+            write_u32(out, *value);
+        }
+    }
+
+    fn write_tokenizer_fixture(path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        write_u32(&mut bytes, SUPPORTED_GGUF_VERSION);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 14);
+
+        write_string_metadata(&mut bytes, "general.architecture", "gemma4");
+        write_string_metadata(&mut bytes, "tokenizer.ggml.model", "gemma4");
+        write_string_array_metadata(
+            &mut bytes,
+            "tokenizer.ggml.tokens",
+            &["<pad>", "<eos>", "<bos>", "<unk>", "<mask>", "Hello"],
+        );
+        write_f32_array_metadata(
+            &mut bytes,
+            "tokenizer.ggml.scores",
+            &[0.0, 0.1, 0.2, 0.3, 0.4, -1.25],
+        );
+        write_i32_array_metadata(&mut bytes, "tokenizer.ggml.token_type", &[3, 3, 3, 2, 3, 1]);
+        write_string_array_metadata(&mut bytes, "tokenizer.ggml.merges", &["H e", "He llo"]);
+        write_string_metadata(
+            &mut bytes,
+            "tokenizer.chat_template",
+            "{{ bos_token }}{{ messages[0].content }}",
+        );
+        write_u32_metadata(&mut bytes, "tokenizer.ggml.bos_token_id", 2);
+        write_u32_metadata(&mut bytes, "tokenizer.ggml.eos_token_id", 1);
+        write_u32_metadata(&mut bytes, "tokenizer.ggml.unknown_token_id", 3);
+        write_u32_metadata(&mut bytes, "tokenizer.ggml.padding_token_id", 0);
+        write_u32_metadata(&mut bytes, "tokenizer.ggml.mask_token_id", 4);
+        write_bool_metadata(&mut bytes, "tokenizer.ggml.add_bos_token", true);
+        write_bool_metadata(&mut bytes, "tokenizer.ggml.add_space_prefix", false);
+
+        std::fs::write(path, bytes).expect("write GGUF tokenizer fixture");
+    }
+
+    fn write_bad_tokenizer_array_fixture(path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        write_u32(&mut bytes, SUPPORTED_GGUF_VERSION);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 1);
+        write_u32_array_metadata(&mut bytes, "tokenizer.ggml.tokens", &[1]);
+        std::fs::write(path, bytes).expect("write bad GGUF tokenizer fixture");
     }
 
     fn write_minimal_fixture(path: &Path, tensor_offset: u64, tensor_data_len: usize) {
@@ -1135,6 +1512,58 @@ mod tests {
     }
 
     #[test]
+    fn inspect_gguf_tokenizer_extracts_tiny_synthetic_metadata_arrays() {
+        let path = tmp_path("tokenizer_metadata");
+        write_tokenizer_fixture(&path);
+
+        let tokenizer =
+            inspect_gguf_tokenizer(&path).expect("tiny tokenizer metadata must inspect");
+
+        assert_eq!(tokenizer.model.as_deref(), Some("gemma4"));
+        assert_eq!(
+            tokenizer.tokens,
+            vec!["<pad>", "<eos>", "<bos>", "<unk>", "<mask>", "Hello"]
+        );
+        assert_eq!(tokenizer.token_count(), 6);
+        assert_eq!(tokenizer.scores, vec![0.0, 0.1, 0.2, 0.3, 0.4, -1.25]);
+        assert_eq!(tokenizer.token_types, vec![3, 3, 3, 2, 3, 1]);
+        assert_eq!(tokenizer.merges, vec!["H e", "He llo"]);
+        assert_eq!(
+            tokenizer.chat_template.as_deref(),
+            Some("{{ bos_token }}{{ messages[0].content }}")
+        );
+        assert_eq!(tokenizer.bos_token_id, Some(2));
+        assert_eq!(tokenizer.eos_token_id, Some(1));
+        assert_eq!(tokenizer.unknown_token_id, Some(3));
+        assert_eq!(tokenizer.padding_token_id, Some(0));
+        assert_eq!(tokenizer.mask_token_id, Some(4));
+        assert_eq!(tokenizer.add_bos_token, Some(true));
+        assert_eq!(tokenizer.add_space_prefix, Some(false));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inspect_gguf_tokenizer_rejects_wrong_token_array_element_type() {
+        let path = tmp_path("bad_tokenizer_array");
+        write_bad_tokenizer_array_fixture(&path);
+
+        let err =
+            inspect_gguf_tokenizer(&path).expect_err("wrong token array type must be rejected");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("tokenizer.ggml.tokens"));
+                assert!(invalid.message.contains("String"));
+                assert!(invalid.message.contains("U32"));
+            }
+            other => panic!("expected InvalidModel for wrong token array type, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     #[ignore = "requires local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf or OCELOTL_GEMMA4_GGUF_PATH"]
     fn local_gemma4_q4_k_m_gguf_header_contract_is_well_formed() {
         let path = local_gemma4_gguf_path();
@@ -1179,5 +1608,50 @@ mod tests {
                 .all(|tensor| tensor.byte_len.is_some()),
             "selected Gemma4 Q4_K_M artifact should contain only dense or Q4_K/Q5_K/Q6_K tensor types whose byte ranges Ocelotl validates"
         );
+    }
+
+    #[test]
+    #[ignore = "requires local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf or OCELOTL_GEMMA4_GGUF_PATH"]
+    fn local_gemma4_q4_k_m_gguf_tokenizer_metadata_is_extractable() {
+        let path = local_gemma4_gguf_path();
+        assert!(
+            path.exists(),
+            "missing Gemma4 GGUF artifact at {}; set OCELOTL_GEMMA4_GGUF_PATH or see docs/artifact-preparation.md",
+            path.display()
+        );
+
+        let tokenizer =
+            inspect_gguf_tokenizer(&path).expect("local Gemma4 tokenizer metadata must inspect");
+
+        assert_eq!(tokenizer.model.as_deref(), Some("gemma4"));
+        assert_eq!(tokenizer.token_count(), 262_144);
+        assert_eq!(
+            tokenizer.scores.len(),
+            tokenizer.tokens.len(),
+            "Gemma4 GGUF tokenizer scores should align one-for-one with tokens"
+        );
+        assert_eq!(
+            tokenizer.token_types.len(),
+            tokenizer.tokens.len(),
+            "Gemma4 GGUF tokenizer token types should align one-for-one with tokens"
+        );
+        assert!(
+            !tokenizer.merges.is_empty(),
+            "Gemma4 GGUF tokenizer should include BPE merge metadata"
+        );
+        assert!(
+            tokenizer
+                .chat_template
+                .as_deref()
+                .is_some_and(|template| template.contains("messages")),
+            "Gemma4 GGUF tokenizer should expose a chat template mentioning messages"
+        );
+        assert_eq!(tokenizer.bos_token_id, Some(2));
+        assert_eq!(tokenizer.eos_token_id, Some(1));
+        assert_eq!(tokenizer.unknown_token_id, Some(3));
+        assert_eq!(tokenizer.padding_token_id, Some(0));
+        assert_eq!(tokenizer.mask_token_id, Some(4));
+        assert_eq!(tokenizer.add_bos_token, Some(true));
+        assert_eq!(tokenizer.add_space_prefix, Some(false));
     }
 }

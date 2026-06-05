@@ -72,6 +72,14 @@ Gemma4:
   context for current llama.cpp-style Gemma4 templates: macros are enabled in
   MiniJinja, and render options now include `bos_token`, `enable_thinking`,
   structured `tools`, and serializable message objects for tool/media fields.
+- A follow-up GGUF tokenizer-metadata slice adds
+  `ocelotl_loader::inspect_gguf_tokenizer`, a targeted extractor for embedded
+  GGUF tokenizer tokens, scores, token types, merges, special-token IDs,
+  chat-template text, and BOS/space-prefix flags. This keeps the default
+  `inspect_gguf` manifest header-only and array-summarized, while giving the
+  Gemma4 tokenizer track a tested bridge toward exact ID parity. Exact Gemma4
+  encode/decode IDs remain pending until Ocelotl has a GGUF tokenizer backend
+  or a pinned local reference tokenizer command.
 - MF.7 adds the first Gemma4 execution subset: `Gemma4TextModel` runs a
   text-only, unquantized, dense F32 synthetic decoder-core path through
   `ocelotl_runtime::gemma::{prefill, decode_one_token}`, with pinned logits and

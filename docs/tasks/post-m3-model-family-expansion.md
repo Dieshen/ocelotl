@@ -95,8 +95,17 @@ and does not modify the closed M3.6 MLP task.
   messages/tools plus `bos_token` and `enable_thinking`, MiniJinja macros are
   enabled, and default-on tests pin llama.cpp-style Gemma4 BOS, thinking,
   assistant-as-model, multimodal placeholder, tool-call/tool-response, and
-  upstream filter-surface behavior. Exact tokenizer ID fixtures and ignored
-  real-artifact drift checks remain pending for Gemma4 and Qwen3.5.
+  upstream filter-surface behavior.
+- `Follow-up`: Gemma4 GGUF tokenizer metadata extraction landed 2026-06-05.
+  `ocelotl-loader` exposes `inspect_gguf_tokenizer` so the tokenizer track can
+  read embedded GGUF tokens, scores, token types, merges, special-token IDs,
+  chat-template text, and BOS/space-prefix flags without making the default
+  `inspect_gguf` manifest retain 262k-token arrays. Default tests cover a tiny
+  synthetic GGUF metadata fixture and malformed array typing; the ignored local
+  Gemma4 proof passed against
+  `D:\Dev\ideas\04-granola-ai-clone\models\google_gemma-4-E4B-it-Q4_K_M.gguf`
+  on 2026-06-05. Exact tokenizer ID fixtures remain pending for Gemma4 until a
+  GGUF tokenizer backend or pinned local reference tokenizer command exists.
 
 ## MF.7 Add Tiny Synthetic Forward Per Supported Subset
 
