@@ -234,6 +234,30 @@ impl KernelBackend for CubeClKernelBackend {
         }
     }
 
+    /// Copy `src` into an existing device tensor at element offset
+    /// `dst_offset`. The WGPU path launches a tiny copy kernel against
+    /// the destination handle so Whisper decoder self-attention can append
+    /// K/V rows without reading the cache back to host.
+    fn copy_into_d(&self, src: &DeviceTensor, dst: &DeviceTensor, dst_offset: usize) -> Result<()> {
+        crate::validate_copy_into_shapes(src, dst, dst_offset)?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(src_buf), Some(dst_buf)) = (extract_wgpu_buf(src), extract_wgpu_buf(dst)) {
+                return run_copy_into_d_wgpu(src_buf, dst_buf, dst_offset);
+            }
+        }
+        if let (Ok(src_host), Ok(mut dst_host)) =
+            (src.borrow_host_slice(), dst.borrow_host_slice_mut())
+        {
+            dst_host[dst_offset..dst_offset + src_host.len()].copy_from_slice(&src_host);
+            return Ok(());
+        }
+        let src_host = src.to_host_owned()?;
+        let mut dst_host = dst.to_host_owned()?;
+        dst_host[dst_offset..dst_offset + src_host.len()].copy_from_slice(&src_host);
+        dst.write_from_host_slice(&dst_host)
+    }
+
     /// Device-resident linear projection. When every operand is already a
     /// `WgpuDeviceBuffer`, launch the cube kernel against the existing
     /// handles — no `create_from_slice`, no `read_one`. The output buffer
@@ -584,6 +608,153 @@ impl KernelBackend for CubeClKernelBackend {
         output.write_from_host_slice(&out_buf)
     }
 
+    /// Device-resident incremental decoder self-attention over a
+    /// fixed-capacity K/V cache. The cache already contains the current
+    /// token row; the kernel attends over `0..visible_seq` without any
+    /// prefix upload or cache readback.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_cache_d(
+        &self,
+        q: &DeviceTensor,
+        key_cache: &DeviceTensor,
+        value_cache: &DeviceTensor,
+        visible_seq: usize,
+        cache_capacity: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        crate::validate_attention_decoder_incremental_cache_shapes(
+            q,
+            key_cache,
+            value_cache,
+            visible_seq,
+            cache_capacity,
+            n_head,
+            head_dim,
+            output,
+        )?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(key_cache),
+                extract_wgpu_buf(value_cache),
+                extract_wgpu_buf(output),
+            ) {
+                return run_attention_decoder_incremental_cache_d_wgpu(
+                    q_buf,
+                    k_buf,
+                    v_buf,
+                    visible_seq,
+                    cache_capacity,
+                    n_head,
+                    head_dim,
+                    scale,
+                    out_buf,
+                );
+            }
+        }
+        let state = n_head * head_dim;
+        let visible_len = visible_seq * state;
+        let key_host = key_cache.to_host_owned()?;
+        let value_host = value_cache.to_host_owned()?;
+        let q_host = q.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; state];
+        crate::attention_decoder_incremental_cache_scalar(
+            &q_host,
+            &key_host[..visible_len],
+            &value_host[..visible_len],
+            visible_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_cache_append_d(
+        &self,
+        q: &DeviceTensor,
+        key_cache: &DeviceTensor,
+        value_cache: &DeviceTensor,
+        new_k: &DeviceTensor,
+        new_v: &DeviceTensor,
+        past_seq: usize,
+        cache_capacity: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        crate::validate_attention_decoder_incremental_cache_append_shapes(
+            q,
+            key_cache,
+            value_cache,
+            new_k,
+            new_v,
+            past_seq,
+            cache_capacity,
+            n_head,
+            head_dim,
+            output,
+        )?;
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (
+                Some(q_buf),
+                Some(k_buf),
+                Some(v_buf),
+                Some(nk_buf),
+                Some(nv_buf),
+                Some(out_buf),
+            ) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(key_cache),
+                extract_wgpu_buf(value_cache),
+                extract_wgpu_buf(new_k),
+                extract_wgpu_buf(new_v),
+                extract_wgpu_buf(output),
+            ) {
+                return run_attention_decoder_incremental_cache_append_d_wgpu(
+                    q_buf,
+                    k_buf,
+                    v_buf,
+                    nk_buf,
+                    nv_buf,
+                    past_seq,
+                    cache_capacity,
+                    n_head,
+                    head_dim,
+                    scale,
+                    out_buf,
+                );
+            }
+        }
+        let state = n_head * head_dim;
+        let dst_offset = past_seq.checked_mul(state).ok_or_else(|| {
+            cubecl_err(
+                "attention_decoder_incremental_cache_append_d past_seq*state overflowed usize",
+            )
+        })?;
+        self.copy_into_d(new_k, key_cache, dst_offset)?;
+        self.copy_into_d(new_v, value_cache, dst_offset)?;
+        self.attention_decoder_incremental_cache_d(
+            q,
+            key_cache,
+            value_cache,
+            past_seq + 1,
+            cache_capacity,
+            n_head,
+            head_dim,
+            scale,
+            output,
+        )
+    }
+
     /// Device-resident decoder cross-attention (encoder-decoder attention).
     /// Q comes from the decoder hidden state `[q_seq, state]`; K and V come
     /// from the precomputed encoder output `[kv_seq, state]`. No causal mask:
@@ -892,6 +1063,54 @@ fn add_out_f32(lhs: &Array<f32>, rhs: &Array<f32>, output: &mut Array<f32>) {
         terminate!();
     }
     output[i] = lhs[i] + rhs[i];
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_copy_into_d_wgpu(
+    src: &WgpuDeviceBuffer,
+    dst: &WgpuDeviceBuffer,
+    dst_offset: usize,
+) -> Result<()> {
+    let end = dst_offset
+        .checked_add(src.len_f32())
+        .ok_or_else(|| cubecl_wgpu_err("copy_into_d dst_offset + src.len overflowed usize"))?;
+    if end > dst.len_f32() {
+        return Err(cubecl_wgpu_err(format!(
+            "copy_into_d range {dst_offset}..{end} exceeds dst len {}",
+            dst.len_f32()
+        )));
+    }
+    let dst_offset_u32 = u32::try_from(dst_offset).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "copy_into_d dst_offset {dst_offset} exceeds CubeCL u32 scalar limit"
+        ))
+    })?;
+    let len = src.len_f32();
+    let client = src.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+
+    unsafe {
+        copy_into_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(src.clone_handle(), src.len_f32()),
+            ArrayArg::from_raw_parts(dst.clone_handle(), dst.len_f32()),
+            dst_offset_u32,
+        );
+    }
+    Ok(())
+}
+
+#[cube(launch_unchecked)]
+fn copy_into_f32(src: &Array<f32>, dst: &mut Array<f32>, dst_offset: u32) {
+    let i = ABSOLUTE_POS;
+    if i >= src.len() {
+        terminate!();
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let dst_start = dst_offset as usize;
+    dst[dst_start + i] = src[i];
 }
 
 #[cfg(feature = "cubecl-wgpu")]
@@ -1578,6 +1797,322 @@ fn run_attention_decoder_incremental_d_wgpu(
             ArrayArg::from_raw_parts(out_handle.clone(), state),
             n_head,
             head_dim,
+            visible_u32,
+            scale,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+/// Fused incremental decoder self-attention over a fixed-capacity cache.
+///
+/// One thread per head. Q is `[state]`; key/value cache are
+/// `[cache_capacity, state]`, but only rows `0..visible` participate.
+/// The caller has already copied the current token's K/V into row
+/// `visible - 1`, so this is mathematically the same as attending over
+/// `concat(past_k, new_k)`.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn attention_decoder_incremental_cache_f32(
+    q: &Array<f32>,
+    key_cache: &Array<f32>,
+    value_cache: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    visible: u32,
+    scale: f32,
+) {
+    #[allow(clippy::unnecessary_cast)]
+    let head = ABSOLUTE_POS as usize;
+    if head >= n_head {
+        terminate!();
+    }
+
+    let state = n_head * head_dim;
+    #[allow(clippy::unnecessary_cast)]
+    let visible_us = visible as usize;
+    let q_base = head * head_dim;
+
+    let k_base_0 = head * head_dim;
+    let mut m = f32::new(0.0);
+    for d in 0..head_dim {
+        m += q[q_base + d] * key_cache[k_base_0 + d];
+    }
+    m *= scale;
+
+    let p0 = f32::new(1.0);
+    let mut l = p0;
+
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let mut acc = SharedMemory::<f32>::new(ENC_ATTN_WG as usize * head_dim);
+    let acc_base = lane * head_dim;
+    for d in 0..head_dim {
+        acc[acc_base + d] = p0 * value_cache[k_base_0 + d];
+    }
+
+    for ki in 1..visible_us {
+        let k_base = ki * state + head * head_dim;
+        let mut s = f32::new(0.0);
+        for d in 0..head_dim {
+            s += q[q_base + d] * key_cache[k_base + d];
+        }
+        s *= scale;
+
+        let m_new = f32::max(m, s);
+        let alpha = f32::exp(m - m_new);
+        let p = f32::exp(s - m_new);
+        l = l * alpha + p;
+
+        let v_base = ki * state + head * head_dim;
+        for d in 0..head_dim {
+            acc[acc_base + d] = acc[acc_base + d] * alpha + p * value_cache[v_base + d];
+        }
+        m = m_new;
+    }
+
+    let out_base = head * head_dim;
+    for d in 0..head_dim {
+        output[out_base + d] = acc[acc_base + d] / l;
+    }
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_decoder_incremental_cache_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    key_cache: &WgpuDeviceBuffer,
+    value_cache: &WgpuDeviceBuffer,
+    visible_seq: usize,
+    cache_capacity: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        cubecl_wgpu_err("attention_decoder_incremental_cache_d n_head*head_dim overflowed usize")
+    })?;
+    if visible_seq == 0 || visible_seq > cache_capacity {
+        return Err(cubecl_wgpu_err(format!(
+            "attention_decoder_incremental_cache_d visible_seq {visible_seq} outside cache capacity {cache_capacity}"
+        )));
+    }
+    let cache_expected = cache_capacity.checked_mul(state).ok_or_else(|| {
+        cubecl_wgpu_err(
+            "attention_decoder_incremental_cache_d cache_capacity*state overflowed usize",
+        )
+    })?;
+    for (label, len, expected) in [
+        ("q", q.len_f32(), state),
+        ("out", out.len_f32(), state),
+        ("key_cache", key_cache.len_f32(), cache_expected),
+        ("value_cache", value_cache.len_f32(), cache_expected),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_decoder_incremental_cache_d {label} len {len} != expected {expected}"
+            )));
+        }
+    }
+
+    let visible_u32 = u32::try_from(visible_seq).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_decoder_incremental_cache_d visible_seq {visible_seq} exceeds u32"
+        ))
+    })?;
+    let total = u32::try_from(n_head).map_err(|_| {
+        cubecl_wgpu_err("attention_decoder_incremental_cache_d n_head exceeds u32".to_string())
+    })?;
+    let workgroup_count = total.div_ceil(ENC_ATTN_WG).max(1);
+
+    let client = q.client();
+    let out_handle = client.empty(state * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_decoder_incremental_cache_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(ENC_ATTN_WG),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(key_cache.clone_handle(), key_cache.len_f32()),
+            ArrayArg::from_raw_parts(value_cache.clone_handle(), value_cache.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), state),
+            n_head,
+            head_dim,
+            visible_u32,
+            scale,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn attention_decoder_incremental_cache_append_f32(
+    q: &Array<f32>,
+    key_cache: &mut Array<f32>,
+    value_cache: &mut Array<f32>,
+    new_k: &Array<f32>,
+    new_v: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    past_seq: u32,
+    visible: u32,
+    scale: f32,
+) {
+    #[allow(clippy::unnecessary_cast)]
+    let head = ABSOLUTE_POS as usize;
+    if head >= n_head {
+        terminate!();
+    }
+
+    let state = n_head * head_dim;
+    #[allow(clippy::unnecessary_cast)]
+    let past_seq_us = past_seq as usize;
+    #[allow(clippy::unnecessary_cast)]
+    let visible_us = visible as usize;
+    let q_base = head * head_dim;
+    let append_base = past_seq_us * state + head * head_dim;
+    for d in 0..head_dim {
+        key_cache[append_base + d] = new_k[q_base + d];
+        value_cache[append_base + d] = new_v[q_base + d];
+    }
+
+    let k_base_0 = head * head_dim;
+    let mut m = f32::new(0.0);
+    for d in 0..head_dim {
+        m += q[q_base + d] * key_cache[k_base_0 + d];
+    }
+    m *= scale;
+
+    let p0 = f32::new(1.0);
+    let mut l = p0;
+
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let mut acc = SharedMemory::<f32>::new(ENC_ATTN_WG as usize * head_dim);
+    let acc_base = lane * head_dim;
+    for d in 0..head_dim {
+        acc[acc_base + d] = p0 * value_cache[k_base_0 + d];
+    }
+
+    for ki in 1..visible_us {
+        let k_base = ki * state + head * head_dim;
+        let mut s = f32::new(0.0);
+        for d in 0..head_dim {
+            s += q[q_base + d] * key_cache[k_base + d];
+        }
+        s *= scale;
+
+        let m_new = f32::max(m, s);
+        let alpha = f32::exp(m - m_new);
+        let p = f32::exp(s - m_new);
+        l = l * alpha + p;
+
+        let v_base = ki * state + head * head_dim;
+        for d in 0..head_dim {
+            acc[acc_base + d] = acc[acc_base + d] * alpha + p * value_cache[v_base + d];
+        }
+        m = m_new;
+    }
+
+    let out_base = head * head_dim;
+    for d in 0..head_dim {
+        output[out_base + d] = acc[acc_base + d] / l;
+    }
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_decoder_incremental_cache_append_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    key_cache: &WgpuDeviceBuffer,
+    value_cache: &WgpuDeviceBuffer,
+    new_k: &WgpuDeviceBuffer,
+    new_v: &WgpuDeviceBuffer,
+    past_seq: usize,
+    cache_capacity: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        cubecl_wgpu_err(
+            "attention_decoder_incremental_cache_append_d n_head*head_dim overflowed usize",
+        )
+    })?;
+    if past_seq >= cache_capacity {
+        return Err(cubecl_wgpu_err(format!(
+            "attention_decoder_incremental_cache_append_d past_seq {past_seq} cannot append into cache_capacity {cache_capacity}"
+        )));
+    }
+    let cache_expected = cache_capacity.checked_mul(state).ok_or_else(|| {
+        cubecl_wgpu_err(
+            "attention_decoder_incremental_cache_append_d cache_capacity*state overflowed usize",
+        )
+    })?;
+    for (label, len, expected) in [
+        ("q", q.len_f32(), state),
+        ("new_k", new_k.len_f32(), state),
+        ("new_v", new_v.len_f32(), state),
+        ("out", out.len_f32(), state),
+        ("key_cache", key_cache.len_f32(), cache_expected),
+        ("value_cache", value_cache.len_f32(), cache_expected),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_decoder_incremental_cache_append_d {label} len {len} != expected {expected}"
+            )));
+        }
+    }
+
+    let past_seq_u32 = u32::try_from(past_seq).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_decoder_incremental_cache_append_d past_seq {past_seq} exceeds u32"
+        ))
+    })?;
+    let visible = past_seq + 1;
+    let visible_u32 = u32::try_from(visible).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_decoder_incremental_cache_append_d visible {visible} exceeds u32"
+        ))
+    })?;
+    let total = u32::try_from(n_head).map_err(|_| {
+        cubecl_wgpu_err(
+            "attention_decoder_incremental_cache_append_d n_head exceeds u32".to_string(),
+        )
+    })?;
+    let workgroup_count = total.div_ceil(ENC_ATTN_WG).max(1);
+
+    let client = q.client();
+    let out_handle = client.empty(state * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_decoder_incremental_cache_append_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(ENC_ATTN_WG),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(key_cache.clone_handle(), key_cache.len_f32()),
+            ArrayArg::from_raw_parts(value_cache.clone_handle(), value_cache.len_f32()),
+            ArrayArg::from_raw_parts(new_k.clone_handle(), new_k.len_f32()),
+            ArrayArg::from_raw_parts(new_v.clone_handle(), new_v.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), state),
+            n_head,
+            head_dim,
+            past_seq_u32,
             visible_u32,
             scale,
         );

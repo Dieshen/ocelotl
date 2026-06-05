@@ -183,6 +183,23 @@ pub trait KernelBackend: Debug + Send + Sync {
         Ok(DeviceTensor::host_zeros(len))
     }
 
+    /// Copy all values from `src` into `dst[dst_offset..]`. The default
+    /// implementation bounces through host memory; device backends can override
+    /// this to keep cache appends resident.
+    fn copy_into_d(&self, src: &DeviceTensor, dst: &DeviceTensor, dst_offset: usize) -> Result<()> {
+        validate_copy_into_shapes(src, dst, dst_offset)?;
+        if let (Ok(src_host), Ok(mut dst_host)) =
+            (src.borrow_host_slice(), dst.borrow_host_slice_mut())
+        {
+            dst_host[dst_offset..dst_offset + src_host.len()].copy_from_slice(&src_host);
+            return Ok(());
+        }
+        let src_host = src.to_host_owned()?;
+        let mut dst_host = dst.to_host_owned()?;
+        dst_host[dst_offset..dst_offset + src_host.len()].copy_from_slice(&src_host);
+        dst.write_from_host_slice(&dst_host)
+    }
+
     /// Device-resident linear projection. `out` is caller-supplied so the
     /// caller can recycle scratch across loop iterations. The default
     /// implementation forces host readback through `to_host_owned` and
@@ -443,6 +460,108 @@ pub trait KernelBackend: Debug + Send + Sync {
         output.write_from_host_slice(&out_buf)
     }
 
+    /// Whisper decoder incremental self-attention over a fixed-capacity K/V
+    /// cache. `visible_seq` rows at the beginning of `key_cache`/`value_cache`
+    /// are visible, and `q` is the query for the final visible row.
+    ///
+    /// This is equivalent to `attention_decoder_incremental_d` after the caller
+    /// has already copied the new K/V row into the cache. The default
+    /// implementation reads the cache prefix back and computes the scalar
+    /// reference path.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_cache_d(
+        &self,
+        q: &DeviceTensor,
+        key_cache: &DeviceTensor,
+        value_cache: &DeviceTensor,
+        visible_seq: usize,
+        cache_capacity: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_incremental_cache_shapes(
+            q,
+            key_cache,
+            value_cache,
+            visible_seq,
+            cache_capacity,
+            n_head,
+            head_dim,
+            output,
+        )?;
+        let state = n_head * head_dim;
+        let visible_len = visible_seq * state;
+        let key_host = key_cache.to_host_owned()?;
+        let value_host = value_cache.to_host_owned()?;
+        let q_host = q.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; state];
+        attention_decoder_incremental_cache_scalar(
+            &q_host,
+            &key_host[..visible_len],
+            &value_host[..visible_len],
+            visible_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_buf,
+        );
+        output.write_from_host_slice(&out_buf)
+    }
+
+    /// Append the current K/V row into a fixed-capacity cache, then run
+    /// incremental decoder self-attention over the visible prefix. Backends can
+    /// fuse the row write with the attention kernel to avoid separate copy
+    /// launches on autoregressive decode.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_cache_append_d(
+        &self,
+        q: &DeviceTensor,
+        key_cache: &DeviceTensor,
+        value_cache: &DeviceTensor,
+        new_k: &DeviceTensor,
+        new_v: &DeviceTensor,
+        past_seq: usize,
+        cache_capacity: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_incremental_cache_append_shapes(
+            q,
+            key_cache,
+            value_cache,
+            new_k,
+            new_v,
+            past_seq,
+            cache_capacity,
+            n_head,
+            head_dim,
+            output,
+        )?;
+        let state = n_head * head_dim;
+        let dst_offset = past_seq.checked_mul(state).ok_or_else(|| {
+            kernel_err(
+                "attention_decoder_incremental_cache_append_d past_seq*state overflowed usize",
+            )
+        })?;
+        self.copy_into_d(new_k, key_cache, dst_offset)?;
+        self.copy_into_d(new_v, value_cache, dst_offset)?;
+        self.attention_decoder_incremental_cache_d(
+            q,
+            key_cache,
+            value_cache,
+            past_seq + 1,
+            cache_capacity,
+            n_head,
+            head_dim,
+            scale,
+            output,
+        )
+    }
+
     /// Whisper decoder cross-attention on device handles.
     ///
     /// Q comes from the decoder hidden state: shape `[q_seq, state]` where
@@ -609,6 +728,449 @@ pub(crate) fn attention_encoder_scalar(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn attention_encoder_parallel(
+    pool: &rayon::ThreadPool,
+    mode: CpuKernelMode,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    use rayon::prelude::*;
+
+    if seq == 0 {
+        return;
+    }
+
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), seq * state);
+    debug_assert_eq!(k.len(), seq * state);
+    debug_assert_eq!(v.len(), seq * state);
+    debug_assert_eq!(out.len(), seq * state);
+
+    let threads = pool.current_num_threads().max(1);
+    let rows_per_chunk = seq.div_ceil(threads).max(1);
+    let chunk_out_len = rows_per_chunk * state;
+
+    pool.install(|| {
+        out.par_chunks_mut(chunk_out_len)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let qi_start = chunk_idx * rows_per_chunk;
+                let chunk_rows = out_chunk.len() / state;
+                let mut scores = vec![0.0_f32; seq];
+
+                for local_qi in 0..chunk_rows {
+                    let qi = qi_start + local_qi;
+                    for head in 0..n_head {
+                        let q_base = qi * state + head * head_dim;
+                        for (ki, score) in scores.iter_mut().enumerate() {
+                            let k_base = ki * state + head * head_dim;
+                            let acc = match mode {
+                                CpuKernelMode::Scalar | CpuKernelMode::Optimized => {
+                                    let mut acc = 0.0_f32;
+                                    for d in 0..head_dim {
+                                        acc += q[q_base + d] * k[k_base + d];
+                                    }
+                                    acc
+                                }
+                                CpuKernelMode::Avx2 => {
+                                    // SAFETY: AVX2 mode is accepted only after
+                                    // `validate_mode_supported` verifies AVX2
+                                    // and FMA support. Slices are equal-length
+                                    // head windows inside prevalidated Q/K.
+                                    #[cfg(target_arch = "x86_64")]
+                                    unsafe {
+                                        cpu_avx2::dot_f32_avx2(
+                                            &q[q_base..q_base + head_dim],
+                                            &k[k_base..k_base + head_dim],
+                                        )
+                                    }
+                                    #[cfg(not(target_arch = "x86_64"))]
+                                    unreachable!(
+                                        "Avx2 mode rejected at construction on non-x86_64"
+                                    );
+                                }
+                            };
+                            *score = acc * scale;
+                        }
+
+                        softmax(&mut scores);
+
+                        let out_base = local_qi * state + head * head_dim;
+                        match mode {
+                            CpuKernelMode::Scalar | CpuKernelMode::Optimized => {
+                                for d in 0..head_dim {
+                                    out_chunk[out_base + d] = 0.0;
+                                }
+                                for (ki, &p) in scores.iter().enumerate() {
+                                    let v_base = ki * state + head * head_dim;
+                                    for d in 0..head_dim {
+                                        out_chunk[out_base + d] += p * v[v_base + d];
+                                    }
+                                }
+                            }
+                            CpuKernelMode::Avx2 => {
+                                // SAFETY: AVX2 mode is accepted only after
+                                // `validate_mode_supported` verifies AVX2
+                                // and FMA support. Slices are prevalidated
+                                // `[seq, state]` buffers, and the output
+                                // head slice is exactly `head_dim` wide.
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    cpu_avx2::attention_value_weighted_sum_avx2(
+                                        &scores,
+                                        v,
+                                        seq,
+                                        state,
+                                        head * head_dim,
+                                        head_dim,
+                                        &mut out_chunk[out_base..out_base + head_dim],
+                                    );
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                unreachable!("Avx2 mode rejected at construction on non-x86_64");
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_decoder_cross_host(
+    mode: CpuKernelMode,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    q_seq: usize,
+    kv_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), q_seq * state);
+    debug_assert_eq!(k.len(), kv_seq * state);
+    debug_assert_eq!(v.len(), kv_seq * state);
+    debug_assert_eq!(out.len(), q_seq * state);
+
+    if mode != CpuKernelMode::Avx2 {
+        attention_decoder_cross_scalar(q, k, v, q_seq, kv_seq, n_head, head_dim, scale, out);
+        return;
+    }
+
+    let mut scores = vec![0.0_f32; kv_seq];
+    for qi in 0..q_seq {
+        for head in 0..n_head {
+            attention_scores_avx2(
+                q,
+                k,
+                qi * state + head * head_dim,
+                kv_seq,
+                state,
+                head * head_dim,
+                head_dim,
+                scale,
+                &mut scores,
+            );
+            softmax(&mut scores);
+            let out_base = qi * state + head * head_dim;
+            attention_values_avx2(
+                &scores,
+                v,
+                kv_seq,
+                state,
+                head * head_dim,
+                head_dim,
+                &mut out[out_base..out_base + head_dim],
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_decoder_cross_parallel(
+    pool: &rayon::ThreadPool,
+    mode: CpuKernelMode,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    q_seq: usize,
+    kv_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    use rayon::prelude::*;
+
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), q_seq * state);
+    debug_assert_eq!(k.len(), kv_seq * state);
+    debug_assert_eq!(v.len(), kv_seq * state);
+    debug_assert_eq!(out.len(), q_seq * state);
+
+    pool.install(|| {
+        out.par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(chunk_idx, out_head)| {
+                let qi = chunk_idx / n_head;
+                let head = chunk_idx % n_head;
+                let q_base = qi * state + head * head_dim;
+                let head_offset = head * head_dim;
+                let mut scores = vec![0.0_f32; kv_seq];
+
+                match mode {
+                    CpuKernelMode::Scalar | CpuKernelMode::Optimized => {
+                        for (ki, score) in scores.iter_mut().enumerate() {
+                            let k_base = ki * state + head_offset;
+                            let mut acc = 0.0_f32;
+                            for d in 0..head_dim {
+                                acc += q[q_base + d] * k[k_base + d];
+                            }
+                            *score = acc * scale;
+                        }
+                        softmax(&mut scores);
+                        out_head.fill(0.0);
+                        for (ki, &p) in scores.iter().enumerate() {
+                            let v_base = ki * state + head_offset;
+                            for d in 0..head_dim {
+                                out_head[d] += p * v[v_base + d];
+                            }
+                        }
+                    }
+                    CpuKernelMode::Avx2 => {
+                        attention_scores_avx2(
+                            q,
+                            k,
+                            q_base,
+                            kv_seq,
+                            state,
+                            head_offset,
+                            head_dim,
+                            scale,
+                            &mut scores,
+                        );
+                        softmax(&mut scores);
+                        attention_values_avx2(
+                            &scores,
+                            v,
+                            kv_seq,
+                            state,
+                            head_offset,
+                            head_dim,
+                            out_head,
+                        );
+                    }
+                }
+            });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_decoder_incremental_cache_host(
+    mode: CpuKernelMode,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    visible_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), state);
+    debug_assert_eq!(k.len(), visible_seq * state);
+    debug_assert_eq!(v.len(), visible_seq * state);
+    debug_assert_eq!(out.len(), state);
+
+    if mode != CpuKernelMode::Avx2 {
+        attention_decoder_incremental_cache_scalar(
+            q,
+            k,
+            v,
+            visible_seq,
+            n_head,
+            head_dim,
+            scale,
+            out,
+        );
+        return;
+    }
+
+    let mut scores = vec![0.0_f32; visible_seq];
+    for head in 0..n_head {
+        let head_offset = head * head_dim;
+        attention_scores_avx2(
+            q,
+            k,
+            head_offset,
+            visible_seq,
+            state,
+            head_offset,
+            head_dim,
+            scale,
+            &mut scores,
+        );
+        softmax(&mut scores);
+        attention_values_avx2(
+            &scores,
+            v,
+            visible_seq,
+            state,
+            head_offset,
+            head_dim,
+            &mut out[head_offset..head_offset + head_dim],
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_decoder_incremental_cache_parallel(
+    pool: &rayon::ThreadPool,
+    mode: CpuKernelMode,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    visible_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    use rayon::prelude::*;
+
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), state);
+    debug_assert_eq!(k.len(), visible_seq * state);
+    debug_assert_eq!(v.len(), visible_seq * state);
+    debug_assert_eq!(out.len(), state);
+
+    pool.install(|| {
+        out.par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(head, out_head)| {
+                let head_offset = head * head_dim;
+                let mut scores = vec![0.0_f32; visible_seq];
+                match mode {
+                    CpuKernelMode::Scalar | CpuKernelMode::Optimized => {
+                        for (ki, score) in scores.iter_mut().enumerate() {
+                            let k_base = ki * state + head_offset;
+                            let mut acc = 0.0_f32;
+                            for d in 0..head_dim {
+                                acc += q[head_offset + d] * k[k_base + d];
+                            }
+                            *score = acc * scale;
+                        }
+                        softmax(&mut scores);
+                        out_head.fill(0.0);
+                        for (ki, &p) in scores.iter().enumerate() {
+                            let v_base = ki * state + head_offset;
+                            for d in 0..head_dim {
+                                out_head[d] += p * v[v_base + d];
+                            }
+                        }
+                    }
+                    CpuKernelMode::Avx2 => {
+                        attention_scores_avx2(
+                            q,
+                            k,
+                            head_offset,
+                            visible_seq,
+                            state,
+                            head_offset,
+                            head_dim,
+                            scale,
+                            &mut scores,
+                        );
+                        softmax(&mut scores);
+                        attention_values_avx2(
+                            &scores,
+                            v,
+                            visible_seq,
+                            state,
+                            head_offset,
+                            head_dim,
+                            out_head,
+                        );
+                    }
+                }
+            });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_scores_avx2(
+    q: &[f32],
+    k: &[f32],
+    q_base: usize,
+    rows: usize,
+    state: usize,
+    head_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    scores: &mut [f32],
+) {
+    debug_assert!(q_base + head_dim <= q.len());
+    debug_assert!(rows * state <= k.len());
+    debug_assert!(head_offset + head_dim <= state);
+    debug_assert!(scores.len() >= rows);
+
+    for (row, score) in scores.iter_mut().take(rows).enumerate() {
+        let k_base = row * state + head_offset;
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: AVX2 mode is accepted only after backend construction
+        // verifies AVX2 and FMA support. Slice windows are validated by the
+        // caller's tensor shape checks.
+        let acc = unsafe {
+            cpu_avx2::dot_f32_avx2(&q[q_base..q_base + head_dim], &k[k_base..k_base + head_dim])
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let acc = {
+            let _ = (q, k, q_base, k_base);
+            unreachable!("Avx2 mode rejected at construction on non-x86_64")
+        };
+        *score = acc * scale;
+    }
+}
+
+fn attention_values_avx2(
+    scores: &[f32],
+    v: &[f32],
+    rows: usize,
+    state: usize,
+    head_offset: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: AVX2 mode is accepted only after backend construction verifies
+    // AVX2 and FMA support. Slice windows are validated by the caller's tensor
+    // shape checks, and `out` is the exact output head slice.
+    unsafe {
+        cpu_avx2::attention_value_weighted_sum_avx2(
+            scores,
+            v,
+            rows,
+            state,
+            head_offset,
+            head_dim,
+            out,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unreachable!("Avx2 mode rejected at construction on non-x86_64");
+}
+
 /// Scalar Whisper decoder causal self-attention (full-context).
 ///
 /// Q, K, V: `[seq, state]` row-major where `state == n_head * head_dim`.
@@ -718,6 +1280,67 @@ pub(crate) fn attention_decoder_incremental_scalar(
             out[out_base + d] = acc;
         }
     }
+}
+
+/// Scalar incremental decoder self-attention over a fixed-capacity cache
+/// prefix. This matches `attention_decoder_incremental_scalar` when `k`/`v`
+/// are `past || new` and `visible_seq = past_seq + 1`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decoder_incremental_cache_scalar(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    visible_seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let state = n_head * head_dim;
+    debug_assert_eq!(q.len(), state);
+    debug_assert_eq!(k.len(), visible_seq * state);
+    debug_assert_eq!(v.len(), visible_seq * state);
+    debug_assert_eq!(out.len(), state);
+
+    let mut scores = vec![0.0_f32; visible_seq];
+    for head in 0..n_head {
+        let q_base = head * head_dim;
+        for (ki, score) in scores.iter_mut().enumerate() {
+            let k_base = ki * state + head * head_dim;
+            let mut acc = 0.0_f32;
+            for d in 0..head_dim {
+                acc += q[q_base + d] * k[k_base + d];
+            }
+            *score = acc * scale;
+        }
+        softmax(&mut scores);
+        let out_base = head * head_dim;
+        for d in 0..head_dim {
+            let mut acc = 0.0_f32;
+            for (ki, &p) in scores.iter().enumerate() {
+                let value = v[ki * state + head * head_dim + d];
+                acc += p * value;
+            }
+            out[out_base + d] = acc;
+        }
+    }
+}
+
+pub(crate) fn validate_copy_into_shapes(
+    src: &DeviceTensor,
+    dst: &DeviceTensor,
+    dst_offset: usize,
+) -> Result<()> {
+    let end = dst_offset
+        .checked_add(src.len())
+        .ok_or_else(|| kernel_err("copy_into_d dst_offset + src.len overflowed usize"))?;
+    if end > dst.len() {
+        return Err(kernel_err(format!(
+            "copy_into_d range {dst_offset}..{end} exceeds dst len {}",
+            dst.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Shape validator for the `attention_encoder_d` device surface. Rejects
@@ -848,6 +1471,109 @@ pub(crate) fn validate_attention_decoder_incremental_shapes(
         if len != past_expected {
             return Err(kernel_err(format!(
                 "attention_decoder_incremental_d {label} len {len} != past_seq*state {past_expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Shape validator for fixed-capacity incremental decoder attention. Cache
+/// tensors must have `cache_capacity * state` cells, `visible_seq` must be
+/// non-zero and not exceed that capacity, and q/out must be one state row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_attention_decoder_incremental_cache_shapes(
+    q: &DeviceTensor,
+    key_cache: &DeviceTensor,
+    value_cache: &DeviceTensor,
+    visible_seq: usize,
+    cache_capacity: usize,
+    n_head: usize,
+    head_dim: usize,
+    out: &DeviceTensor,
+) -> Result<()> {
+    if visible_seq == 0 {
+        return Err(kernel_err(
+            "attention_decoder_incremental_cache_d visible_seq must be > 0",
+        ));
+    }
+    if visible_seq > cache_capacity {
+        return Err(kernel_err(format!(
+            "attention_decoder_incremental_cache_d visible_seq {visible_seq} exceeds cache_capacity {cache_capacity}"
+        )));
+    }
+    if n_head == 0 {
+        return Err(kernel_err(
+            "attention_decoder_incremental_cache_d n_head must be > 0",
+        ));
+    }
+    if head_dim == 0 {
+        return Err(kernel_err(
+            "attention_decoder_incremental_cache_d head_dim must be > 0",
+        ));
+    }
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        kernel_err("attention_decoder_incremental_cache_d n_head*head_dim overflowed usize")
+    })?;
+    for (label, len) in [("q", q.len()), ("out", out.len())] {
+        if len != state {
+            return Err(kernel_err(format!(
+                "attention_decoder_incremental_cache_d {label} len {len} != state {state}"
+            )));
+        }
+    }
+    let cache_expected = cache_capacity.checked_mul(state).ok_or_else(|| {
+        kernel_err("attention_decoder_incremental_cache_d cache_capacity*state overflowed usize")
+    })?;
+    for (label, len) in [
+        ("key_cache", key_cache.len()),
+        ("value_cache", value_cache.len()),
+    ] {
+        if len != cache_expected {
+            return Err(kernel_err(format!(
+                "attention_decoder_incremental_cache_d {label} len {len} != cache_capacity*state {cache_expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Shape validator for appending one K/V row to a fixed-capacity incremental
+/// decoder cache and attending over the resulting visible prefix.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_attention_decoder_incremental_cache_append_shapes(
+    q: &DeviceTensor,
+    key_cache: &DeviceTensor,
+    value_cache: &DeviceTensor,
+    new_k: &DeviceTensor,
+    new_v: &DeviceTensor,
+    past_seq: usize,
+    cache_capacity: usize,
+    n_head: usize,
+    head_dim: usize,
+    out: &DeviceTensor,
+) -> Result<()> {
+    if past_seq >= cache_capacity {
+        return Err(kernel_err(format!(
+            "attention_decoder_incremental_cache_append_d past_seq {past_seq} cannot append into cache_capacity {cache_capacity}"
+        )));
+    }
+    validate_attention_decoder_incremental_cache_shapes(
+        q,
+        key_cache,
+        value_cache,
+        past_seq + 1,
+        cache_capacity,
+        n_head,
+        head_dim,
+        out,
+    )?;
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        kernel_err("attention_decoder_incremental_cache_append_d n_head*head_dim overflowed usize")
+    })?;
+    for (label, len) in [("new_k", new_k.len()), ("new_v", new_v.len())] {
+        if len != state {
+            return Err(kernel_err(format!(
+                "attention_decoder_incremental_cache_append_d {label} len {len} != state {state}"
             )));
         }
     }
@@ -1167,6 +1893,18 @@ impl CpuKernelBackend {
         out: &mut [f32],
     ) -> Result<()> {
         if let Some(pool) = &self.pool {
+            if rows == 1 && out_features >= PARALLEL_LINEAR_MIN_OUTPUTS {
+                return linear_out_by_in_output_parallel(
+                    pool,
+                    self.mode,
+                    x,
+                    in_features,
+                    weight_out_by_in,
+                    out_features,
+                    bias,
+                    out,
+                );
+            }
             if rows >= PARALLEL_LINEAR_MIN_ROWS {
                 return linear_out_by_in_parallel(
                     pool,
@@ -1572,10 +2310,11 @@ impl KernelBackend for CpuKernelBackend {
         Ok(())
     }
 
-    /// CPU override: borrow host slices and run the scalar encoder
-    /// attention directly. Falls through to the trait default if any
-    /// operand is device-resident (shouldn't happen on the CPU backend,
-    /// but the default path stays correct).
+    /// CPU override: borrow host slices and run encoder attention directly.
+    /// A configured CPU thread pool partitions query rows; each row keeps the
+    /// same per-head scalar softmax order as the serial oracle. Falls through
+    /// to the trait default if any operand is device-resident (shouldn't happen
+    /// on the CPU backend, but the default path stays correct).
     #[allow(clippy::too_many_arguments)]
     fn attention_encoder_d(
         &self,
@@ -1615,6 +2354,14 @@ impl KernelBackend for CpuKernelBackend {
             }
         };
         let mut out_b = out_b;
+        if let Some(pool) = &self.pool {
+            if seq >= PARALLEL_SDPA_MIN_SEQ {
+                attention_encoder_parallel(
+                    pool, self.mode, &q_b, &k_b, &v_b, seq, n_head, head_dim, scale, &mut out_b,
+                );
+                return Ok(());
+            }
+        }
         attention_encoder_scalar(&q_b, &k_b, &v_b, seq, n_head, head_dim, scale, &mut out_b);
         Ok(())
     }
@@ -1655,6 +2402,212 @@ impl KernelBackend for CpuKernelBackend {
                 x_b[dst_start + col] += pe_b[src_start + col];
             }
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_cache_d(
+        &self,
+        q: &DeviceTensor,
+        key_cache: &DeviceTensor,
+        value_cache: &DeviceTensor,
+        visible_seq: usize,
+        cache_capacity: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_incremental_cache_shapes(
+            q,
+            key_cache,
+            value_cache,
+            visible_seq,
+            cache_capacity,
+            n_head,
+            head_dim,
+            output,
+        )?;
+        let state = n_head * head_dim;
+        let visible_len = visible_seq * state;
+        let (q_b, key_b, value_b, out_b) = match (
+            q.borrow_host_slice(),
+            key_cache.borrow_host_slice(),
+            value_cache.borrow_host_slice(),
+            output.borrow_host_slice_mut(),
+        ) {
+            (Ok(q_b), Ok(key_b), Ok(value_b), Ok(out_b)) => (q_b, key_b, value_b, out_b),
+            _ => {
+                let q_host = q.to_host_owned()?;
+                let key_host = key_cache.to_host_owned()?;
+                let value_host = value_cache.to_host_owned()?;
+                let mut out_buf = vec![0.0_f32; state];
+                attention_decoder_incremental_cache_host(
+                    self.mode,
+                    &q_host,
+                    &key_host[..visible_len],
+                    &value_host[..visible_len],
+                    visible_seq,
+                    n_head,
+                    head_dim,
+                    scale,
+                    &mut out_buf,
+                );
+                return output.write_from_host_slice(&out_buf);
+            }
+        };
+        let mut out_b = out_b;
+        let key_prefix = &key_b[..visible_len];
+        let value_prefix = &value_b[..visible_len];
+        if let Some(pool) = &self.pool {
+            if visible_seq >= PARALLEL_SDPA_MIN_SEQ && n_head > 1 {
+                attention_decoder_incremental_cache_parallel(
+                    pool,
+                    self.mode,
+                    &q_b,
+                    key_prefix,
+                    value_prefix,
+                    visible_seq,
+                    n_head,
+                    head_dim,
+                    scale,
+                    &mut out_b,
+                );
+                return Ok(());
+            }
+        }
+        attention_decoder_incremental_cache_host(
+            self.mode,
+            &q_b,
+            key_prefix,
+            value_prefix,
+            visible_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut out_b,
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_incremental_cache_append_d(
+        &self,
+        q: &DeviceTensor,
+        key_cache: &DeviceTensor,
+        value_cache: &DeviceTensor,
+        new_k: &DeviceTensor,
+        new_v: &DeviceTensor,
+        past_seq: usize,
+        cache_capacity: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_incremental_cache_append_shapes(
+            q,
+            key_cache,
+            value_cache,
+            new_k,
+            new_v,
+            past_seq,
+            cache_capacity,
+            n_head,
+            head_dim,
+            output,
+        )?;
+        let state = n_head * head_dim;
+        let dst_offset = past_seq.checked_mul(state).ok_or_else(|| {
+            kernel_err(
+                "attention_decoder_incremental_cache_append_d past_seq*state overflowed usize",
+            )
+        })?;
+        {
+            let maybe_borrows = (
+                new_k.borrow_host_slice(),
+                new_v.borrow_host_slice(),
+                key_cache.borrow_host_slice_mut(),
+                value_cache.borrow_host_slice_mut(),
+            );
+            match maybe_borrows {
+                (Ok(new_k_b), Ok(new_v_b), Ok(mut key_b), Ok(mut value_b)) => {
+                    key_b[dst_offset..dst_offset + state].copy_from_slice(&new_k_b);
+                    value_b[dst_offset..dst_offset + state].copy_from_slice(&new_v_b);
+                }
+                _ => {
+                    self.copy_into_d(new_k, key_cache, dst_offset)?;
+                    self.copy_into_d(new_v, value_cache, dst_offset)?;
+                }
+            }
+        }
+        self.attention_decoder_incremental_cache_d(
+            q,
+            key_cache,
+            value_cache,
+            past_seq + 1,
+            cache_capacity,
+            n_head,
+            head_dim,
+            scale,
+            output,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decoder_cross_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        q_seq: usize,
+        kv_seq: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        output: &DeviceTensor,
+    ) -> Result<()> {
+        validate_attention_decoder_cross_shapes(q, k, v, q_seq, kv_seq, n_head, head_dim, output)?;
+        let (q_b, k_b, v_b, out_b) = match (
+            q.borrow_host_slice(),
+            k.borrow_host_slice(),
+            v.borrow_host_slice(),
+            output.borrow_host_slice_mut(),
+        ) {
+            (Ok(q_b), Ok(k_b), Ok(v_b), Ok(out_b)) => (q_b, k_b, v_b, out_b),
+            _ => {
+                let q_host = q.to_host_owned()?;
+                let k_host = k.to_host_owned()?;
+                let v_host = v.to_host_owned()?;
+                let mut out_buf = vec![0.0_f32; q_seq * n_head * head_dim];
+                attention_decoder_cross_host(
+                    self.mode,
+                    &q_host,
+                    &k_host,
+                    &v_host,
+                    q_seq,
+                    kv_seq,
+                    n_head,
+                    head_dim,
+                    scale,
+                    &mut out_buf,
+                );
+                return output.write_from_host_slice(&out_buf);
+            }
+        };
+        let mut out_b = out_b;
+        if let Some(pool) = &self.pool {
+            if kv_seq >= PARALLEL_SDPA_MIN_SEQ && q_seq * n_head > 1 {
+                attention_decoder_cross_parallel(
+                    pool, self.mode, &q_b, &k_b, &v_b, q_seq, kv_seq, n_head, head_dim, scale,
+                    &mut out_b,
+                );
+                return Ok(());
+            }
+        }
+        attention_decoder_cross_host(
+            self.mode, &q_b, &k_b, &v_b, q_seq, kv_seq, n_head, head_dim, scale, &mut out_b,
+        );
         Ok(())
     }
 }
@@ -2240,9 +3193,14 @@ fn linear_out_by_in_optimized_compute(
 
 /// Below this row count, single-threaded execution beats the rayon dispatch
 /// overhead. Tuned for the Whisper encoder where M = audio_ctx (>=1500 for
-/// all classic sizes); decoder single-token decode has rows=1 and stays
-/// serial regardless of pool configuration.
+/// all classic sizes). Single-token decoder projections use the output-axis
+/// threshold below instead.
 const PARALLEL_LINEAR_MIN_ROWS: usize = 32;
+
+/// Below this output-feature count, single-row linear projections stay serial.
+/// The high-value Whisper decoder case is the tied-embedding logits projection
+/// (vocab-sized output); smaller 384-wide projections avoid rayon overhead.
+const PARALLEL_LINEAR_MIN_OUTPUTS: usize = 1024;
 
 /// Same rationale as `PARALLEL_LINEAR_MIN_ROWS` but for the generic `matmul`
 /// kernel. Qwen prefill uses M = seq_len which can run into the hundreds for
@@ -2253,6 +3211,90 @@ const PARALLEL_MATMUL_MIN_ROWS: usize = 32;
 /// overhead. Mirrors the Whisper attention threshold; chosen so that single-
 /// token decode (seq_len = 1) stays serial.
 const PARALLEL_SDPA_MIN_SEQ: usize = 32;
+
+/// Parallel dispatcher for single-row `linear_out_by_in`. Partitions the
+/// output-feature axis across the rayon pool. This is the hot Whisper decoder
+/// append shape, especially the tied-embedding logits projection
+/// (`rows == 1`, `out_features ~= vocab`). Each output cell keeps the same
+/// K-loop accumulation order as the serial helper; only independent output
+/// columns run on different threads.
+#[allow(clippy::too_many_arguments)]
+fn linear_out_by_in_output_parallel(
+    pool: &rayon::ThreadPool,
+    mode: CpuKernelMode,
+    x: &[f32],
+    in_features: usize,
+    weight_out_by_in: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    validate_linear_out_by_in(x, 1, in_features, weight_out_by_in, out_features, bias, out)?;
+
+    let threads = pool.current_num_threads().max(1);
+    let tile = 4usize;
+    let tiles_total = out_features.div_ceil(tile);
+    let tiles_per_chunk = tiles_total.div_ceil(threads).max(1);
+    let outputs_per_chunk = tiles_per_chunk * tile;
+
+    pool.install(|| {
+        out.par_chunks_mut(outputs_per_chunk)
+            .enumerate()
+            .for_each(|(idx, out_chunk)| {
+                let out_start = idx * outputs_per_chunk;
+                let chunk_out = out_chunk.len();
+                let w_start = out_start * in_features;
+                let w_end = w_start + chunk_out * in_features;
+                let weight_chunk = &weight_out_by_in[w_start..w_end];
+                let bias_chunk = bias.map(|b| &b[out_start..out_start + chunk_out]);
+
+                match mode {
+                    CpuKernelMode::Scalar => linear_out_by_in_compute(
+                        x,
+                        1,
+                        in_features,
+                        weight_chunk,
+                        chunk_out,
+                        bias_chunk,
+                        out_chunk,
+                    ),
+                    CpuKernelMode::Optimized => linear_out_by_in_optimized_compute(
+                        x,
+                        1,
+                        in_features,
+                        weight_chunk,
+                        chunk_out,
+                        bias_chunk,
+                        out_chunk,
+                    ),
+                    CpuKernelMode::Avx2 => {
+                        // SAFETY: `with_mode_and_threads` validates AVX2+FMA
+                        // support before constructing this backend. The full
+                        // shape was validated above; chunk slices preserve the
+                        // single-row `linear_out_by_in` contract.
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            cpu_avx2::linear_out_by_in_compute_avx2(
+                                x,
+                                1,
+                                in_features,
+                                weight_chunk,
+                                chunk_out,
+                                bias_chunk,
+                                out_chunk,
+                            );
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        unreachable!("Avx2 mode rejected at construction on non-x86_64");
+                    }
+                }
+            });
+    });
+
+    Ok(())
+}
 
 /// Validate that the host CPU supports the requested mode. AVX2 needs both
 /// the `avx2` and `fma` x86_64 features at runtime; the scalar/optimized
@@ -2496,6 +3538,24 @@ pub(crate) fn validate_linear_out_by_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_close_with_tolerance(got: &[f32], expected: &[f32], tolerance: f32, label: &str) {
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "{label} length mismatch: got {} expected {}",
+            got.len(),
+            expected.len()
+        );
+        for (idx, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            let abs = (g - e).abs();
+            let rel = if e.abs() > 1e-6 { abs / e.abs() } else { abs };
+            assert!(
+                abs <= tolerance || rel <= tolerance,
+                "{label} drifted at idx {idx}: expected={e} got={g} abs={abs} rel={rel}"
+            );
+        }
+    }
 
     // --- vec_add ---
 
@@ -2941,6 +4001,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn threaded_linear_out_by_in_single_row_splits_output_axis_bit_for_bit() {
+        let rows = 1usize;
+        let in_features = 17;
+        let out_features = PARALLEL_LINEAR_MIN_OUTPUTS + 7;
+        let x: Vec<f32> = (0..(rows * in_features))
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let w: Vec<f32> = (0..(out_features * in_features))
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let b: Vec<f32> = (0..out_features).map(|i| (i as f32) * 0.002).collect();
+
+        let mut serial = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::scalar()
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut serial,
+            )
+            .expect("serial linear must succeed");
+
+        let mut threaded = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .expect("4-thread backend must build")
+            .linear_out_by_in(
+                &x,
+                rows,
+                in_features,
+                &w,
+                out_features,
+                Some(&b),
+                &mut threaded,
+            )
+            .expect("threaded output-axis linear must succeed");
+
+        assert_eq!(
+            serial, threaded,
+            "threaded output-axis linear_out_by_in must match serial bit-for-bit"
+        );
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_linear_out_by_in_matches_scalar_within_tolerance() {
@@ -3000,6 +4106,150 @@ mod tests {
                 "AVX2 output drifted at idx {idx}: scalar={s} avx2={a} abs={abs} rel={rel}"
             );
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_linear_out_by_in_single_row_matches_scalar_within_tolerance() {
+        // Whisper decoder append uses rows=1 for each projection. This pins
+        // the AVX2 row-tail SIMD path instead of only exercising the 4-row
+        // tile body above.
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let rows = 1usize;
+        let in_features = 384;
+        let out_features = 257; // exercises the out-dimension tail too
+        let x: Vec<f32> = (0..(rows * in_features))
+            .map(|i| ((i as f32) * 0.009).sin())
+            .collect();
+        let w: Vec<f32> = (0..(out_features * in_features))
+            .map(|i| ((i as f32) * 0.014).cos())
+            .collect();
+
+        let mut scalar = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::scalar()
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut scalar)
+            .expect("scalar must succeed");
+
+        let mut avx2 = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_checked(CpuKernelMode::Avx2)
+            .expect("AVX2 backend must build on host that advertises avx2+fma")
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut avx2)
+            .expect("AVX2 must succeed");
+
+        for (idx, (a, s)) in avx2.iter().zip(scalar.iter()).enumerate() {
+            let abs = (a - s).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "AVX2 single-row output drifted at idx {idx}: scalar={s} avx2={a} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_dot_f32_matches_scalar_within_tolerance() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let a: Vec<f32> = (0..130).map(|i| ((i as f32) * 0.011).sin()).collect();
+        let b: Vec<f32> = (0..130).map(|i| ((i as f32) * 0.017).cos()).collect();
+        let scalar = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>();
+        // SAFETY: the host feature check above verified AVX2+FMA support.
+        let avx2 = unsafe { cpu_avx2::dot_f32_avx2(&a, &b) };
+        let abs = (avx2 - scalar).abs();
+        let rel = if scalar.abs() > 1e-6 {
+            abs / scalar.abs()
+        } else {
+            abs
+        };
+        assert!(
+            abs <= 1e-4 || rel <= 1e-4,
+            "AVX2 dot drifted: scalar={scalar} avx2={avx2} abs={abs} rel={rel}"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_attention_value_weighted_sum_matches_scalar_within_tolerance() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let seq = 17usize;
+        let state = 24usize;
+        let head_offset = 8usize;
+        let head_dim = 10usize;
+        let probs: Vec<f32> = (0..seq).map(|i| 0.001 + (i as f32) * 0.003).collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.017).cos())
+            .collect();
+
+        let mut scalar = vec![0.0_f32; head_dim];
+        for d in 0..head_dim {
+            for (ki, &p) in probs.iter().enumerate() {
+                scalar[d] += p * v[ki * state + head_offset + d];
+            }
+        }
+
+        let mut avx2 = vec![0.0_f32; head_dim];
+        // SAFETY: the host feature check above verified AVX2+FMA support, and
+        // the synthetic slices satisfy the helper's documented shape contract.
+        unsafe {
+            cpu_avx2::attention_value_weighted_sum_avx2(
+                &probs,
+                &v,
+                seq,
+                state,
+                head_offset,
+                head_dim,
+                &mut avx2,
+            );
+        }
+
+        for (idx, (a, s)) in avx2.iter().zip(scalar.iter()).enumerate() {
+            let abs = (a - s).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "AVX2 weighted sum drifted at idx {idx}: scalar={s} avx2={a} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn threaded_avx2_linear_out_by_in_single_row_matches_serial_avx2_bit_for_bit() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let rows = 1usize;
+        let in_features = 384;
+        let out_features = PARALLEL_LINEAR_MIN_OUTPUTS + 7;
+        let x: Vec<f32> = (0..(rows * in_features))
+            .map(|i| ((i as f32) * 0.009).sin())
+            .collect();
+        let w: Vec<f32> = (0..(out_features * in_features))
+            .map(|i| ((i as f32) * 0.014).cos())
+            .collect();
+
+        let mut serial = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_checked(CpuKernelMode::Avx2)
+            .expect("AVX2 backend must build on host that advertises avx2+fma")
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut serial)
+            .expect("serial AVX2 must succeed");
+
+        let mut threaded = vec![0.0_f32; rows * out_features];
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Avx2, 4)
+            .expect("threaded AVX2 backend must build")
+            .linear_out_by_in(&x, rows, in_features, &w, out_features, None, &mut threaded)
+            .expect("threaded output-axis AVX2 must succeed");
+
+        assert_eq!(
+            serial, threaded,
+            "threaded output-axis AVX2 must match serial AVX2 bit-for-bit"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3616,6 +4866,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cpu_attention_encoder_d_threaded_matches_scalar_bit_for_bit() {
+        let seq = PARALLEL_SDPA_MIN_SEQ;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut scalar_out = vec![0.0_f32; seq * state];
+        attention_encoder_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut scalar_out);
+
+        let backend = CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .expect("threaded scalar backend must build");
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_encoder_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("threaded CPU attention_encoder_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(
+            got, scalar_out,
+            "threaded CPU override must match scalar bit-for-bit"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpu_attention_encoder_d_threaded_avx2_matches_scalar_within_tolerance() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let seq = PARALLEL_SDPA_MIN_SEQ;
+        let n_head = 2usize;
+        let head_dim = 8usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.019).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut scalar_out = vec![0.0_f32; seq * state];
+        attention_encoder_scalar(&q, &k, &v, seq, n_head, head_dim, scale, &mut scalar_out);
+
+        let backend = CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Avx2, 4)
+            .expect("threaded AVX2 backend must build");
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(seq * state).expect("alloc out");
+        backend
+            .attention_encoder_d(&q_d, &k_d, &v_d, seq, n_head, head_dim, scale, &out_d)
+            .expect("threaded AVX2 attention_encoder_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        for (idx, (g, s)) in got.iter().zip(scalar_out.iter()).enumerate() {
+            let abs = (g - s).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "threaded AVX2 encoder attention drifted at idx {idx}: scalar={s} avx2={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // GW.4-5B CPU parity gates
     // -----------------------------------------------------------------------
@@ -3711,6 +5045,302 @@ mod tests {
             got, expected,
             "CPU incremental decoder attention must be bit-identical to scalar"
         );
+    }
+
+    /// PostGW.1: cache append must be expressible as a backend device copy.
+    /// The CPU default path bounces through host, but it exercises the public
+    /// contract that GPU backends override without changing semantics.
+    #[test]
+    fn cpu_copy_into_d_updates_destination_window() {
+        let backend = CpuKernelBackend::scalar();
+        let src = backend.upload(&[9.0_f32, 8.0]).expect("upload src");
+        let dst = backend
+            .upload(&[0.0_f32, 1.0, 2.0, 3.0, 4.0])
+            .expect("upload dst");
+
+        backend
+            .copy_into_d(&src, &dst, 2)
+            .expect("copy into existing tensor");
+
+        let got = dst.to_host_owned().expect("readback dst");
+        assert_eq!(got, [0.0, 1.0, 9.0, 8.0, 4.0]);
+    }
+
+    #[test]
+    fn cpu_copy_into_d_rejects_out_of_range_window() {
+        let backend = CpuKernelBackend::scalar();
+        let src = backend.upload(&[1.0_f32, 2.0, 3.0]).expect("upload src");
+        let dst = backend.upload(&[0.0_f32, 0.0]).expect("upload dst");
+
+        let err = backend
+            .copy_into_d(&src, &dst, 1)
+            .expect_err("copy must reject a window past destination end");
+
+        match err {
+            OcelotlError::Kernel(KernelError { message, .. }) => {
+                assert!(
+                    message.contains("copy_into_d"),
+                    "expected copy diagnostic, got {message}"
+                );
+            }
+            other => panic!("expected KernelError, got {other:?}"),
+        }
+    }
+
+    /// PostGW.1: fixed-capacity cache attention must match the older
+    /// `past || new` incremental contract while ignoring unused cache tail.
+    #[test]
+    fn cpu_attention_decoder_incremental_cache_d_matches_incremental_scalar() {
+        let past_seq = 3usize;
+        let visible_seq = past_seq + 1;
+        let cache_capacity = 6usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let past_k: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let past_v: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.019).sin())
+            .collect();
+        let new_k: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.027).cos()).collect();
+        let new_v: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.033).sin()).collect();
+
+        let mut expected = vec![0.0_f32; state];
+        attention_decoder_incremental_scalar(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let mut key_cache = vec![-99.0_f32; cache_capacity * state];
+        let mut value_cache = vec![99.0_f32; cache_capacity * state];
+        key_cache[..past_seq * state].copy_from_slice(&past_k);
+        value_cache[..past_seq * state].copy_from_slice(&past_v);
+        key_cache[past_seq * state..visible_seq * state].copy_from_slice(&new_k);
+        value_cache[past_seq * state..visible_seq * state].copy_from_slice(&new_v);
+
+        let backend = CpuKernelBackend::scalar();
+        let q_d = backend.upload(&q).expect("upload q");
+        let key_cache_d = backend.upload(&key_cache).expect("upload key cache");
+        let value_cache_d = backend.upload(&value_cache).expect("upload value cache");
+        let out_d = backend.alloc(state).expect("alloc out");
+        backend
+            .attention_decoder_incremental_cache_d(
+                &q_d,
+                &key_cache_d,
+                &value_cache_d,
+                visible_seq,
+                cache_capacity,
+                n_head,
+                head_dim,
+                scale,
+                &out_d,
+            )
+            .expect("CPU cache attention must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+        assert_eq!(
+            got, expected,
+            "cache-prefix attention must match past-plus-new incremental scalar"
+        );
+    }
+
+    #[test]
+    fn cpu_attention_decoder_incremental_cache_append_d_matches_incremental_scalar_and_updates_cache()
+     {
+        let past_seq = 3usize;
+        let visible_seq = past_seq + 1;
+        let cache_capacity = 6usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let past_k: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let past_v: Vec<f32> = (0..past_seq * state)
+            .map(|i| ((i as f32) * 0.019).sin())
+            .collect();
+        let new_k: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.027).cos()).collect();
+        let new_v: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.033).sin()).collect();
+
+        let mut expected = vec![0.0_f32; state];
+        attention_decoder_incremental_scalar(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let mut key_cache = vec![-99.0_f32; cache_capacity * state];
+        let mut value_cache = vec![99.0_f32; cache_capacity * state];
+        key_cache[..past_seq * state].copy_from_slice(&past_k);
+        value_cache[..past_seq * state].copy_from_slice(&past_v);
+
+        let backend = CpuKernelBackend::scalar();
+        let q_d = backend.upload(&q).expect("upload q");
+        let key_cache_d = backend.upload(&key_cache).expect("upload key cache");
+        let value_cache_d = backend.upload(&value_cache).expect("upload value cache");
+        let new_k_d = backend.upload(&new_k).expect("upload new k");
+        let new_v_d = backend.upload(&new_v).expect("upload new v");
+        let out_d = backend.alloc(state).expect("alloc out");
+        backend
+            .attention_decoder_incremental_cache_append_d(
+                &q_d,
+                &key_cache_d,
+                &value_cache_d,
+                &new_k_d,
+                &new_v_d,
+                past_seq,
+                cache_capacity,
+                n_head,
+                head_dim,
+                scale,
+                &out_d,
+            )
+            .expect("CPU cache append attention must succeed");
+
+        let got = out_d.to_host_owned().expect("readback");
+        assert_eq!(got, expected);
+        let got_key_cache = key_cache_d.to_host_owned().expect("read key cache");
+        let got_value_cache = value_cache_d.to_host_owned().expect("read value cache");
+        assert_eq!(
+            &got_key_cache[past_seq * state..visible_seq * state],
+            &new_k[..]
+        );
+        assert_eq!(
+            &got_value_cache[past_seq * state..visible_seq * state],
+            &new_v[..]
+        );
+    }
+
+    #[test]
+    fn cpu_attention_decoder_incremental_cache_d_threaded_matches_scalar_bit_for_bit() {
+        let visible_seq = PARALLEL_SDPA_MIN_SEQ;
+        let cache_capacity = visible_seq + 3;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let mut key_cache = vec![-99.0_f32; cache_capacity * state];
+        let mut value_cache = vec![99.0_f32; cache_capacity * state];
+        for i in 0..visible_seq * state {
+            key_cache[i] = ((i as f32) * 0.013).cos();
+            value_cache[i] = ((i as f32) * 0.019).sin();
+        }
+
+        let mut expected = vec![0.0_f32; state];
+        attention_decoder_incremental_cache_scalar(
+            &q,
+            &key_cache[..visible_seq * state],
+            &value_cache[..visible_seq * state],
+            visible_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .expect("threaded scalar backend must build");
+        let q_d = backend.upload(&q).expect("upload q");
+        let key_cache_d = backend.upload(&key_cache).expect("upload key cache");
+        let value_cache_d = backend.upload(&value_cache).expect("upload value cache");
+        let out_d = backend.alloc(state).expect("alloc out");
+        backend
+            .attention_decoder_incremental_cache_d(
+                &q_d,
+                &key_cache_d,
+                &value_cache_d,
+                visible_seq,
+                cache_capacity,
+                n_head,
+                head_dim,
+                scale,
+                &out_d,
+            )
+            .expect("threaded cache attention must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+        assert_eq!(
+            got, expected,
+            "threaded cache attention must match scalar bit-for-bit"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpu_attention_decoder_incremental_cache_d_threaded_avx2_matches_scalar_within_tolerance() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let visible_seq = PARALLEL_SDPA_MIN_SEQ;
+        let cache_capacity = visible_seq + 3;
+        let n_head = 2usize;
+        let head_dim = 8usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..state).map(|i| ((i as f32) * 0.041).sin()).collect();
+        let mut key_cache = vec![-99.0_f32; cache_capacity * state];
+        let mut value_cache = vec![99.0_f32; cache_capacity * state];
+        for i in 0..visible_seq * state {
+            key_cache[i] = ((i as f32) * 0.013).cos();
+            value_cache[i] = ((i as f32) * 0.019).sin();
+        }
+
+        let mut expected = vec![0.0_f32; state];
+        attention_decoder_incremental_cache_scalar(
+            &q,
+            &key_cache[..visible_seq * state],
+            &value_cache[..visible_seq * state],
+            visible_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Avx2, 4)
+            .expect("threaded AVX2 backend must build");
+        let q_d = backend.upload(&q).expect("upload q");
+        let key_cache_d = backend.upload(&key_cache).expect("upload key cache");
+        let value_cache_d = backend.upload(&value_cache).expect("upload value cache");
+        let out_d = backend.alloc(state).expect("alloc out");
+        backend
+            .attention_decoder_incremental_cache_d(
+                &q_d,
+                &key_cache_d,
+                &value_cache_d,
+                visible_seq,
+                cache_capacity,
+                n_head,
+                head_dim,
+                scale,
+                &out_d,
+            )
+            .expect("threaded AVX2 cache attention must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+        assert_close_with_tolerance(&got, &expected, 1.0e-4, "threaded AVX2 cache attention");
     }
 
     /// GW.4-5B: `attention_decoder_causal_d` rejects wrong buffer lengths.
@@ -3909,10 +5539,11 @@ mod tests {
         }
     }
 
-    // GW.4-5C: `attention_decoder_cross_d` default trait impl (readback +
-    // scalar) must produce the same output as the scalar oracle.
+    // GW.4-5C/PostGW.2: `attention_decoder_cross_d` on CPU must produce the
+    // same output as the scalar oracle. The CPU backend now borrows host slices
+    // directly instead of falling through the cloning trait default.
     #[test]
-    fn attention_decoder_cross_d_default_matches_scalar_oracle() {
+    fn attention_decoder_cross_d_cpu_matches_scalar_oracle() {
         let q_seq = 3usize;
         let kv_seq = 5usize;
         let n_head = 2usize;
@@ -3962,5 +5593,106 @@ mod tests {
                 "cross_d default mismatch at idx {idx}: got={g} expected={e}"
             );
         }
+    }
+
+    #[test]
+    fn cpu_attention_decoder_cross_d_threaded_matches_scalar_bit_for_bit() {
+        let q_seq = 3usize;
+        let kv_seq = PARALLEL_SDPA_MIN_SEQ;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..q_seq * state)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; q_seq * state];
+        attention_decoder_cross_scalar(
+            &q,
+            &k,
+            &v,
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4)
+            .expect("threaded scalar backend must build");
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(q_seq * state).expect("alloc out");
+        backend
+            .attention_decoder_cross_d(
+                &q_d, &k_d, &v_d, q_seq, kv_seq, n_head, head_dim, scale, &out_d,
+            )
+            .expect("threaded cross attention must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+        assert_eq!(
+            got, expected,
+            "threaded cross attention must match scalar bit-for-bit"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpu_attention_decoder_cross_d_threaded_avx2_matches_scalar_within_tolerance() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let q_seq = 3usize;
+        let kv_seq = PARALLEL_SDPA_MIN_SEQ;
+        let n_head = 2usize;
+        let head_dim = 8usize;
+        let state = n_head * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..q_seq * state)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.013).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * state)
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+
+        let mut expected = vec![0.0_f32; q_seq * state];
+        attention_decoder_cross_scalar(
+            &q,
+            &k,
+            &v,
+            q_seq,
+            kv_seq,
+            n_head,
+            head_dim,
+            scale,
+            &mut expected,
+        );
+
+        let backend = CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Avx2, 4)
+            .expect("threaded AVX2 backend must build");
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(q_seq * state).expect("alloc out");
+        backend
+            .attention_decoder_cross_d(
+                &q_d, &k_d, &v_d, q_seq, kv_seq, n_head, head_dim, scale, &out_d,
+            )
+            .expect("threaded AVX2 cross attention must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+        assert_close_with_tolerance(&got, &expected, 1.0e-4, "threaded AVX2 cross attention");
     }
 }

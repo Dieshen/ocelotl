@@ -11,10 +11,9 @@
 //! GW.4-2B migrated `WhisperCrossAttentionCache` to device-resident
 //! `DeviceTensor` handles. The cache is built once per 30 s audio window and
 //! read 80× by the decoder, so keeping it on device collapses the largest
-//! single host bounce in the forward path (per the GW.4 audit). The self-
-//! attention cache stays on host: it feeds the host-scalar attention body and
-//! grows token-by-token via `Vec::extend_from_slice`, which costs nothing in
-//! aggregate compared to a device-resident growable design.
+//! single host bounce in the forward path (per the GW.4 audit). PostGW.1 keeps
+//! decoder self-attention K/V cache buffers device-resident too: they are
+//! allocated at text-context capacity and track how many prefix rows are valid.
 
 use ocelotl_core::TokenId;
 use ocelotl_kernels::DeviceTensor;
@@ -57,6 +56,25 @@ pub struct WhisperAudioEncodeTimings {
     pub cross_attention_precompute_ms: u128,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WhisperEncoderTimings {
+    pub conv_stack_ms: u128,
+    pub device_upload_ms: u128,
+    pub qkv_projection_ms: u128,
+    pub attention_ms: u128,
+    pub attention_out_projection_ms: u128,
+    pub mlp_ms: u128,
+    pub norm_residual_ms: u128,
+    pub final_layer_norm_ms: u128,
+    pub readback_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WhisperDecoderStepTimings {
+    pub decoder_ms: u128,
+    pub logits_project_ms: u128,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct WhisperCrossAttentionCache {
     pub(super) key: DeviceTensor,
@@ -88,10 +106,42 @@ pub struct WhisperDecoderState {
     pub(super) next_token_logits: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(super) struct WhisperSelfAttentionCache {
-    pub(super) key: Vec<f32>,
-    pub(super) value: Vec<f32>,
+    pub(super) key: DeviceTensor,
+    pub(super) value: DeviceTensor,
+    pub(super) filled_tokens: usize,
+    pub(super) capacity_tokens: usize,
+    pub(super) row_width: usize,
+}
+
+impl PartialEq for WhisperSelfAttentionCache {
+    fn eq(&self, other: &Self) -> bool {
+        if self.filled_tokens != other.filled_tokens
+            || self.capacity_tokens != other.capacity_tokens
+            || self.row_width != other.row_width
+            || self.key.len() != other.key.len()
+            || self.value.len() != other.value.len()
+        {
+            return false;
+        }
+        let Some(prefix_len) = self.filled_tokens.checked_mul(self.row_width) else {
+            return false;
+        };
+        match (self.key.to_host_owned(), other.key.to_host_owned()) {
+            (Ok(a), Ok(b))
+                if a.len() >= prefix_len
+                    && b.len() >= prefix_len
+                    && a[..prefix_len] == b[..prefix_len] => {}
+            _ => return false,
+        }
+        match (self.value.to_host_owned(), other.value.to_host_owned()) {
+            (Ok(a), Ok(b)) if a.len() >= prefix_len && b.len() >= prefix_len => {
+                a[..prefix_len] == b[..prefix_len]
+            }
+            _ => false,
+        }
+    }
 }
 
 impl WhisperEncodedAudio {

@@ -8,11 +8,76 @@
 
 use ocelotl_core::Result;
 use ocelotl_kernels::{DeviceTensor, KernelBackend, softmax};
+use rayon::prelude::*;
 
 use super::{checked_len_product, invalid_model, invalid_request};
 
+#[derive(Clone, Copy)]
+struct Conv1dShape {
+    time: usize,
+    in_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn conv1d(
+    input: &[f32],
+    time: usize,
+    in_channels: usize,
+    weight: &[f32],
+    bias: &[f32],
+    out_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<Vec<f32>> {
+    conv1d_impl(
+        None,
+        input,
+        time,
+        in_channels,
+        weight,
+        bias,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn conv1d_with_backend(
+    kernels: &dyn KernelBackend,
+    input: &[f32],
+    time: usize,
+    in_channels: usize,
+    weight: &[f32],
+    bias: &[f32],
+    out_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<Vec<f32>> {
+    conv1d_impl(
+        kernels.cpu_thread_pool(),
+        input,
+        time,
+        in_channels,
+        weight,
+        bias,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_impl(
+    pool: Option<&rayon::ThreadPool>,
     input: &[f32],
     time: usize,
     in_channels: usize,
@@ -52,28 +117,60 @@ pub(super) fn conv1d(
 
     let out_time = conv_output_len(time, kernel, stride, padding)?;
     let mut out = vec![0.0_f32; out_time * out_channels];
-    for t_out in 0..out_time {
-        for oc in 0..out_channels {
-            let mut acc = bias[oc];
-            for ic in 0..in_channels {
-                for k in 0..kernel {
-                    let padded_t = t_out * stride + k;
-                    if padded_t < padding {
-                        continue;
-                    }
-                    let t_in = padded_t - padding;
-                    if t_in >= time {
-                        continue;
-                    }
-                    let input_idx = t_in * in_channels + ic;
-                    let weight_idx = (oc * in_channels + ic) * kernel + k;
-                    acc += input[input_idx] * weight[weight_idx];
-                }
-            }
-            out[t_out * out_channels + oc] = acc;
+
+    let shape = Conv1dShape {
+        time,
+        in_channels,
+        kernel,
+        stride,
+        padding,
+    };
+    if let Some(pool) = pool {
+        if out.len() >= 16_384 && out_time > 1 {
+            pool.install(|| {
+                out.par_chunks_mut(out_channels)
+                    .enumerate()
+                    .for_each(|(t_out, out_row)| {
+                        conv1d_write_row(input, weight, bias, shape, t_out, out_row);
+                    });
+            });
+            return Ok(out);
         }
     }
+
+    for (t_out, out_row) in out.chunks_mut(out_channels).enumerate() {
+        conv1d_write_row(input, weight, bias, shape, t_out, out_row);
+    }
     Ok(out)
+}
+
+fn conv1d_write_row(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    shape: Conv1dShape,
+    t_out: usize,
+    out_row: &mut [f32],
+) {
+    for (oc, out_cell) in out_row.iter_mut().enumerate() {
+        let mut acc = bias[oc];
+        for ic in 0..shape.in_channels {
+            for k in 0..shape.kernel {
+                let padded_t = t_out * shape.stride + k;
+                if padded_t < shape.padding {
+                    continue;
+                }
+                let t_in = padded_t - shape.padding;
+                if t_in >= shape.time {
+                    continue;
+                }
+                let input_idx = t_in * shape.in_channels + ic;
+                let weight_idx = (oc * shape.in_channels + ic) * shape.kernel + k;
+                acc += input[input_idx] * weight[weight_idx];
+            }
+        }
+        *out_cell = acc;
+    }
 }
 
 pub(super) fn conv_output_len(
@@ -893,6 +990,27 @@ pub(super) fn add_inplace_d(
     kernels.add_inplace_d(lhs, rhs)
 }
 
+pub(super) fn copy_into_d(
+    kernels: &dyn KernelBackend,
+    src: &DeviceTensor,
+    dst: &DeviceTensor,
+    dst_offset: usize,
+) -> Result<()> {
+    let end = dst_offset
+        .checked_add(src.len())
+        .ok_or_else(|| invalid_request("copy_into_d", "dst_offset + src length overflowed"))?;
+    if end > dst.len() {
+        return Err(invalid_request(
+            "copy_into_d",
+            &format!(
+                "range {dst_offset}..{end} exceeds destination length {}",
+                dst.len()
+            ),
+        ));
+    }
+    kernels.copy_into_d(src, dst, dst_offset)
+}
+
 /// Device-resident elementwise GELU.
 pub(super) fn gelu_inplace_d(kernels: &dyn KernelBackend, x: &DeviceTensor) -> Result<()> {
     kernels.gelu_inplace_d(x)
@@ -979,28 +1097,29 @@ pub(super) fn attention_decoder_causal_d(
     kernels.attention_decoder_causal_d(q, k, v, seq, n_head, head_dim, scale, output)
 }
 
-/// Device-resident incremental decoder self-attention (single new token).
-///
-/// `q`: `[state]`, `past_k`/`past_v`: `[past_seq, state]`,
-/// `new_k`/`new_v`: `[state]`. Visible = `past_seq + 1`. `output`: `[state]`.
-///
-/// GW.4-5B: replaces the `attention_incremental_body_host` host bounce
-/// in `decode_appended_token` so the single-token incremental path stays
-/// on device.
+/// Append one K/V row to a fixed-capacity decoder self-attention cache and
+/// attend over the resulting visible prefix.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn attention_decoder_incremental_d(
+pub(super) fn attention_decoder_incremental_cache_append_d(
     kernels: &dyn KernelBackend,
     q: &DeviceTensor,
-    past_k: &DeviceTensor,
-    past_v: &DeviceTensor,
+    key_cache: &DeviceTensor,
+    value_cache: &DeviceTensor,
     new_k: &DeviceTensor,
     new_v: &DeviceTensor,
     past_seq: usize,
+    cache_capacity: usize,
     n_head: usize,
     head_dim: usize,
     scale: f32,
     output: &DeviceTensor,
 ) -> Result<()> {
+    if past_seq >= cache_capacity {
+        return Err(invalid_request(
+            "attention.past_seq",
+            &format!("past_seq {past_seq} cannot append into cache capacity {cache_capacity}"),
+        ));
+    }
     if n_head == 0 {
         return Err(invalid_model("attention.heads", "must be > 0"));
     }
@@ -1021,20 +1140,30 @@ pub(super) fn attention_decoder_incremental_d(
             ));
         }
     }
-    let past_expected = checked_len_product("attention.past", &[past_seq, state])?;
+    let cache_expected = checked_len_product("attention.cache", &[cache_capacity, state])?;
     for (label, len) in [
-        ("attention.past_k", past_k.len()),
-        ("attention.past_v", past_v.len()),
+        ("attention.key_cache", key_cache.len()),
+        ("attention.value_cache", value_cache.len()),
     ] {
-        if len != past_expected {
+        if len != cache_expected {
             return Err(invalid_request(
                 label,
-                &format!("expected length {past_expected}, got {len}"),
+                &format!("expected length {cache_expected}, got {len}"),
             ));
         }
     }
-    kernels.attention_decoder_incremental_d(
-        q, past_k, past_v, new_k, new_v, past_seq, n_head, head_dim, scale, output,
+    kernels.attention_decoder_incremental_cache_append_d(
+        q,
+        key_cache,
+        value_cache,
+        new_k,
+        new_v,
+        past_seq,
+        cache_capacity,
+        n_head,
+        head_dim,
+        scale,
+        output,
     )
 }
 
@@ -1099,9 +1228,9 @@ pub(super) fn attention_decoder_cross_d(
 /// device — no host bounce between Q/K/V projections and the out
 /// projection.
 ///
-/// GW.4-5B: decoder paths (causal self-attention with KV cache,
+/// GW.4-5B/PostGW.1: decoder paths (causal self-attention with KV cache,
 /// cross-attention) now have device-resident analogues via
-/// `attention_decoder_causal_d` and `attention_decoder_incremental_d`.
+/// `attention_decoder_causal_d` and `attention_decoder_incremental_cache_append_d`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attention_encoder_d(
     kernels: &dyn KernelBackend,

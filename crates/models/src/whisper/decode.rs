@@ -15,32 +15,38 @@
 //!
 //! GW.4-2B: the per-layer linear / layer-norm / MLP / residual-add ops run
 //! over `DeviceTensor` handles via the `*_d` primitives. Token embedding
-//! gather (a host table lookup), the self-attention KV cache append
-//! (`Vec::extend_from_slice` per Stage 2.5 deferral), and the final logits
-//! readback for sampling remain host events.
+//! gather (a host table lookup) and the final logits readback for sampling
+//! remain host events.
 //!
 //! GW.4-5B: self-attention bodies (causal full-context and incremental
 //! single-token) are now device-resident via `attention_decoder_causal_d`
-//! and `attention_decoder_incremental_d`.
+//! and `attention_decoder_incremental_cache_append_d`.
 //!
 //! GW.4-5C: cross-attention is now device-resident via
 //! `attention_decoder_cross_d`. Q, K, and V all remain on device through
-//! the attention body and the out projection. Search `to_host_owned()` in
-//! this file to grep every remaining host bounce (KV cache readbacks and
-//! final logits only).
+//! the attention body and the out projection.
+//!
+//! PostGW.1: decoder self-attention K/V caches are fixed-capacity
+//! device tensors. Appended-token decode copies one new row into those
+//! tensors and attends over the visible prefix, removing the previous
+//! per-layer growing cache upload/readback.
+
+use std::time::Instant;
 
 use ocelotl_core::{Result, TokenId};
 
-use super::LAYER_NORM_EPS;
 use super::model::{
     WhisperModel, validate_decoder_state_for_append, validate_decoder_token,
     validate_decoder_tokens, validate_encoded_audio, validate_forward_request,
 };
 use super::primitives::{
     add_inplace_d, attention_decoder_causal_d, attention_decoder_cross_d,
-    attention_decoder_incremental_d, layer_norm_d, linear_d, mlp_gelu_d,
+    attention_decoder_incremental_cache_append_d, copy_into_d, layer_norm_d, linear_d, mlp_gelu_d,
 };
-use super::state::{WhisperDecoderState, WhisperEncodedAudio, WhisperSelfAttentionCache};
+use super::state::{
+    WhisperDecoderState, WhisperDecoderStepTimings, WhisperEncodedAudio, WhisperSelfAttentionCache,
+};
+use super::{LAYER_NORM_EPS, checked_len_product};
 
 impl WhisperModel {
     pub fn forward_next_token_logits(
@@ -69,21 +75,40 @@ impl WhisperModel {
         audio: &WhisperEncodedAudio,
         decoder_tokens: &[TokenId],
     ) -> Result<WhisperDecoderState> {
+        self.prepare_decoder_state_from_audio_with_timings(audio, decoder_tokens)
+            .map(|(state, _)| state)
+    }
+
+    pub fn prepare_decoder_state_from_audio_with_timings(
+        &self,
+        audio: &WhisperEncodedAudio,
+        decoder_tokens: &[TokenId],
+    ) -> Result<(WhisperDecoderState, WhisperDecoderStepTimings)> {
         validate_encoded_audio(&self.config, audio)?;
         validate_decoder_tokens(&self.config, decoder_tokens)?;
 
+        let decoder_started = Instant::now();
         let (decoded, self_attention) =
             decode_tokens_with_self_attention_cache(self, decoder_tokens, audio)?;
+        let decoder_ms = decoder_started.elapsed().as_millis();
         let state_size = self.config.text_state_size;
         let last_start = (decoder_tokens.len() - 1) * state_size;
         let last = &decoded[last_start..last_start + state_size];
+        let logits_started = Instant::now();
         let next_token_logits = project_decoder_logits(self, last)?;
+        let logits_project_ms = logits_started.elapsed().as_millis();
 
-        Ok(WhisperDecoderState {
-            tokens: decoder_tokens.to_vec(),
-            self_attention,
-            next_token_logits,
-        })
+        Ok((
+            WhisperDecoderState {
+                tokens: decoder_tokens.to_vec(),
+                self_attention,
+                next_token_logits,
+            },
+            WhisperDecoderStepTimings {
+                decoder_ms,
+                logits_project_ms,
+            },
+        ))
     }
 
     pub fn append_decoder_token_from_audio<'a>(
@@ -92,14 +117,25 @@ impl WhisperModel {
         state: &'a mut WhisperDecoderState,
         token: TokenId,
     ) -> Result<&'a [f32]> {
+        self.append_decoder_token_from_audio_with_timings(audio, state, token)
+            .map(|(logits, _)| logits)
+    }
+
+    pub fn append_decoder_token_from_audio_with_timings<'a>(
+        &self,
+        audio: &WhisperEncodedAudio,
+        state: &'a mut WhisperDecoderState,
+        token: TokenId,
+    ) -> Result<(&'a [f32], WhisperDecoderStepTimings)> {
         validate_encoded_audio(&self.config, audio)?;
         validate_decoder_state_for_append(&self.config, state)?;
         validate_decoder_token(&self.config, token, state.tokens.len())?;
 
-        let next_token_logits = decode_appended_token(self, audio, state, token)?;
+        let (next_token_logits, timings) =
+            decode_appended_token_with_timings(self, audio, state, token)?;
         state.tokens.push(token);
         state.next_token_logits = next_token_logits;
-        Ok(state.next_token_logits())
+        Ok((state.next_token_logits(), timings))
     }
 }
 
@@ -190,15 +226,12 @@ fn decode_tokens_with_self_attention_cache(
             &v_proj_d,
         )?;
 
-        // GW.4-5B: device-resident causal self-attention. Avoids the
-        // host bounce that read Q/K/V back, ran scalar attention, and
-        // re-uploaded the context. K/V are still read back to host to
-        // populate the self-attention cache for later token appends —
-        // that read is the only remaining bounce in this block.
+        // GW.4-5B: device-resident causal self-attention. PostGW.1 keeps
+        // the projected K/V cache on device too: copy the prompt rows into
+        // fixed-capacity cache tensors so appended decode can mutate one row
+        // per layer without a host readback or growing prefix upload.
         let head_dim = text_state / heads;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        // Reuse v_proj_d as the context output scratch (same shape, and
-        // v_proj is not needed after the attention body).
         attention_decoder_causal_d(
             kernels,
             &q_proj_d,
@@ -210,9 +243,14 @@ fn decode_tokens_with_self_attention_cache(
             scale,
             &proj_out_d,
         )?;
-        // Cache K/V on host for later incremental appends.
-        let key_host = k_proj_d.to_host_owned()?;
-        let value_host = v_proj_d.to_host_owned()?;
+        let cache_len = checked_len_product(
+            "decoder_state.self_attention",
+            &[model.config.text_context_length, text_state],
+        )?;
+        let key_cache_d = kernels.alloc(cache_len)?;
+        let value_cache_d = kernels.alloc(cache_len)?;
+        copy_into_d(kernels, &k_proj_d, &key_cache_d, 0)?;
+        copy_into_d(kernels, &v_proj_d, &value_cache_d, 0)?;
         let out_w = model.device_weight(&format!("{prefix}.attn.out.weight"))?;
         let out_b = model.device_weight(&format!("{prefix}.attn.out.bias"))?;
         linear_d(
@@ -227,8 +265,11 @@ fn decode_tokens_with_self_attention_cache(
             &q_proj_d,
         )?;
         self_attention.push(WhisperSelfAttentionCache {
-            key: key_host,
-            value: value_host,
+            key: key_cache_d,
+            value: value_cache_d,
+            filled_tokens: seq,
+            capacity_tokens: model.config.text_context_length,
+            row_width: text_state,
         });
         // Out-projection result is in q_proj_d (see linear_d above).
         add_inplace_d(kernels, &x_d, &q_proj_d)?;
@@ -341,12 +382,13 @@ fn decode_tokens_with_self_attention_cache(
     Ok((decoded, self_attention))
 }
 
-fn decode_appended_token(
+fn decode_appended_token_with_timings(
     model: &WhisperModel,
     audio: &WhisperEncodedAudio,
     state: &mut WhisperDecoderState,
     token: TokenId,
-) -> Result<Vec<f32>> {
+) -> Result<(Vec<f32>, WhisperDecoderStepTimings)> {
+    let decoder_started = Instant::now();
     let text_state = model.config.text_state_size;
     let ffn = model.config.text_ffn_size;
     let heads = model.config.text_attention_heads;
@@ -363,7 +405,6 @@ fn decode_appended_token(
     let x_d = kernels.upload(&x_host)?;
     drop(x_host);
 
-    let mut next_self_attention = Vec::with_capacity(model.config.text_layers);
     // Per-layer device scratch: seq=1, so these are tiny (1*state at tiny =
     // 1.5 KB) but reusing them across the 4-layer loop saves the same
     // allocations the GW.4-1C `mlp_gelu` caller-supplied scratch saves on
@@ -424,35 +465,27 @@ fn decode_appended_token(
             &v_proj_d,
         )?;
 
-        // GW.4-5B: device-resident incremental self-attention. Upload the
-        // host-resident past K/V cache, run the incremental kernel on device,
-        // then read back new_k/new_v for the cache append. The cache upload
-        // is the only host-to-device transfer per token per layer; it is
-        // proportional to `past_seq * state` and grows by one row each step.
-        let past_seq = state.tokens.len();
+        // PostGW.1: append current K/V into the fixed-capacity device cache,
+        // then attend the visible prefix in place. This removes the previous
+        // per-token upload of `past_seq * state` K/V and the readback of the
+        // new row after every layer.
         let head_dim = text_state / heads;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        let cache = &state.self_attention[layer];
-        let past_k_d = kernels.upload(&cache.key)?;
-        let past_v_d = kernels.upload(&cache.value)?;
-        // `k_proj_d` and `v_proj_d` hold the current step's new K/V.
-        // Attention context goes into `proj_out_d` (seq=1, state shape).
-        attention_decoder_incremental_d(
+        let cache = &mut state.self_attention[layer];
+        attention_decoder_incremental_cache_append_d(
             kernels,
             &q_proj_d,
-            &past_k_d,
-            &past_v_d,
+            &cache.key,
+            &cache.value,
             &k_proj_d,
             &v_proj_d,
-            past_seq,
+            cache.filled_tokens,
+            cache.capacity_tokens,
             heads,
             head_dim,
             scale,
             &proj_out_d,
         )?;
-        // Read the new single-token K/V back to host for the cache append.
-        let key_host = k_proj_d.to_host_owned()?;
-        let value_host = v_proj_d.to_host_owned()?;
         let out_w = model.device_weight(&format!("{prefix}.attn.out.weight"))?;
         let out_b = model.device_weight(&format!("{prefix}.attn.out.bias"))?;
         linear_d(
@@ -465,10 +498,6 @@ fn decode_appended_token(
             Some(out_b),
             &q_proj_d,
         )?;
-        next_self_attention.push(WhisperSelfAttentionCache {
-            key: key_host,
-            value: value_host,
-        });
         // Out-projection result is in q_proj_d (see linear_d above).
         add_inplace_d(kernels, &x_d, &q_proj_d)?;
 
@@ -576,14 +605,22 @@ fn decode_appended_token(
         LAYER_NORM_EPS,
         &decoded_d,
     )?;
+    let decoder_ms = decoder_started.elapsed().as_millis();
+    let logits_started = Instant::now();
     let logits = project_decoder_logits_d(model, &decoded_d)?;
+    let logits_project_ms = logits_started.elapsed().as_millis();
 
-    for (cache, next) in state.self_attention.iter_mut().zip(next_self_attention) {
-        cache.key.extend_from_slice(&next.key);
-        cache.value.extend_from_slice(&next.value);
+    for cache in &mut state.self_attention {
+        cache.filled_tokens += 1;
     }
 
-    Ok(logits)
+    Ok((
+        logits,
+        WhisperDecoderStepTimings {
+            decoder_ms,
+            logits_project_ms,
+        },
+    ))
 }
 
 fn project_decoder_logits(model: &WhisperModel, last: &[f32]) -> Result<Vec<f32>> {

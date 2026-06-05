@@ -633,3 +633,103 @@ Ocelotl can run real Whisper weights yet.
   expected-token text.
 - `Out of scope`: adding a production transcription CLI, using text output as
   a replacement for exact-token parity, or changing WER corpus scoring.
+
+## PostGW.1 Flatten GPU Decoder Self-Attention Cache Append
+
+- `Crates`: `ocelotl-kernels`, `ocelotl-models` Whisper real adapter, and
+  benchmark docs.
+- `Test first`: add backend-contract tests for copying into an existing
+  `DeviceTensor` and for fixed-capacity cache-prefix incremental attention
+  matching the existing `past || new` scalar oracle. Preserve the Whisper
+  decoder-state append-vs-full-context logits parity test.
+- `Done when`: `WhisperDecoderState` owns fixed-capacity device-resident
+  self-attention K/V caches, full-context decoder preparation copies prompt
+  K/V into those caches once, appended-token decode copies only the new row
+  into each layer cache while attending the visible prefix, and `cubecl-wgpu`
+  compiles the WGPU copy/cache attention kernels.
+- `Status note`: landed on 2026-06-04. `KernelBackend::copy_into_d` and
+  `attention_decoder_incremental_cache_append_d` are covered by CPU contract
+  tests and WGPU feature compilation. Whisper append parity still matches the
+  full-context path. A fresh long-output tiny.en GPU run still measured
+  `7157 ms` total and `5272 ms` decode for 107 expected tokens, versus
+  whisper.cpp CPU at about `764 ms` total on the same sample; PostGW.1
+  performance is not closed.
+- `Out of scope`: reducing WGPU kernel-launch count, moving greedy sampling
+  fully onto device, or claiming whisper.cpp parity without a refreshed local
+  long-output benchmark.
+
+## PostGW.2 CPU AVX2 Long-Output Acceleration
+
+- `Crates`: `ocelotl-kernels`, benchmark docs, and local proof notes.
+- `Test first`: add focused kernel tests for AVX2 single-row linear tails,
+  threaded single-row output-axis linear dispatch, threaded encoder attention,
+  AVX2 attention score dots, and AVX2 attention value accumulation. Preserve
+  the Whisper optimized-backend forward-logits parity test.
+- `Done when`: CPU `avx2` with `--cpu-threads 4` improves the long-output
+  tiny.en benchmark while exact expected-token parity still passes.
+- `Status note`: landed on 2026-06-04. The CPU long-output path now keeps
+  decoder `rows == 1` linear projections in AVX2, parallelizes very wide
+  single-row projections across output chunks, runs encoder attention over the
+  configured rayon pool, and uses AVX2/FMA for threaded encoder attention score
+  dots plus value accumulation. Fresh local long-output tiny.en runs passed
+  exact token parity at `2831 ms` and `2997 ms` total with encoder around
+  `1.5 s` and decode around `1.1 s`. This is a meaningful improvement, but it
+  is still about `3.7x-3.9x` the local whisper.cpp CPU printed total
+  (`~764 ms`), so Whisper is not yet competitive.
+- `Follow-up measurement`: the benchmark hook now splits decode timing into
+  initial decoder-state preparation, masked greedy sampling, and aligned
+  per-token append timing. Use `timings_ms.decode_prepare`,
+  `timings_ms.decode_sample`, and `timings_ms.decode_append` before choosing
+  whether the next CPU task should fuse logits/sampling or optimize decoder
+  block kernels.
+- `Follow-up result`: the decode split showed sampling was not the bottleneck.
+  CPU decoder cross-attention and fixed-cache incremental self-attention now
+  override the cloning scalar trait defaults, borrow host tensors directly,
+  write one appended K/V row in place, and use rayon plus AVX2/FMA for long
+  prefixes/cross-attention. A fresh long-output tiny.en run passed exact token
+  parity at `1837 ms` total with `1128 ms` encoder and `445 ms` decode. This
+  clears the historical `<=3x` CPU-competitive gate on this fixture, but it is
+  still not as good as local whisper.cpp (`~764 ms` total). The next CPU task
+  should target encoder compute.
+- `Encoder measurement`: the benchmark hook now uses
+  `encode_audio_features_with_detailed_timings` and reports
+  `timings_ms.audio_encode_detail.encoder_detail` with conv stack, device
+  upload, Q/K/V projections, attention, attention output projection, MLP,
+  norm/residual, final layer norm, and readback buckets. Use this split before
+  choosing between a narrow conv/kernel-dispatch task and larger packed-GEMM or
+  native-dtype work. A fresh long-output tiny.en run passed exact token parity
+  at `1607 ms` total with `977 ms` encoder and `377 ms` decode. The encoder
+  split measured `676 ms` in `conv_stack`, `190 ms` in encoder `attention`, and
+  `67 ms` in encoder `mlp`, making the host conv stack the next narrow CPU
+  target.
+- `Conv follow-up result`: the encoder now calls a backend-aware Conv1d wrapper
+  that uses the configured CPU thread pool for independent output rows while
+  preserving the scalar accumulation order for each value. The scalar Conv1d
+  remains the oracle in
+  `threaded_conv1d_matches_scalar_bit_for_bit`. Fresh long-output tiny.en runs
+  passed exact token parity at `1430 ms` total with CPU `avx2`/4 threads and
+  `1013 ms` total with CPU `avx2`/8 threads. The best observed resident model
+  path was `mel_to_tokens = 765 ms` at 8 threads, with `318 ms` audio encode,
+  `447 ms` decode, `92 ms` conv stack, and `114 ms` encoder attention. This
+  reaches practical resident core-model parity with the local whisper.cpp CPU
+  total (`~764 ms`) on this fixture, but the cold CLI `total` is still higher
+  because it includes log-mel extraction, artifact loading, tokenizer load, and
+  text decode.
+- `Out of scope`: claiming whisper.cpp parity, changing generation semantics,
+  moving greedy sampling/logit selection out of the public logits path, or
+  optimizing the WGPU decoder.
+
+## PostGW.3 Build A Real whisper.cpp GPU Baseline
+
+- `Crates`: benchmark docs/tooling only unless the runner needs a new local
+  manifest field.
+- `Test first`: preserve the existing benchmark manifest tests and add a
+  local-only record shape if the GPU build emits different backend metadata.
+- `Done when`: whisper.cpp is rebuilt locally with Vulkan or CUDA, the same
+  long-output fixture has a real whisper.cpp GPU column, and
+  `docs/benchmarks/whisper-cpp.md` distinguishes CPU-only whisper.cpp from the
+  GPU build.
+- `Status note`: deferred. The available local `whisper-cli.exe` reports
+  `whisper_backend_init_gpu: no GPU found`; current cross-anchors therefore
+  compare Ocelotl GPU against whisper.cpp CPU.
+- `Out of scope`: fabricating a GPU baseline from CPU-only whisper.cpp output.

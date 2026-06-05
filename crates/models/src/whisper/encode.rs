@@ -28,10 +28,13 @@ use ocelotl_kernels::DeviceTensor;
 use super::WhisperConfig;
 use super::model::{WhisperModel, validate_audio_request};
 use super::primitives::{
-    add_inplace_d, add_positional_embedding, attention_encoder_d, conv_output_len, conv1d,
-    gelu_inplace, layer_norm_d, linear_d, mlp_gelu_d,
+    add_inplace_d, add_positional_embedding, attention_encoder_d, conv_output_len,
+    conv1d_with_backend, gelu_inplace, layer_norm_d, linear_d, mlp_gelu_d,
 };
-use super::state::{WhisperAudioEncodeTimings, WhisperCrossAttentionCache, WhisperEncodedAudio};
+use super::state::{
+    WhisperAudioEncodeTimings, WhisperCrossAttentionCache, WhisperEncodedAudio,
+    WhisperEncoderTimings,
+};
 use super::{CONV_KERNEL_WIDTH, LAYER_NORM_EPS, invalid_model, invalid_request};
 
 impl WhisperModel {
@@ -49,17 +52,33 @@ impl WhisperModel {
         log_mel: &[f32],
         mel_frames: usize,
     ) -> Result<(WhisperEncodedAudio, WhisperAudioEncodeTimings)> {
+        self.encode_audio_features_with_detailed_timings(log_mel, mel_frames)
+            .map(|(audio, timings, _encoder_detail)| (audio, timings))
+    }
+
+    pub fn encode_audio_features_with_detailed_timings(
+        &self,
+        log_mel: &[f32],
+        mel_frames: usize,
+    ) -> Result<(
+        WhisperEncodedAudio,
+        WhisperAudioEncodeTimings,
+        WhisperEncoderTimings,
+    )> {
         validate_audio_request(&self.config, log_mel, mel_frames)?;
 
         let encoder_started = Instant::now();
-        let (encoded_d, frames) = encode_audio(self, log_mel, mel_frames)?;
+        let (encoded_d, frames, mut encoder_detail) =
+            encode_audio_with_timings(self, log_mel, mel_frames)?;
         let state_size = self.config.audio_state_size;
         // Read the encoder output back to host for `WhisperEncodedAudio.values`.
         // This is the natural boundary: the host `values` field stays around
         // for inspection / future use, while the device handle is consumed
         // directly by the cross-attention precompute below without a second
         // upload.
+        let readback_started = Instant::now();
         let values = encoded_d.to_host_owned()?;
+        encoder_detail.readback_ms = readback_started.elapsed().as_millis();
         let encoder_ms = encoder_started.elapsed().as_millis();
         if values.len() % state_size != 0 {
             return Err(invalid_model(
@@ -92,6 +111,7 @@ impl WhisperModel {
                 encoder_ms,
                 cross_attention_precompute_ms,
             },
+            encoder_detail,
         ))
     }
 }
@@ -99,16 +119,19 @@ impl WhisperModel {
 /// Run the encoder forward pass. Returns the device-resident encoder output
 /// (`audio_seq * audio_state` floats) plus the post-conv frame count. The
 /// caller decides whether to read the output back to host.
-fn encode_audio(
+fn encode_audio_with_timings(
     model: &WhisperModel,
     log_mel: &[f32],
     mel_frames: usize,
-) -> Result<(DeviceTensor, usize)> {
+) -> Result<(DeviceTensor, usize, WhisperEncoderTimings)> {
     let config: &WhisperConfig = &model.config;
     let kernels = model.kernels.as_ref();
+    let mut timings = WhisperEncoderTimings::default();
     // Conv1d + GELU + positional add stays on host: only two convolutions
     // per 30 s window, and the log-mel input arrives on host anyway.
-    let conv1 = conv1d(
+    let conv_started = Instant::now();
+    let conv1 = conv1d_with_backend(
+        kernels,
         log_mel,
         mel_frames,
         config.mel_bins,
@@ -123,7 +146,8 @@ fn encode_audio(
     let mut conv1 = conv1;
     gelu_inplace(&mut conv1);
 
-    let mut conv2 = conv1d(
+    let mut conv2 = conv1d_with_backend(
+        kernels,
         &conv1,
         conv1_frames,
         config.audio_state_size,
@@ -154,10 +178,13 @@ fn encode_audio(
         model.weights.get("encoder.positional_embedding"),
         config.audio_context_length,
     )?;
+    timings.conv_stack_ms = conv_started.elapsed().as_millis();
 
     // Upload the post-conv-positional activation onto the device. From here
     // on, every per-layer compute step runs over `DeviceTensor` handles.
+    let upload_started = Instant::now();
     let x_d = kernels.upload(&conv2)?;
+    timings.device_upload_ms = upload_started.elapsed().as_millis();
     drop(conv2);
 
     // Per-layer scratch pool: allocated once outside the loop, reused
@@ -200,6 +227,7 @@ fn encode_audio(
 
     for layer in 0..config.audio_layers {
         let prefix = format!("encoder.blocks.{layer}");
+        let norm_started = Instant::now();
         let attn_ln_w = model.device_weight(&format!("{prefix}.attn_ln.weight"))?;
         let attn_ln_b = model.device_weight(&format!("{prefix}.attn_ln.bias"))?;
         layer_norm_d(
@@ -212,12 +240,14 @@ fn encode_audio(
             LAYER_NORM_EPS,
             &attn_ln_d,
         )?;
+        timings.norm_residual_ms += norm_started.elapsed().as_millis();
 
         let q_w = model.device_weight(&format!("{prefix}.attn.query.weight"))?;
         let q_b = model.device_weight(&format!("{prefix}.attn.query.bias"))?;
         let k_w = model.device_weight(&format!("{prefix}.attn.key.weight"))?;
         let v_w = model.device_weight(&format!("{prefix}.attn.value.weight"))?;
         let v_b = model.device_weight(&format!("{prefix}.attn.value.bias"))?;
+        let qkv_started = Instant::now();
         linear_d(
             kernels,
             &attn_ln_d,
@@ -239,11 +269,13 @@ fn encode_audio(
             Some(v_b),
             &v_proj_d,
         )?;
+        timings.qkv_projection_ms += qkv_started.elapsed().as_millis();
 
         // GW.4-5A: device-resident fused encoder attention. Q/K/V stay on
         // device; the fused kernel writes its context output into
         // `attn_ctx_d`, which the out-projection then reads from. No host
         // bounce, no scalar fallback when a WGPU adapter is available.
+        let attention_started = Instant::now();
         attention_encoder_d(
             kernels,
             &q_proj_d,
@@ -255,8 +287,10 @@ fn encode_audio(
             attn_scale,
             &attn_ctx_d,
         )?;
+        timings.attention_ms += attention_started.elapsed().as_millis();
         let out_w = model.device_weight(&format!("{prefix}.attn.out.weight"))?;
         let out_b = model.device_weight(&format!("{prefix}.attn.out.bias"))?;
+        let attention_out_started = Instant::now();
         linear_d(
             kernels,
             &attn_ctx_d,
@@ -267,8 +301,12 @@ fn encode_audio(
             Some(out_b),
             &proj_out_d,
         )?;
+        timings.attention_out_projection_ms += attention_out_started.elapsed().as_millis();
+        let norm_started = Instant::now();
         add_inplace_d(kernels, &x_d, &proj_out_d)?;
+        timings.norm_residual_ms += norm_started.elapsed().as_millis();
 
+        let norm_started = Instant::now();
         let mlp_ln_w = model.device_weight(&format!("{prefix}.mlp_ln.weight"))?;
         let mlp_ln_b = model.device_weight(&format!("{prefix}.mlp_ln.bias"))?;
         layer_norm_d(
@@ -281,10 +319,12 @@ fn encode_audio(
             LAYER_NORM_EPS,
             &mlp_ln_d,
         )?;
+        timings.norm_residual_ms += norm_started.elapsed().as_millis();
         let fc1_w = model.device_weight(&format!("{prefix}.mlp.0.weight"))?;
         let fc1_b = model.device_weight(&format!("{prefix}.mlp.0.bias"))?;
         let fc2_w = model.device_weight(&format!("{prefix}.mlp.2.weight"))?;
         let fc2_b = model.device_weight(&format!("{prefix}.mlp.2.bias"))?;
+        let mlp_started = Instant::now();
         mlp_gelu_d(
             kernels,
             &mlp_ln_d,
@@ -298,7 +338,10 @@ fn encode_audio(
             &mlp_hidden_d,
             &mlp_out_d,
         )?;
+        timings.mlp_ms += mlp_started.elapsed().as_millis();
+        let norm_started = Instant::now();
         add_inplace_d(kernels, &x_d, &mlp_out_d)?;
+        timings.norm_residual_ms += norm_started.elapsed().as_millis();
     }
 
     // Final ln_post into a fresh device handle so the result outlives the
@@ -306,6 +349,7 @@ fn encode_audio(
     let encoded_d = kernels.alloc(seq * state)?;
     let ln_w = model.device_weight("encoder.ln_post.weight")?;
     let ln_b = model.device_weight("encoder.ln_post.bias")?;
+    let final_ln_started = Instant::now();
     layer_norm_d(
         kernels,
         &x_d,
@@ -316,8 +360,9 @@ fn encode_audio(
         LAYER_NORM_EPS,
         &encoded_d,
     )?;
+    timings.final_layer_norm_ms = final_ln_started.elapsed().as_millis();
 
-    Ok((encoded_d, seq))
+    Ok((encoded_d, seq, timings))
 }
 
 fn precompute_cross_attention(

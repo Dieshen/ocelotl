@@ -10,7 +10,8 @@ use ocelotl_kernels::CubeClKernelBackend;
 use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode, KernelBackend};
 use ocelotl_loader::{LoadedTensor, inspect_safetensors, load_safetensors_tensors_f32};
 use ocelotl_models::whisper::{
-    WhisperAudioEncodeTimings, WhisperConfig, WhisperEncodedAudio, WhisperModel,
+    WhisperAudioEncodeTimings, WhisperConfig, WhisperEncodedAudio, WhisperEncoderTimings,
+    WhisperModel,
     audio::{AudioMetadata, log_mel_spectrogram},
     parse_whisper_config_json, required_whisper_tensor_names, validate_whisper_tensors,
 };
@@ -76,9 +77,17 @@ struct BenchWhisperTimings {
     log_mel_ms: u128,
     audio_encode_ms: u128,
     audio_encode_detail: WhisperAudioEncodeTimings,
+    audio_encoder_detail: WhisperEncoderTimings,
     decode_total_ms: u128,
+    decode_prepare_ms: u128,
     text_decode_ms: Option<u128>,
     decode_token_ms: Vec<u128>,
+    decode_sample_ms: Vec<u128>,
+    decode_append_ms: Vec<u128>,
+    decode_prepare_decoder_ms: u128,
+    decode_prepare_logits_project_ms: u128,
+    decode_append_decoder_ms: Vec<u128>,
+    decode_append_logits_project_ms: Vec<u128>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -499,19 +508,19 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
 
     let decode_policy = WhisperArtifactDecodePolicy::for_config(&whisper_config);
     let audio_encode_started = Instant::now();
-    let (encoded_audio, audio_encode_detail) = model
-        .encode_audio_features_with_timings(&mel.values, mel.frames)
+    let (encoded_audio, audio_encode_detail, audio_encoder_detail) = model
+        .encode_audio_features_with_detailed_timings(&mel.values, mel.frames)
         .map_err(|err| format!("failed to encode Whisper audio features - {err:?}"))?;
     let audio_encode_ms = audio_encode_started.elapsed().as_millis();
 
     let decode_started = Instant::now();
-    let mut decode_token_ms = Vec::new();
+    let mut decode_detail = BenchWhisperDecodeTimings::default();
     let generated = generate_tokens_to_expected_length(
         &model,
         &encoded_audio,
         expected_tokens.len(),
         decode_policy,
-        &mut decode_token_ms,
+        &mut decode_detail,
     )?;
     let decode_total_ms = decode_started.elapsed().as_millis();
 
@@ -530,9 +539,17 @@ fn run_bench_whisper_transcribe(args: BenchWhisperArgs) -> Result<(), String> {
         log_mel_ms,
         audio_encode_ms,
         audio_encode_detail,
+        audio_encoder_detail,
         decode_total_ms,
+        decode_prepare_ms: decode_detail.prepare_ms,
         text_decode_ms: text_output.text_decode_ms,
-        decode_token_ms,
+        decode_token_ms: decode_detail.token_ms,
+        decode_sample_ms: decode_detail.sample_ms,
+        decode_append_ms: decode_detail.append_ms,
+        decode_prepare_decoder_ms: decode_detail.prepare_decoder_ms,
+        decode_prepare_logits_project_ms: decode_detail.prepare_logits_project_ms,
+        decode_append_decoder_ms: decode_detail.append_decoder_ms,
+        decode_append_logits_project_ms: decode_detail.append_logits_project_ms,
     };
     let output = bench_whisper_output(
         matches_expected,
@@ -589,12 +606,55 @@ fn bench_whisper_output(
             "audio_encode_detail": {
                 "encoder": timings.audio_encode_detail.encoder_ms,
                 "cross_attention_precompute": timings.audio_encode_detail.cross_attention_precompute_ms,
+                "encoder_detail": {
+                    "conv_stack": timings.audio_encoder_detail.conv_stack_ms,
+                    "device_upload": timings.audio_encoder_detail.device_upload_ms,
+                    "qkv_projection": timings.audio_encoder_detail.qkv_projection_ms,
+                    "attention": timings.audio_encoder_detail.attention_ms,
+                    "attention_out_projection": timings.audio_encoder_detail.attention_out_projection_ms,
+                    "mlp": timings.audio_encoder_detail.mlp_ms,
+                    "norm_residual": timings.audio_encoder_detail.norm_residual_ms,
+                    "final_layer_norm": timings.audio_encoder_detail.final_layer_norm_ms,
+                    "readback": timings.audio_encoder_detail.readback_ms,
+                },
             },
             "decode_total": timings.decode_total_ms,
+            "decode_prepare": timings.decode_prepare_ms,
             "text_decode": timings.text_decode_ms,
             "decode_token": timings.decode_token_ms,
+            "decode_sample": timings.decode_sample_ms,
+            "decode_append": timings.decode_append_ms,
+            "decode_detail": {
+                "initial_prepare": timings.decode_prepare_ms,
+                "sample_token": timings.decode_sample_ms,
+                "append_token": timings.decode_append_ms,
+                "decoder": {
+                    "initial": timings.decode_prepare_decoder_ms,
+                    "append_token": timings.decode_append_decoder_ms,
+                    "total": timings.decode_prepare_decoder_ms
+                        + timings.decode_append_decoder_ms.iter().sum::<u128>(),
+                },
+                "logits_project": {
+                    "initial": timings.decode_prepare_logits_project_ms,
+                    "append_token": timings.decode_append_logits_project_ms,
+                    "total": timings.decode_prepare_logits_project_ms
+                        + timings.decode_append_logits_project_ms.iter().sum::<u128>(),
+                },
+            },
         }
     })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BenchWhisperDecodeTimings {
+    prepare_ms: u128,
+    prepare_decoder_ms: u128,
+    prepare_logits_project_ms: u128,
+    token_ms: Vec<u128>,
+    sample_ms: Vec<u128>,
+    append_ms: Vec<u128>,
+    append_decoder_ms: Vec<u128>,
+    append_logits_project_ms: Vec<u128>,
 }
 
 fn decode_generated_text(
@@ -678,39 +738,72 @@ fn generate_tokens_to_expected_length(
     encoded_audio: &WhisperEncodedAudio,
     expected_len: usize,
     policy: WhisperArtifactDecodePolicy,
-    decode_token_ms: &mut Vec<u128>,
+    decode_timings: &mut BenchWhisperDecodeTimings,
 ) -> Result<Vec<TokenId>, String> {
     let mut generated = policy.startup_prompt();
     let mask = WhisperDecodeMask::transcribe_without_timestamps(policy.tokens);
-    let mut decoder_state = model
-        .prepare_decoder_state_from_audio(encoded_audio, &generated)
+    let prepare_started = Instant::now();
+    let (mut decoder_state, prepare_timing) = model
+        .prepare_decoder_state_from_audio_with_timings(encoded_audio, &generated)
         .map_err(|err| {
             format!(
                 "Whisper prepare_decoder_state_from_audio failed at generated length {} - {err:?}",
                 generated.len()
             )
         })?;
+    decode_timings.prepare_ms = prepare_started.elapsed().as_millis();
+    decode_timings.prepare_decoder_ms = prepare_timing.decoder_ms;
+    decode_timings.prepare_logits_project_ms = prepare_timing.logits_project_ms;
 
     while generated.len() < expected_len {
         let token_started = Instant::now();
         let logits = decoder_state.next_token_logits();
+        let sample_started = Instant::now();
         let next = masked_greedy_sample(logits, mask)?;
+        let sample_ms = sample_started.elapsed().as_millis();
         generated.push(next);
+        let mut append_ms = 0;
+        let mut append_decoder_ms = 0;
+        let mut append_logits_project_ms = 0;
         if next == policy.tokens.end_of_text {
-            decode_token_ms.push(token_started.elapsed().as_millis());
+            decode_timings.sample_ms.push(sample_ms);
+            decode_timings.append_ms.push(append_ms);
+            decode_timings.append_decoder_ms.push(append_decoder_ms);
+            decode_timings
+                .append_logits_project_ms
+                .push(append_logits_project_ms);
+            decode_timings
+                .token_ms
+                .push(token_started.elapsed().as_millis());
             break;
         }
         if generated.len() < expected_len {
-            model
-                .append_decoder_token_from_audio(encoded_audio, &mut decoder_state, next)
+            let append_started = Instant::now();
+            let (_, append_timing) = model
+                .append_decoder_token_from_audio_with_timings(
+                    encoded_audio,
+                    &mut decoder_state,
+                    next,
+                )
                 .map_err(|err| {
                     format!(
                         "Whisper append_decoder_token_from_audio failed at generated length {} - {err:?}",
                         generated.len()
                     )
                 })?;
+            append_ms = append_started.elapsed().as_millis();
+            append_decoder_ms = append_timing.decoder_ms;
+            append_logits_project_ms = append_timing.logits_project_ms;
         }
-        decode_token_ms.push(token_started.elapsed().as_millis());
+        decode_timings.sample_ms.push(sample_ms);
+        decode_timings.append_ms.push(append_ms);
+        decode_timings.append_decoder_ms.push(append_decoder_ms);
+        decode_timings
+            .append_logits_project_ms
+            .push(append_logits_project_ms);
+        decode_timings
+            .token_ms
+            .push(token_started.elapsed().as_millis());
     }
 
     Ok(generated)
@@ -1023,9 +1116,27 @@ mod tests {
                 encoder_ms: 11,
                 cross_attention_precompute_ms: 12,
             },
+            audio_encoder_detail: WhisperEncoderTimings {
+                conv_stack_ms: 21,
+                device_upload_ms: 22,
+                qkv_projection_ms: 23,
+                attention_ms: 24,
+                attention_out_projection_ms: 25,
+                mlp_ms: 26,
+                norm_residual_ms: 27,
+                final_layer_norm_ms: 28,
+                readback_ms: 29,
+            },
             decode_total_ms: 8,
+            decode_prepare_ms: 15,
             text_decode_ms: Some(14),
             decode_token_ms: vec![9, 10],
+            decode_sample_ms: vec![16, 17],
+            decode_append_ms: vec![18, 0],
+            decode_prepare_decoder_ms: 19,
+            decode_prepare_logits_project_ms: 20,
+            decode_append_decoder_ms: vec![21, 0],
+            decode_append_logits_project_ms: vec![22, 0],
         };
 
         let output = bench_whisper_output(
@@ -1061,11 +1172,89 @@ mod tests {
             output["timings_ms"]["audio_encode_detail"]["cross_attention_precompute"],
             12
         );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["conv_stack"],
+            21
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["device_upload"],
+            22
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["qkv_projection"],
+            23
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["attention"],
+            24
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["attention_out_projection"],
+            25
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["mlp"],
+            26
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["norm_residual"],
+            27
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["final_layer_norm"],
+            28
+        );
+        assert_eq!(
+            output["timings_ms"]["audio_encode_detail"]["encoder_detail"]["readback"],
+            29
+        );
         assert_eq!(output["timings_ms"]["decode_total"], 8);
+        assert_eq!(output["timings_ms"]["decode_prepare"], 15);
         assert_eq!(output["timings_ms"]["text_decode"], 14);
         assert_eq!(
             output["timings_ms"]["decode_token"],
             serde_json::json!([9, 10])
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_sample"],
+            serde_json::json!([16, 17])
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_append"],
+            serde_json::json!([18, 0])
+        );
+        assert_eq!(output["timings_ms"]["decode_detail"]["initial_prepare"], 15);
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["sample_token"],
+            serde_json::json!([16, 17])
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["append_token"],
+            serde_json::json!([18, 0])
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["decoder"]["initial"],
+            19
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["decoder"]["append_token"],
+            serde_json::json!([21, 0])
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["decoder"]["total"],
+            40
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["logits_project"]["initial"],
+            20
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["logits_project"]["append_token"],
+            serde_json::json!([22, 0])
+        );
+        assert_eq!(
+            output["timings_ms"]["decode_detail"]["logits_project"]["total"],
+            42
         );
     }
 }

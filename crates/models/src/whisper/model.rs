@@ -301,9 +301,37 @@ pub(super) fn validate_decoder_state_for_append(
     }
     let expected_cache = checked_len_product(
         "decoder_state.self_attention",
-        &[state.tokens.len(), config.text_state_size],
+        &[config.text_context_length, config.text_state_size],
     )?;
     for (layer, cache) in state.self_attention.iter().enumerate() {
+        if cache.filled_tokens != state.tokens.len() {
+            return Err(invalid_request(
+                "decoder_state.self_attention.filled_tokens",
+                &format!(
+                    "layer {layer} expected filled_tokens {}, got {}",
+                    state.tokens.len(),
+                    cache.filled_tokens
+                ),
+            ));
+        }
+        if cache.capacity_tokens != config.text_context_length {
+            return Err(invalid_request(
+                "decoder_state.self_attention.capacity_tokens",
+                &format!(
+                    "layer {layer} expected capacity {}, got {}",
+                    config.text_context_length, cache.capacity_tokens
+                ),
+            ));
+        }
+        if cache.row_width != config.text_state_size {
+            return Err(invalid_request(
+                "decoder_state.self_attention.row_width",
+                &format!(
+                    "layer {layer} expected row_width {}, got {}",
+                    config.text_state_size, cache.row_width
+                ),
+            ));
+        }
         if cache.key.len() != expected_cache {
             return Err(invalid_request(
                 "decoder_state.self_attention.key",

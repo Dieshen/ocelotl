@@ -33,7 +33,10 @@ mod tests;
 
 pub use config::{WhisperConfig, parse_whisper_config_json};
 pub use model::WhisperModel;
-pub use state::{WhisperAudioEncodeTimings, WhisperDecoderState, WhisperEncodedAudio};
+pub use state::{
+    WhisperAudioEncodeTimings, WhisperDecoderState, WhisperDecoderStepTimings, WhisperEncodedAudio,
+    WhisperEncoderTimings,
+};
 pub use tensors::{required_whisper_tensor_names, validate_whisper_tensors};
 pub use weights::WhisperWeights;
 pub use wer::{

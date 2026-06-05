@@ -173,7 +173,30 @@ setup:
 - `log_mel`
 - `audio_encode`
 - `decode_total`
+- `decode_prepare`
 - `decode_token`
+- `decode_sample`
+- `decode_append`
+
+`audio_encode_detail` includes the existing `encoder` and
+`cross_attention_precompute` totals plus an `encoder_detail` object with:
+
+- `conv_stack`
+- `device_upload`
+- `qkv_projection`
+- `attention`
+- `attention_out_projection`
+- `mlp`
+- `norm_residual`
+- `final_layer_norm`
+- `readback`
+
+`decode_total` includes initial decoder-state preparation plus the generation
+loop. `decode_prepare` isolates startup-prompt decoder-state construction.
+`decode_token`, `decode_sample`, and `decode_append` are aligned per generated
+token: `decode_token` is the end-to-end per-token bucket, `decode_sample` is
+masked greedy selection over the current logits, and `decode_append` is the
+state-advance call for non-final tokens (`0` when no append is needed).
 
 The output summary is intentionally loose at W-ASR.13/W-ASR.20: it may carry
 token count, text, or a stdout excerpt depending on the target. Do not compare
@@ -1365,7 +1388,7 @@ either:
 - **CUDA / cuBLAS** (only if NVIDIA + CUDA toolkit present):
   `-DGGML_CUDA=ON` instead.
 
-This is deferred under **PostGW.2** rather than fabricated; the board
+This is deferred under **PostGW.3** rather than fabricated; the board
 escape hatch in the GW.4-bench-decoder scope explicitly allows
 shipping the long-output decoder numbers without a fabricated GPU
 baseline if the GPU build can't be produced on this machine.
@@ -1373,15 +1396,230 @@ baseline if the GPU build can't be produced on this machine.
 ### Actionable follow-ups (post-GW investigations)
 
 - **PostGW.1** GPU decoder per-token amortization: investigate the
-  ~50 ms/tok floor and the 2.5x per-token growth with sequence. Likely
-  sources: WGPU kernel-launch overhead per autoregressive step,
-  non-incremental self-attn KV append patterns, possible GPU->host
-  sync per logit readback for the greedy sampler. Goal: flatten the
-  per-token curve; flat is achievable (whisper.cpp shows 1.77 ms/tok
-  flat).
-- **PostGW.2** whisper.cpp-GPU baseline: build whisper.cpp with Vulkan
+  ~50 ms/tok floor and the 2.5x per-token growth with sequence. One
+  identified source, non-incremental self-attn KV append/upload, is now
+  addressed by fixed-capacity device-resident decoder K/V caches plus a
+  fused append-and-attend kernel (2026-06-04). The refreshed long-output
+  tiny.en run still measured `7157 ms` total and `5272 ms` decode for
+  107 expected tokens, so PostGW.1 is **not closed**. Remaining suspects
+  are the high WGPU kernel-launch count per autoregressive step and the
+  GPU->host sync per logit readback for the greedy sampler. Goal:
+  flatten the per-token curve; flat is achievable (whisper.cpp shows
+  1.42-1.77 ms/decode-run on this fixture across captured runs).
+- **PostGW.3** whisper.cpp-GPU baseline: build whisper.cpp with Vulkan
   per the recipe above and add the GPU column to the cross-anchor
   table.
 
 These are tracked in `projects/ocelotl/devs/assignments.md` post-GW
 section.
+
+### PostGW.1 device-resident self-attention cache append (2026-06-04)
+
+Decoder self-attention K/V caches now allocate at text-context capacity
+as `DeviceTensor` handles. Full-context decoder preparation copies the
+prompt K/V projections into those cache tensors once. Appended-token
+decode runs `attention_decoder_incremental_cache_append_d`, which writes
+the new one-row K/V projections into the existing cache and attends over
+the visible prefix in one backend call. On `cubecl-wgpu`, the fused
+kernel removes the old per-layer sequence-growing cache upload, new-row
+readback, and separate copy launches.
+
+Correctness gates run in this change:
+
+```powershell
+cargo test -p ocelotl-kernels copy_into_d -- --nocapture
+cargo test -p ocelotl-kernels incremental_cache -- --nocapture
+cargo test -p ocelotl-kernels cache_append -- --nocapture
+cargo test -p ocelotl-kernels
+cargo check -p ocelotl-kernels --features cubecl-wgpu
+cargo test -p ocelotl-models whisper:: -- --nocapture
+```
+
+Fresh local long-output proof after this change:
+
+| Engine | Backend | Total | Decode | Expected tokens | Result |
+| --- | --- | ---: | ---: | ---: | --- |
+| Ocelotl | `cubecl-wgpu` | `7157 ms` | `5272 ms` | 107 | `matches_expected = true` |
+| whisper.cpp | CPU `-t 4`, greedy/no-fallback | `~764 ms` | `110.85 ms / 78 decode runs` | n/a | completed |
+
+Interpretation: fixed-capacity device cache append is correctness-clean
+but not sufficient. The next GPU decoder task should reduce launch count,
+for example by fusing larger portions of the per-layer decoder block or by
+keeping greedy sampling/logit selection on device.
+
+### PostGW.2 CPU AVX2 long-output acceleration (2026-06-04)
+
+This follow-up targeted the CPU side of the same 107-token long tiny.en
+fixture, using the same `-t 4` comparison shape as whisper.cpp:
+
+```powershell
+target\release\ocelotl.exe bench-whisper-transcribe `
+  --config-path local-artifacts\whisper_tiny_en\config.json `
+  --model-path local-artifacts\whisper_tiny_en\model.safetensors `
+  --audio-path local-artifacts\whisper_tiny_en\reference\sample_long_16khz_mono.wav `
+  --expected-tokens-path local-artifacts\whisper_tiny_en\reference\expected_tokens_long.json `
+  --tokenizer-path local-artifacts\whisper_tiny_en\tokenizer.json `
+  --backend cpu `
+  --cpu-kernel-mode avx2 `
+  --cpu-threads 4
+```
+
+Changes:
+
+- AVX2 `linear_out_by_in` now keeps row-tail (`rows == 1`) projections in
+  SIMD instead of falling back to scalar loops. This is the decoder append
+  shape.
+- Pooled CPU `linear_out_by_in` now splits very wide single-row projections
+  across the output axis, which targets the tied-embedding logits projection
+  without paying rayon overhead for 384-wide projections.
+- CPU `attention_encoder_d` now uses the configured rayon pool for large
+  encoder sequences.
+- In AVX2 mode, threaded encoder attention computes score dots and
+  probability-weighted V accumulation with AVX2/FMA helpers.
+
+Correctness gates added or refreshed:
+
+```powershell
+cargo test -p ocelotl-kernels linear_out_by_in -- --nocapture
+cargo test -p ocelotl-kernels cpu_attention_encoder_d -- --nocapture
+cargo test -p ocelotl-kernels avx2_dot_f32_matches_scalar_within_tolerance -- --nocapture
+cargo test -p ocelotl-kernels avx2_attention_value_weighted_sum_matches_scalar_within_tolerance -- --nocapture
+cargo test -p ocelotl-models optimized_cpu_backend_preserves_forward_logits
+```
+
+Fresh local long-output proof after this change:
+
+| Engine | Backend | Total | Encoder | Decode | Expected tokens | Result |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Ocelotl | CPU `avx2`, 4 threads | `2831 ms` | `1501 ms` | `1064 ms` | 107 | `matches_expected = true` |
+| Ocelotl | CPU `avx2`, 4 threads | `2997 ms` | `1547 ms` | `1183 ms` | 107 | `matches_expected = true` |
+| whisper.cpp | CPU `-t 4`, greedy/no-fallback | `~764 ms` | n/a | `110.85 ms / 78 decode runs` | n/a | completed |
+
+Interpretation: the CPU path is now substantially better on the long-output
+fixture, but it is still not whisper.cpp-level. The best observed Ocelotl run
+here is about `3.7x` whisper.cpp's printed total on this local setup, and the
+decode loop remains the main gap (`~1.1 s` vs whisper.cpp's `~111 ms` decode
+summary). A follow-up benchmark-hook instrumentation split now reports
+`decode_prepare`, `decode_sample`, and `decode_append` alongside the existing
+`decode_token` array so the next CPU task can distinguish masked greedy/logit
+selection overhead from decoder-state append work. Next CPU work should use
+that split before choosing between decoder-block kernels and a narrower
+logit-selection path; it should not spend more effort on GPU cache traffic.
+
+#### PostGW.2A CPU decoder attention override (2026-06-04)
+
+The decode timing split showed masked greedy sampling was effectively free
+(`decode_sample` rounded to `0 ms` per token), while decoder block work
+dominated append time. The CPU backend still used the default trait
+implementations for decoder cross-attention and fixed-capacity incremental
+self-attention, which cloned host tensors before running scalar attention.
+
+This follow-up adds CPU overrides for:
+
+- `attention_decoder_cross_d`
+- `attention_decoder_incremental_cache_d`
+- `attention_decoder_incremental_cache_append_d`
+
+The overrides borrow host-resident tensors directly, write the one-row K/V
+append into the existing cache without cloning the whole capacity, use the
+configured rayon pool for long prefixes/cross-attention, and use the existing
+AVX2/FMA dot/value helpers in `CpuKernelMode::Avx2`.
+
+Correctness gates added or refreshed:
+
+```powershell
+cargo test -p ocelotl-kernels attention_decoder_cross -- --nocapture
+cargo test -p ocelotl-kernels incremental_cache -- --nocapture
+cargo test -p ocelotl-models avx2_threaded_cpu_backend_preserves_forward_logits
+cargo test -p ocelotl-models optimized_cpu_backend_preserves_forward_logits
+cargo test -p ocelotl-models decoder_state_append_matches_full_context_logits
+```
+
+Fresh local long-output proof after this change:
+
+| Engine | Backend | Total | Encoder | Decode | Decoder detail | Logits project | Expected tokens | Result |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Ocelotl | CPU `avx2`, 4 threads | `1837 ms` | `1128 ms` | `445 ms` | `197 ms` | `138 ms` | 107 | `matches_expected = true` |
+| Ocelotl | CPU `avx2`, 8 threads | `1855 ms` | `1082 ms` | `501 ms` | `254 ms` | `121 ms` | 107 | `matches_expected = true` |
+| whisper.cpp | CPU `-t 4`, greedy/no-fallback | `~764 ms` | n/a | `110.85 ms / 78 decode runs` | n/a | n/a | n/a | completed |
+
+Interpretation: this is the largest PostGW.2 decoder win so far. The 4-thread
+run is now about `2.4x` the local whisper.cpp printed total and passes the
+historical `<=3x` CPU-competitive gate on this fixture, but it is still not
+as good as whisper.cpp. Eight threads improved the encoder slightly but
+regressed decode enough that the 4-thread comparison remains the better local
+shape. The next CPU task should focus on the encoder (`audio_encode_detail.encoder
+~= 1.1 s`), not masked sampling or decoder cache traffic.
+
+#### PostGW.2B encoder-internal timing split (2026-06-04)
+
+The benchmark hook now emits `timings_ms.audio_encode_detail.encoder_detail`
+so the remaining encoder bottleneck can be chosen from measured buckets rather
+than from the aggregate `encoder` total. This is an additive timing seam:
+existing callers can still use `encode_audio_features_with_timings`, while
+the benchmark hook calls `encode_audio_features_with_detailed_timings`.
+
+The new buckets are:
+
+- `conv_stack`: host conv1/GELU/conv2/GELU/positional add.
+- `device_upload`: post-conv activation upload.
+- `qkv_projection`: per-layer encoder attention Q/K/V projections.
+- `attention`: per-layer encoder self-attention body.
+- `attention_out_projection`: per-layer attention output projection.
+- `mlp`: per-layer `fc1 -> GELU -> fc2`.
+- `norm_residual`: layer norms and residual adds inside encoder blocks.
+- `final_layer_norm`: final `encoder.ln_post`.
+- `readback`: encoded-audio host readback for `WhisperEncodedAudio.values`.
+
+This split does not claim a speedup by itself. It exists to decide whether the
+next practical encoder task is a small conv/kernel dispatch fix or a larger
+packed-GEMM/native-dtype direction.
+
+Fresh local long-output proof with the detailed split before conv-stack
+threading:
+
+| Engine | Backend | Total | Encoder | Decode | Conv stack | Encoder attention | Encoder MLP | Decoder detail | Logits project | Result |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Ocelotl | CPU `avx2`, 4 threads | `1607 ms` | `977 ms` | `377 ms` | `676 ms` | `190 ms` | `67 ms` | `119 ms` | `109 ms` | `matches_expected = true` |
+| whisper.cpp | CPU `-t 4`, greedy/no-fallback | `~764 ms` | n/a | `110.85 ms / 78 decode runs` | n/a | n/a | n/a | n/a | n/a | completed |
+
+Interpretation: the decoder attention override plus AVX2/threaded CPU work has
+made decode a secondary cost on this fixture. The measured encoder bottleneck
+is now the host convolution stack (`conv_stack = 676 ms`), followed by encoder
+attention (`190 ms`). The next narrow CPU task should target the Whisper conv
+stack before taking on larger packed-GEMM or native F16/BF16 work.
+
+#### PostGW.2C threaded host conv stack (2026-06-04)
+
+The encoder now routes the two host Whisper Conv1d stages through a backend-aware
+primitive. When the selected CPU backend has a configured thread pool, Conv1d
+splits independent output rows across that pool while preserving the exact
+inner accumulation order for every output value. The scalar `conv1d` remains the
+unit-test oracle.
+
+Correctness gates:
+
+```powershell
+cargo test -p ocelotl-models threaded_conv1d_matches_scalar_bit_for_bit
+cargo test -p ocelotl-models threaded_conv1d_stride_two_matches_scalar_bit_for_bit
+cargo test -p ocelotl-models timed_audio_encode_matches_plain_audio_encode
+cargo test -p ocelotl-models avx2_threaded_cpu_backend_preserves_forward_logits
+```
+
+Fresh local long-output proof after threaded Conv1d:
+
+| Engine | Backend | Total | Resident audio-to-tokens | Resident mel-to-tokens | Audio encode | Decode | Conv stack | Encoder attention | Decoder detail | Logits project | Result |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Ocelotl | CPU `avx2`, 4 threads | `1430 ms` | `1276 ms` | `1148 ms` | `540 ms` | `608 ms` | `177 ms` | `219 ms` | `281 ms` | `211 ms` | `matches_expected = true` |
+| Ocelotl | CPU `avx2`, 8 threads | `1013 ms` | `883 ms` | `765 ms` | `318 ms` | `447 ms` | `92 ms` | `114 ms` | `203 ms` | `107 ms` | `matches_expected = true` |
+| Ocelotl | CPU `avx2`, 16 threads | `1082 ms` | `944 ms` | `822 ms` | `281 ms` | `541 ms` | `86 ms` | `92 ms` | `292 ms` | `109 ms` | `matches_expected = true` |
+| whisper.cpp | CPU `-t 4`, greedy/no-fallback | `~764 ms` | n/a | n/a | n/a | `110.85 ms / 78 decode runs` | n/a | n/a | n/a | n/a | completed |
+
+Interpretation: the threaded conv stack is a real improvement and moves the
+best local Ocelotl resident model `mel_to_tokens` path to `765 ms`, effectively
+the same order as the documented whisper.cpp CPU total (`~764 ms`) for this
+fixture. The full benchmark `total` remains higher at `1013 ms` because it also
+includes log-mel extraction, model/tensor loading, tokenizer load, and output
+text decode. For core model compute, the next measured target is decoder block
+and logits projection cost under 8 threads; for end-to-end CLI parity, the next
+target is separating warm/resident timing from cold artifact/tokenizer setup.

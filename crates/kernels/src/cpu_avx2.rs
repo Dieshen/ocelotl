@@ -43,6 +43,89 @@
 
 use std::arch::x86_64::*;
 
+/// AVX2 + FMA dot product for pre-validated contiguous f32 slices.
+///
+/// # Safety
+///
+/// - The host CPU must support AVX2 and FMA.
+/// - `a` and `b` must have equal length.
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(crate) unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+
+    let len = a.len();
+    let k_simd = len - (len % 8);
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+    let mut acc = _mm256_setzero_ps();
+
+    let mut k = 0;
+    while k < k_simd {
+        let av = _mm256_loadu_ps(a_ptr.add(k));
+        let bv = _mm256_loadu_ps(b_ptr.add(k));
+        acc = _mm256_fmadd_ps(av, bv, acc);
+        k += 8;
+    }
+
+    let mut sum = hsum_ps_avx(acc);
+    for idx in k_simd..len {
+        sum += *a_ptr.add(idx) * *b_ptr.add(idx);
+    }
+    sum
+}
+
+/// AVX2 + FMA weighted sum for one attention value head.
+///
+/// Computes `out[d] = sum_i probs[i] * v[i, head_offset + d]` for
+/// `d in 0..head_dim`, where `v` is row-major `[seq, state]`.
+///
+/// # Safety
+///
+/// - The host CPU must support AVX2 and FMA.
+/// - `probs.len() >= seq`.
+/// - `v.len() >= seq * state`.
+/// - `head_offset + head_dim <= state`.
+/// - `out.len() >= head_dim`.
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(crate) unsafe fn attention_value_weighted_sum_avx2(
+    probs: &[f32],
+    v: &[f32],
+    seq: usize,
+    state: usize,
+    head_offset: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    debug_assert!(probs.len() >= seq);
+    debug_assert!(v.len() >= seq * state);
+    debug_assert!(head_offset + head_dim <= state);
+    debug_assert!(out.len() >= head_dim);
+
+    let simd_dim = head_dim - (head_dim % 8);
+    let v_ptr = v.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+
+    for d_base in (0..simd_dim).step_by(8) {
+        let mut acc = _mm256_setzero_ps();
+        for (ki, &p) in probs.iter().take(seq).enumerate() {
+            let p_vec = _mm256_set1_ps(p);
+            let v_vec = _mm256_loadu_ps(v_ptr.add(ki * state + head_offset + d_base));
+            acc = _mm256_fmadd_ps(p_vec, v_vec, acc);
+        }
+        _mm256_storeu_ps(out_ptr.add(d_base), acc);
+    }
+
+    for d in simd_dim..head_dim {
+        let mut sum = 0.0_f32;
+        for (ki, &p) in probs.iter().take(seq).enumerate() {
+            sum += p * *v_ptr.add(ki * state + head_offset + d);
+        }
+        *out_ptr.add(d) = sum;
+    }
+}
+
 /// AVX2 + FMA tiled compute body matching `linear_out_by_in_compute`.
 ///
 /// # Safety
@@ -237,17 +320,78 @@ pub(crate) unsafe fn linear_out_by_in_compute_avx2(
         }
     }
 
-    // Row tail: 1 row at a time, scalar fallback.
+    // Row tail: 1 row at a time. This is the common Whisper decoder
+    // append shape (`rows == 1`), so keep the K-loop SIMD even though the
+    // 4-row tile above cannot apply.
     for row in tiled_rows..rows {
         let x_base = x_ptr.add(row * in_features);
-        for out_dim in 0..out_features {
+        for out_dim in (0..tiled_out).step_by(4) {
             let w_base = w_ptr.add(out_dim * in_features);
-            let bias_v = bias.map_or(0.0, |b| b[out_dim]);
-            let mut sum = bias_v;
-            for k_dim in 0..in_features {
-                sum += *x_base.add(k_dim) * *w_base.add(k_dim);
+            let w1_base = w_ptr.add((out_dim + 1) * in_features);
+            let w2_base = w_ptr.add((out_dim + 2) * in_features);
+            let w3_base = w_ptr.add((out_dim + 3) * in_features);
+
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut acc2 = _mm256_setzero_ps();
+            let mut acc3 = _mm256_setzero_ps();
+
+            let mut k = 0;
+            while k < k_simd {
+                let xv = _mm256_loadu_ps(x_base.add(k));
+                let w0 = _mm256_loadu_ps(w_base.add(k));
+                let w1 = _mm256_loadu_ps(w1_base.add(k));
+                let w2 = _mm256_loadu_ps(w2_base.add(k));
+                let w3 = _mm256_loadu_ps(w3_base.add(k));
+
+                acc0 = _mm256_fmadd_ps(xv, w0, acc0);
+                acc1 = _mm256_fmadd_ps(xv, w1, acc1);
+                acc2 = _mm256_fmadd_ps(xv, w2, acc2);
+                acc3 = _mm256_fmadd_ps(xv, w3, acc3);
+
+                k += 8;
             }
-            *out_ptr.add(row * out_features + out_dim) = sum;
+
+            let mut s0 = hsum_ps_avx(acc0);
+            let mut s1 = hsum_ps_avx(acc1);
+            let mut s2 = hsum_ps_avx(acc2);
+            let mut s3 = hsum_ps_avx(acc3);
+
+            for k_tail in k_simd..in_features {
+                let x_value = *x_base.add(k_tail);
+                s0 += x_value * *w_base.add(k_tail);
+                s1 += x_value * *w1_base.add(k_tail);
+                s2 += x_value * *w2_base.add(k_tail);
+                s3 += x_value * *w3_base.add(k_tail);
+            }
+
+            let (b0, b1, b2, b3) = if let Some(b) = bias {
+                (b[out_dim], b[out_dim + 1], b[out_dim + 2], b[out_dim + 3])
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
+            let out_base = row * out_features + out_dim;
+            *out_ptr.add(out_base) = s0 + b0;
+            *out_ptr.add(out_base + 1) = s1 + b1;
+            *out_ptr.add(out_base + 2) = s2 + b2;
+            *out_ptr.add(out_base + 3) = s3 + b3;
+        }
+
+        for tail_out in tiled_out..out_features {
+            let w_base = w_ptr.add(tail_out * in_features);
+            let mut acc = _mm256_setzero_ps();
+            let mut k = 0;
+            while k < k_simd {
+                let xv = _mm256_loadu_ps(x_base.add(k));
+                let w = _mm256_loadu_ps(w_base.add(k));
+                acc = _mm256_fmadd_ps(xv, w, acc);
+                k += 8;
+            }
+            let mut sum = hsum_ps_avx(acc);
+            for k_tail in k_simd..in_features {
+                sum += *x_base.add(k_tail) * *w_base.add(k_tail);
+            }
+            *out_ptr.add(row * out_features + tail_out) = sum + bias.map_or(0.0, |b| b[tail_out]);
         }
     }
 }

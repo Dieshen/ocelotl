@@ -3,12 +3,12 @@
 use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 
 use ocelotl_core::{DType, TokenId};
-use ocelotl_kernels::default_kernel_backend;
+use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode, default_kernel_backend};
 
 use super::WhisperModel;
 use super::primitives::{
-    attention, attention_incremental_from_projected, attention_with_precomputed_kv, conv1d, gelu,
-    layer_norm, mlp_gelu,
+    attention, attention_incremental_from_projected, attention_with_precomputed_kv, conv1d,
+    conv1d_with_backend, gelu, layer_norm, mlp_gelu,
 };
 use super::state::WhisperEncodedAudio;
 use super::weights::expected_shape;
@@ -23,6 +23,104 @@ fn conv1d_applies_padding_and_stride() {
     let out = conv1d(&input, 4, 1, &weight, &bias, 1, 3, 2, 1).expect("conv1d");
 
     assert_eq!(out, vec![-0.5, 19.5]);
+}
+
+#[test]
+fn threaded_conv1d_matches_scalar_bit_for_bit() {
+    let time = 65;
+    let in_channels = 5;
+    let out_channels = 257;
+    let kernel = 3;
+    let stride = 1;
+    let padding = 1;
+    let input: Vec<f32> = (0..time * in_channels)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
+        .collect();
+    let weight: Vec<f32> = (0..out_channels * in_channels * kernel)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.03125)
+        .collect();
+    let bias: Vec<f32> = (0..out_channels)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.0625)
+        .collect();
+    let threaded_backend =
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4).expect("threaded CPU");
+
+    let scalar = conv1d(
+        &input,
+        time,
+        in_channels,
+        &weight,
+        &bias,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+    )
+    .expect("scalar conv1d");
+    let threaded = conv1d_with_backend(
+        &threaded_backend,
+        &input,
+        time,
+        in_channels,
+        &weight,
+        &bias,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+    )
+    .expect("threaded conv1d");
+
+    assert_eq!(threaded, scalar);
+}
+
+#[test]
+fn threaded_conv1d_stride_two_matches_scalar_bit_for_bit() {
+    let time = 67;
+    let in_channels = 13;
+    let out_channels = 513;
+    let kernel = 3;
+    let stride = 2;
+    let padding = 1;
+    let input: Vec<f32> = (0..time * in_channels)
+        .map(|i| ((i % 19) as f32 - 9.0) * 0.0625)
+        .collect();
+    let weight: Vec<f32> = (0..out_channels * in_channels * kernel)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.015625)
+        .collect();
+    let bias: Vec<f32> = (0..out_channels)
+        .map(|i| ((i % 11) as f32 - 5.0) * 0.03125)
+        .collect();
+    let threaded_backend =
+        CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Scalar, 4).expect("threaded CPU");
+
+    let scalar = conv1d(
+        &input,
+        time,
+        in_channels,
+        &weight,
+        &bias,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+    )
+    .expect("scalar conv1d");
+    let threaded = conv1d_with_backend(
+        &threaded_backend,
+        &input,
+        time,
+        in_channels,
+        &weight,
+        &bias,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+    )
+    .expect("threaded conv1d");
+
+    assert_eq!(threaded, scalar);
 }
 
 #[test]
@@ -369,8 +467,17 @@ fn decoder_state_append_matches_full_context_logits() {
     assert_eq!(state.tokens(), &prompt);
     assert_eq!(state.self_attention.len(), cfg.text_layers);
     for cache in &state.self_attention {
-        assert_eq!(cache.key.len(), prompt.len() * cfg.text_state_size);
-        assert_eq!(cache.value.len(), prompt.len() * cfg.text_state_size);
+        assert_eq!(cache.filled_tokens, prompt.len());
+        assert_eq!(cache.capacity_tokens, cfg.text_context_length);
+        assert_eq!(cache.row_width, cfg.text_state_size);
+        assert_eq!(
+            cache.key.len(),
+            cfg.text_context_length * cfg.text_state_size
+        );
+        assert_eq!(
+            cache.value.len(),
+            cfg.text_context_length * cfg.text_state_size
+        );
     }
     assert_close(state.next_token_logits(), &full_prompt, 0.0);
 
@@ -384,10 +491,16 @@ fn decoder_state_append_matches_full_context_logits() {
 
     assert_eq!(state.tokens(), &[prompt[0], appended]);
     for cache in &state.self_attention {
-        assert_eq!(cache.key.len(), state.tokens().len() * cfg.text_state_size);
+        assert_eq!(cache.filled_tokens, state.tokens().len());
+        assert_eq!(cache.capacity_tokens, cfg.text_context_length);
+        assert_eq!(cache.row_width, cfg.text_state_size);
+        assert_eq!(
+            cache.key.len(),
+            cfg.text_context_length * cfg.text_state_size
+        );
         assert_eq!(
             cache.value.len(),
-            state.tokens().len() * cfg.text_state_size
+            cfg.text_context_length * cfg.text_state_size
         );
     }
     assert_close(&incremental_appended, &full_appended, 1.0e-5);
@@ -539,6 +652,40 @@ fn optimized_cpu_backend_preserves_forward_logits() {
         .expect("optimized logits");
 
     assert_close(&optimized_logits, &scalar_logits, 1.0e-5);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_threaded_cpu_backend_preserves_forward_logits() {
+    if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+        return;
+    }
+
+    let cfg = tiny_config();
+    let scalar = WhisperModel::new(cfg.clone(), tiny_weight_tensors(&cfg)).expect("scalar model");
+    let avx2_backend = ocelotl_kernels::CpuKernelBackend::with_mode_and_threads(
+        ocelotl_kernels::CpuKernelMode::Avx2,
+        4,
+    )
+    .expect("AVX2 threaded backend must build");
+    let avx2 = WhisperModel::with_kernel_backend(
+        cfg.clone(),
+        tiny_weight_tensors(&cfg),
+        std::sync::Arc::new(avx2_backend),
+    )
+    .expect("AVX2 model");
+    let mel = vec![0.0_f32; 4 * cfg.mel_bins];
+    let tokens = [TokenId(0), TokenId(2)];
+
+    assert_eq!(avx2.kernel_backend().name(), "cpu");
+    let scalar_logits = scalar
+        .forward_next_token_logits(&mel, 4, &tokens)
+        .expect("scalar logits");
+    let avx2_logits = avx2
+        .forward_next_token_logits(&mel, 4, &tokens)
+        .expect("AVX2 logits");
+
+    assert_close(&avx2_logits, &scalar_logits, 1.0e-4);
 }
 
 #[test]
