@@ -89,9 +89,9 @@ Gemma4:
   harness that runs a local `llama-tokenize` binary, parses `--ids` stdout, and
   compares both BOS-free and configured-BOS Gemma4 token IDs against Ocelotl.
   The default suite checks the harness parser and fixture command schema. The
-  external proof remains opt-in and was not run at landing time because no
-  local `llama-tokenize` binary was available; refresh it with a pinned
-  llama.cpp build before claiming independent tokenizer parity.
+  ignored external proof passed locally on 2026-06-05 against llama.cpp commit
+  `856c3adac1709be15e1ea2529a0e89f742d25fe0`
+  (`b9127-1-g856c3adac`) with IDs `[9259]` and `[2, 9259]`.
 - MF.7 adds the first Gemma4 execution subset: `Gemma4TextModel` runs a
   text-only, unquantized, dense F32 synthetic decoder-core path through
   `ocelotl_runtime::gemma::{prefill, decode_one_token}`, with pinned logits and

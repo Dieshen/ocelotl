@@ -288,8 +288,11 @@ plain `Hello` encodes to `[9259]`, and the configured-BOS path encodes to
 
 MF.6 also includes an ignored llama.cpp tokenizer-reference harness. It is not a
 default test because it requires a locally built `llama-tokenize` binary plus the
-selected Gemma4 GGUF. Build or download a pinned llama.cpp release, record its
-tag/commit in `fixtures/tokenizer/gemma4_gguf_basic_prompt.json`, and run:
+selected Gemma4 GGUF. The local proof passed on 2026-06-05 against llama.cpp
+commit `856c3adac1709be15e1ea2529a0e89f742d25fe0`
+(`b9127-1-g856c3adac`). To refresh it, build or download a pinned llama.cpp
+release, record its tag/commit in
+`fixtures/tokenizer/gemma4_gguf_basic_prompt.json`, and run:
 
 ```powershell
 $env:OCELOTL_GEMMA4_GGUF_PATH="D:\path\to\google_gemma-4-E4B-it-Q4_K_M.gguf"

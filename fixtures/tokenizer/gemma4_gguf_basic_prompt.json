@@ -6,10 +6,10 @@
   "expected_token_ids": [9259],
   "expected_with_bos_token_ids": [2, 9259],
   "decoded": "Hello",
-  "reference_status": "Implementation regression fixture captured from Ocelotl's GGUF BPE backend on 2026-06-05. The ignored llama.cpp reference harness is checked in, but the external proof was not run locally because no llama-tokenize binary was found on PATH or under D:\\Dev.",
+  "reference_status": "Implementation regression fixture captured from Ocelotl's GGUF BPE backend on 2026-06-05. External llama.cpp reference proof passed locally on 2026-06-05 against llama.cpp commit 856c3adac1709be15e1ea2529a0e89f742d25fe0 (describe b9127-1-g856c3adac).",
   "llama_cpp_reference": {
     "tool": "llama-tokenize",
-    "revision": "pending-local-run; record the exact pinned llama.cpp tag/commit or local build before refreshing expectations",
+    "revision": "856c3adac1709be15e1ea2529a0e89f742d25fe0 (describe b9127-1-g856c3adac)",
     "source": "ggml-org/llama.cpp tools/tokenize; llama-tokenize prints Python-style ID arrays with --ids and uses the model BOS setting unless --no-bos is supplied.",
     "bos_free_command": ["llama-tokenize", "--model", "<model.gguf>", "--prompt", "Hello", "--ids", "--no-bos", "--no-escape", "--log-disable"],
     "configured_bos_command": ["llama-tokenize", "--model", "<model.gguf>", "--prompt", "Hello", "--ids", "--no-escape", "--log-disable"],

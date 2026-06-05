@@ -122,10 +122,10 @@ and does not modify the closed M3.6 MLP task.
   BOS-free output with `--no-bos`, compares configured-BOS output without
   `--no-bos`, and checks both against Ocelotl plus
   `fixtures/tokenizer/gemma4_gguf_basic_prompt.json`. Default tests cover the
-  fixture's command schema and stdout parser. The external proof was not run
-  locally because no `llama-tokenize` binary was found on PATH or under
-  `D:\Dev`; run the ignored harness against a pinned llama.cpp build before
-  claiming independent tokenizer parity.
+  fixture's command schema and stdout parser. The ignored external proof passed
+  locally on 2026-06-05 against llama.cpp commit
+  `856c3adac1709be15e1ea2529a0e89f742d25fe0`
+  (`b9127-1-g856c3adac`), matching `[9259]` and `[2, 9259]`.
 
 ## MF.7 Add Tiny Synthetic Forward Per Supported Subset
 
