@@ -111,30 +111,49 @@ contract and to avoid double-BOS when a Gemma4 chat template already renders
 `bos_token`. The configured-BOS helper pins GGUF `add_bos_token = true`
 separately.
 
+### llama.cpp reference harness
+
+The fixture records the `llama-tokenize` command shape used as the external
+reference target. The harness uses `--ids --no-escape --log-disable`; plain
+Ocelotl `encode("Hello")` is compared to llama.cpp with `--no-bos`, while
+`encode_with_configured_bos("Hello")` is compared without `--no-bos` so
+llama.cpp honors the GGUF `add_bos_token` setting.
+
+The current `llama_cpp_reference.revision` is marked `pending-local-run`
+because no `llama-tokenize` binary was available locally when the fixture was
+captured. Before claiming independent external parity, run the ignored harness
+against a pinned llama.cpp tag/commit and update the revision field with the
+actual build identity.
+
 ### Test surfaces
 
-Two test surfaces exercise this fixture in `src/gemma4.rs`:
+Three test surfaces exercise this fixture in `src/gemma4.rs`:
 
 1. `gemma4_gguf_tokenizer_fixture_is_well_formed_and_populated` runs by
    default and verifies the fixture names the pinned GGUF revision and has
-   populated ID fields.
+   populated ID fields plus a machine-checked llama.cpp command shape.
 2. `local_gemma4_q4_k_m_gguf_tokenizer_builds_from_embedded_metadata` is
    `#[ignore]`'d by default. It extracts embedded GGUF tokenizer metadata,
    maps it through the root crate into `ocelotl-tokenizer`'s `GgufBpeTokenizer`,
    and asserts the real artifact matches the fixture.
+3. `local_gemma4_q4_k_m_gguf_tokenizer_matches_llama_cpp_tokenize_reference` is
+   `#[ignore]`'d by default. It runs a local `llama-tokenize` binary, parses
+   the `--ids` stdout array, and compares both BOS-free and configured-BOS IDs
+   against Ocelotl and the fixture.
 
 Run the opt-in proof with:
 
 ```text
 cargo test -p ocelotl local_gemma4_q4_k_m_gguf_tokenizer_builds_from_embedded_metadata -- --ignored --nocapture
+cargo test -p ocelotl local_gemma4_q4_k_m_gguf_tokenizer_matches_llama_cpp_tokenize_reference -- --ignored --nocapture
 ```
 
 ### Regeneration
 
 If the pinned GGUF artifact or GGUF tokenizer backend intentionally changes,
 run the ignored proof against the selected artifact and update
-`expected_token_ids`, `expected_with_bos_token_ids`, and `decoded` together.
-This fixture is currently an Ocelotl backend regression pin. A local llama.cpp
-tokenizer command was not available when it was captured, so independent
-external-reference parity remains a follow-up before claiming full tokenizer
-parity with llama.cpp.
+`expected_token_ids`, `expected_with_bos_token_ids`, `decoded`, and
+`llama_cpp_reference` together. This fixture is currently an Ocelotl backend
+regression pin with a checked llama.cpp harness. A local llama.cpp tokenizer
+binary was not available when it was captured, so the external reference proof
+must still be run before claiming full tokenizer parity with llama.cpp.

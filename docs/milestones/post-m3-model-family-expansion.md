@@ -84,8 +84,14 @@ Gemma4:
   `add_space_prefix`, keeps plain `encode` BOS-free, provides an explicit
   configured-BOS path, and uses GGUF token types to register control/unknown and
   user-defined tokens. `fixtures/tokenizer/gemma4_gguf_basic_prompt.json` pins
-  local backend IDs for `Hello`; an external llama.cpp tokenizer command remains
-  pending before the fixture can claim independent reference parity.
+  local backend IDs for `Hello`.
+- A follow-up llama.cpp tokenizer-reference slice adds an ignored root-crate
+  harness that runs a local `llama-tokenize` binary, parses `--ids` stdout, and
+  compares both BOS-free and configured-BOS Gemma4 token IDs against Ocelotl.
+  The default suite checks the harness parser and fixture command schema. The
+  external proof remains opt-in and was not run at landing time because no
+  local `llama-tokenize` binary was available; refresh it with a pinned
+  llama.cpp build before claiming independent tokenizer parity.
 - MF.7 adds the first Gemma4 execution subset: `Gemma4TextModel` runs a
   text-only, unquantized, dense F32 synthetic decoder-core path through
   `ocelotl_runtime::gemma::{prefill, decode_one_token}`, with pinned logits and

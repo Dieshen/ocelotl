@@ -55,7 +55,10 @@ fn tokenizer_error(message: impl Into<String>) -> OcelotlError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use ocelotl_tokenizer::Tokenizer;
     use serde::Deserialize;
@@ -73,6 +76,19 @@ mod tests {
         expected_token_ids: Vec<u32>,
         expected_with_bos_token_ids: Vec<u32>,
         decoded: String,
+        reference_status: String,
+        llama_cpp_reference: LlamaCppTokenizerReference,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LlamaCppTokenizerReference {
+        tool: String,
+        revision: String,
+        source: String,
+        bos_free_command: Vec<String>,
+        configured_bos_command: Vec<String>,
+        expected_stdout_token_ids: Vec<u32>,
+        expected_stdout_with_bos_token_ids: Vec<u32>,
     }
 
     fn tiny_metadata() -> GgufTokenizerMetadata {
@@ -154,6 +170,62 @@ mod tests {
             !fixture.decoded.is_empty(),
             "Gemma4 GGUF fixture must pin decoded text"
         );
+        assert!(
+            fixture.reference_status.contains("llama.cpp"),
+            "fixture must describe the llama.cpp reference state"
+        );
+        assert_eq!(fixture.llama_cpp_reference.tool, "llama-tokenize");
+        assert!(
+            fixture.llama_cpp_reference.source.contains("llama.cpp"),
+            "fixture must name the llama.cpp tokenizer source"
+        );
+        assert!(
+            !fixture.llama_cpp_reference.revision.is_empty(),
+            "fixture must declare the intended llama.cpp reference revision"
+        );
+        assert!(
+            fixture
+                .llama_cpp_reference
+                .bos_free_command
+                .iter()
+                .any(|arg| arg == "--no-bos"),
+            "BOS-free llama.cpp reference command must pass --no-bos"
+        );
+        assert!(
+            !fixture
+                .llama_cpp_reference
+                .configured_bos_command
+                .iter()
+                .any(|arg| arg == "--no-bos"),
+            "configured-BOS llama.cpp reference command must allow model BOS"
+        );
+        assert_eq!(
+            fixture.llama_cpp_reference.expected_stdout_token_ids, fixture.expected_token_ids,
+            "fixture llama.cpp BOS-free stdout must match pinned expected IDs"
+        );
+        assert_eq!(
+            fixture
+                .llama_cpp_reference
+                .expected_stdout_with_bos_token_ids,
+            fixture.expected_with_bos_token_ids,
+            "fixture llama.cpp configured-BOS stdout must match pinned expected IDs"
+        );
+    }
+
+    #[test]
+    fn llama_tokenize_ids_parser_accepts_python_style_id_list() {
+        assert_eq!(
+            parse_llama_tokenize_ids(b" [2, 9259]\r\n").expect("ID list should parse"),
+            vec![2, 9259]
+        );
+    }
+
+    #[test]
+    fn llama_tokenize_ids_parser_rejects_non_list_output() {
+        let err = parse_llama_tokenize_ids(b"Total number of tokens: 2")
+            .expect_err("non-list llama-tokenize output must reject");
+
+        assert!(err.contains("missing '['"), "unexpected parse error: {err}");
     }
 
     #[test]
@@ -266,6 +338,61 @@ mod tests {
         assert_eq!(decoded, fixture.decoded);
     }
 
+    #[test]
+    #[ignore = "requires Gemma4 GGUF plus OCELOTL_LLAMA_TOKENIZE_PATH or local-artifacts/llama_cpp/llama-tokenize.exe; see docs/artifact-preparation.md"]
+    fn local_gemma4_q4_k_m_gguf_tokenizer_matches_llama_cpp_tokenize_reference() {
+        let model_path = local_gemma4_gguf_path();
+        assert!(
+            model_path.exists(),
+            "missing Gemma4 GGUF at {}; see docs/artifact-preparation.md",
+            model_path.display()
+        );
+        let llama_tokenize = local_llama_tokenize_path();
+        assert!(
+            llama_tokenize.exists(),
+            "missing llama-tokenize at {}; set OCELOTL_LLAMA_TOKENIZE_PATH or see docs/artifact-preparation.md",
+            llama_tokenize.display()
+        );
+
+        let fixture = load_gemma4_tokenizer_fixture();
+        let tokenizer = load_gemma4_gguf_tokenizer(&model_path)
+            .expect("local Gemma4 GGUF tokenizer must build");
+
+        let ocelotl_plain: Vec<u32> = tokenizer
+            .encode(&fixture.input)
+            .expect("Ocelotl Gemma4 GGUF tokenizer should encode fixture input")
+            .iter()
+            .map(|token| token.0)
+            .collect();
+        let llama_plain =
+            run_llama_tokenize_ids(&llama_tokenize, &model_path, &fixture.input, false);
+        assert_eq!(
+            llama_plain, fixture.expected_token_ids,
+            "fixture must match llama.cpp BOS-free tokenizer output"
+        );
+        assert_eq!(
+            ocelotl_plain, llama_plain,
+            "Ocelotl Gemma4 BOS-free tokenizer output must match llama.cpp"
+        );
+
+        let ocelotl_with_bos: Vec<u32> = tokenizer
+            .encode_with_configured_bos(&fixture.input)
+            .expect("Ocelotl Gemma4 GGUF tokenizer should encode fixture input with configured BOS")
+            .iter()
+            .map(|token| token.0)
+            .collect();
+        let llama_with_bos =
+            run_llama_tokenize_ids(&llama_tokenize, &model_path, &fixture.input, true);
+        assert_eq!(
+            llama_with_bos, fixture.expected_with_bos_token_ids,
+            "fixture must match llama.cpp configured-BOS tokenizer output"
+        );
+        assert_eq!(
+            ocelotl_with_bos, llama_with_bos,
+            "Ocelotl Gemma4 configured-BOS tokenizer output must match llama.cpp"
+        );
+    }
+
     fn local_gemma4_gguf_path() -> PathBuf {
         if let Ok(path) = std::env::var("OCELOTL_GEMMA4_GGUF_PATH") {
             return PathBuf::from(path);
@@ -274,5 +401,85 @@ mod tests {
             .join("local-artifacts")
             .join("gemma4_e4b_it_q4_k_m")
             .join("google_gemma-4-E4B-it-Q4_K_M.gguf")
+    }
+
+    fn local_llama_tokenize_path() -> PathBuf {
+        if let Ok(path) = std::env::var("OCELOTL_LLAMA_TOKENIZE_PATH") {
+            return PathBuf::from(path);
+        }
+        let executable = if cfg!(windows) {
+            "llama-tokenize.exe"
+        } else {
+            "llama-tokenize"
+        };
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("local-artifacts")
+            .join("llama_cpp")
+            .join(executable)
+    }
+
+    fn run_llama_tokenize_ids(
+        llama_tokenize: &Path,
+        model_path: &Path,
+        input: &str,
+        add_bos: bool,
+    ) -> Vec<u32> {
+        let mut command = Command::new(llama_tokenize);
+        command
+            .arg("--model")
+            .arg(model_path)
+            .arg("--prompt")
+            .arg(input)
+            .arg("--ids")
+            .arg("--no-escape")
+            .arg("--log-disable");
+        if !add_bos {
+            command.arg("--no-bos");
+        }
+
+        let output = command.output().unwrap_or_else(|err| {
+            panic!(
+                "failed to run llama-tokenize at {}: {err}",
+                llama_tokenize.display()
+            )
+        });
+        assert!(
+            output.status.success(),
+            "llama-tokenize failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_llama_tokenize_ids(&output.stdout).unwrap_or_else(|err| {
+            panic!(
+                "failed to parse llama-tokenize stdout: {err}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    fn parse_llama_tokenize_ids(stdout: &[u8]) -> std::result::Result<Vec<u32>, String> {
+        let rendered = std::str::from_utf8(stdout)
+            .map_err(|err| format!("llama-tokenize stdout was not UTF-8: {err}"))?;
+        let start = rendered
+            .find('[')
+            .ok_or_else(|| format!("missing '[' in llama-tokenize stdout: {rendered:?}"))?;
+        let tail = &rendered[start + 1..];
+        let end = tail
+            .find(']')
+            .ok_or_else(|| format!("missing ']' in llama-tokenize stdout: {rendered:?}"))?;
+        let ids = tail[..end].trim();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        ids.split(',')
+            .map(|part| {
+                let trimmed = part.trim();
+                trimmed
+                    .parse::<u32>()
+                    .map_err(|err| format!("invalid llama-tokenize token id {trimmed:?}: {err}"))
+            })
+            .collect()
     }
 }

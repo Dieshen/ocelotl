@@ -284,8 +284,25 @@ BOS/space-prefix flags. The root-crate tokenizer proof builds the
 `ocelotl-tokenizer` GGUF BPE backend from that embedded metadata and compares
 `fixtures/tokenizer/gemma4_gguf_basic_prompt.json` against the local artifact:
 plain `Hello` encodes to `[9259]`, and the configured-BOS path encodes to
-`[2, 9259]`. A pinned local llama.cpp tokenizer command is still needed before
-those IDs can be described as independent external-reference parity.
+`[2, 9259]`.
+
+MF.6 also includes an ignored llama.cpp tokenizer-reference harness. It is not a
+default test because it requires a locally built `llama-tokenize` binary plus the
+selected Gemma4 GGUF. Build or download a pinned llama.cpp release, record its
+tag/commit in `fixtures/tokenizer/gemma4_gguf_basic_prompt.json`, and run:
+
+```powershell
+$env:OCELOTL_GEMMA4_GGUF_PATH="D:\path\to\google_gemma-4-E4B-it-Q4_K_M.gguf"
+$env:OCELOTL_LLAMA_TOKENIZE_PATH="D:\path\to\llama-tokenize.exe"
+cargo test -p ocelotl local_gemma4_q4_k_m_gguf_tokenizer_matches_llama_cpp_tokenize_reference -- --ignored --nocapture
+```
+
+The harness compares Ocelotl against `llama-tokenize --ids --no-escape
+--log-disable`. Plain `Tokenizer::encode` is compared with `--no-bos`; the
+configured-BOS path omits `--no-bos` so llama.cpp uses the GGUF model BOS
+setting. For prompt fixtures with shell-sensitive whitespace, escapes, or
+chat-template output, prefer a future file/stdin-backed fixture rather than a
+literal `--prompt` command.
 
 ## 6. Keeping Artifacts Out Of Git
 

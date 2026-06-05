@@ -145,6 +145,35 @@ The M4 model path is intentionally partial: RoPE uses CubeCL WGPU, and matmul,
 attention, RMSNorm, MLP, residual adds, and logits projection use CPU fallback.
 Full-model GPU execution remains deferred.
 
+## Post-M3 Gemma4 GGUF Tokenizer
+
+Gemma4 tokenizer parity is split into default-on fixture/harness validation and
+an opt-in local llama.cpp reference proof:
+
+- **Gemma4 GGUF tokenizer fixture, default-on**:
+  `fixtures/tokenizer/gemma4_gguf_basic_prompt.json` pins the selected
+  `bartowski/google_gemma-4-E4B-it-GGUF` Q4_K_M artifact at revision
+  `c04cb322fd63e347db759a08b6249b867488ccf8`, input `Hello`, BOS-free token
+  IDs `[9259]`, configured-BOS token IDs `[2, 9259]`, and decoded text
+  `Hello`. `src/gemma4.rs` validates the fixture, the llama.cpp command shape,
+  and the stdout parser in the default test suite.
+- **Gemma4 GGUF tokenizer, opt-in local artifact**:
+  `local_gemma4_q4_k_m_gguf_tokenizer_builds_from_embedded_metadata` extracts
+  embedded GGUF tokenizer metadata from the selected local artifact, builds
+  Ocelotl's `GgufBpeTokenizer`, and compares exact token IDs and decoded text
+  against the fixture.
+- **llama.cpp tokenizer reference, opt-in local execution**:
+  `local_gemma4_q4_k_m_gguf_tokenizer_matches_llama_cpp_tokenize_reference`
+  runs `llama-tokenize --ids --no-escape --log-disable`. Plain Ocelotl
+  `encode` is compared with llama.cpp `--no-bos`; the configured-BOS path omits
+  `--no-bos` so llama.cpp uses the GGUF model BOS setting. This proof requires
+  `OCELOTL_LLAMA_TOKENIZE_PATH` plus the selected GGUF and was not run at
+  landing time because no local `llama-tokenize` binary was available.
+
+Exact token equality is the parity contract. Before claiming independent
+llama.cpp parity, refresh the ignored reference proof with a pinned llama.cpp
+tag/commit and record that build identity in the tokenizer fixture.
+
 ## Post-M3 Whisper ASR
 
 Whisper ASR parity is split into default-on synthetic coverage and an opt-in

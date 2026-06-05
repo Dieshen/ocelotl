@@ -115,8 +115,17 @@ and does not modify the closed M3.6 MLP task.
   pins the selected GGUF backend's local `Hello` IDs as `[9259]` and configured
   BOS IDs as `[2, 9259]`; the ignored local proof passed against
   `D:\Dev\ideas\04-granola-ai-clone\models\google_gemma-4-E4B-it-Q4_K_M.gguf`
-  on 2026-06-05. A pinned external llama.cpp tokenizer command remains a
-  follow-up before this fixture can claim independent reference parity.
+  on 2026-06-05.
+- `Follow-up`: Gemma4 llama.cpp tokenizer-reference harness landed 2026-06-05.
+  The root crate now has an ignored opt-in test that runs a local
+  `llama-tokenize` binary with `--ids --no-escape --log-disable`, compares
+  BOS-free output with `--no-bos`, compares configured-BOS output without
+  `--no-bos`, and checks both against Ocelotl plus
+  `fixtures/tokenizer/gemma4_gguf_basic_prompt.json`. Default tests cover the
+  fixture's command schema and stdout parser. The external proof was not run
+  locally because no `llama-tokenize` binary was found on PATH or under
+  `D:\Dev`; run the ignored harness against a pinned llama.cpp build before
+  claiming independent tokenizer parity.
 
 ## MF.7 Add Tiny Synthetic Forward Per Supported Subset
 
