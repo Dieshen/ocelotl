@@ -110,8 +110,12 @@ Gemma4:
 - A follow-up text-forward slice makes the CPU/reference model loop
   layer-aware for SWA/global attention widths and RoPE bases. Mixed SWA/global
   widths are now executable only for the text-only unquantized dense F32
-  full-attention subset; multimodal, sliding-window/shared-KV, softcap,
+  full-attention subset; multimodal, sliding-window/shared-KV,
   quantized-origin, and reference real-artifact parity remain open.
+- A follow-up final-logit softcap slice applies Gemma4's
+  `cap * tanh(logit / cap)` transform in the same supported synthetic
+  text-forward path and validates the cap before compute. This does not enable
+  real Q4_K_M execution yet.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

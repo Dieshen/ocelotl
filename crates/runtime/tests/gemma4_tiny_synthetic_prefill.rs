@@ -2,9 +2,9 @@
 //!
 //! This test is intentionally narrower than the selected real Gemma4 Q4_K_M
 //! artifact. It pins the first supported execution subset: text-only, dense
-//! F32 weights, no multimodal inputs, no sliding-window/shared-KV attention,
-//! and no final-logit softcap. The real GGUF artifact remains rejected until
-//! those features are implemented and compared against a reference.
+//! F32 weights, no multimodal inputs, and no sliding-window/shared-KV
+//! attention. The real GGUF artifact remains rejected until those features,
+//! quantized-origin execution, and reference parity are complete.
 
 use ocelotl_core::{OcelotlError, TokenId};
 use ocelotl_models::gemma::{
@@ -163,6 +163,43 @@ fn gemma4_prefill_matches_pinned_fixture_through_runtime_path() {
             fixture.rationale
         );
     }
+}
+
+#[test]
+fn gemma4_prefill_applies_final_logit_softcap_through_runtime_path() {
+    let fixture = load_fixture();
+    let mut cfg = tiny_config();
+    let cap = 0.25_f32;
+    cfg.final_logit_softcap = Some(cap);
+    let model = Gemma4TextModel::new(cfg.clone(), tiny_weights(&cfg))
+        .expect("softcapped tiny Gemma4 text model must build");
+    let prompt: Vec<TokenId> = fixture.prompt_tokens.iter().copied().map(TokenId).collect();
+
+    let logits = prefill(&model, &prompt).expect("runtime Gemma4 prefill must succeed");
+
+    assert_eq!(logits.len(), fixture.expected_logits.len());
+    let mut changed = false;
+    for (idx, (got, raw)) in logits
+        .iter()
+        .zip(fixture.expected_logits.iter())
+        .enumerate()
+    {
+        let want = cap * (raw / cap).tanh();
+        let diff = (got - want).abs();
+        assert!(
+            diff < TOLERANCE,
+            "softcapped Gemma4 logit {idx}: got {got}, want {want}, diff {diff} exceeds {TOLERANCE}"
+        );
+        assert!(
+            got.abs() <= cap + TOLERANCE,
+            "softcapped Gemma4 logit {idx}: got {got}, cap {cap}"
+        );
+        changed |= (got - raw).abs() > TOLERANCE;
+    }
+    assert!(
+        changed,
+        "softcap test must prove at least one logit changed"
+    );
 }
 
 #[test]

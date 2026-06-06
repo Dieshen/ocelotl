@@ -88,8 +88,8 @@ impl Gemma4Config {
 
     /// Return `Ok(())` only for the explicitly supported MF.7 text-forward
     /// subset. Real Gemma4 GGUF artifacts still fail here because they carry
-    /// multimodal, sliding-window/shared-KV, softcap, and quantized-origin
-    /// features whose execution semantics are not implemented yet.
+    /// multimodal, sliding-window/shared-KV, and quantized-origin features
+    /// whose execution semantics are not implemented yet.
     pub fn ensure_supported_for_text_forward(&self) -> Result<()> {
         let mut requested = Vec::new();
 
@@ -104,9 +104,6 @@ impl Gemma4Config {
         }
         if self.attention_sliding_window_pattern_len.is_some() {
             requested.push("sliding_window_pattern".to_string());
-        }
-        if self.final_logit_softcap.is_some() {
-            requested.push("final_logit_softcap".to_string());
         }
         if self.has_quantized_tensors {
             requested.push("quantized_tensors".to_string());
@@ -134,7 +131,7 @@ impl Gemma4Config {
             feature: "gemma4.text_forward_features".to_string(),
             requested: Some(requested.join(",")),
             supported: vec![
-                "text-only unquantized dense F32 synthetic subset with full attention and layer-specific SWA/global widths"
+                "text-only unquantized dense F32 synthetic subset with full attention, layer-specific SWA/global widths, and final logit softcap"
                     .to_string(),
             ],
         }))
@@ -874,6 +871,11 @@ impl Gemma4TextModel {
             (h, vocab),
             &mut logits,
         )?;
+        if let Some(cap) = cfg.final_logit_softcap {
+            for logit in &mut logits {
+                *logit = cap * (*logit / cap).tanh();
+            }
+        }
 
         Ok(logits)
     }
@@ -923,6 +925,9 @@ fn validate_gemma4_text_weight_config(config: &Gemma4Config) -> Result<()> {
         "gemma4.attention.layer_norm_rms_epsilon",
         config.rms_norm_eps,
     )?;
+    if let Some(value) = config.final_logit_softcap {
+        validate_finite_positive("gemma4.final_logit_softcapping", value)?;
+    }
 
     if config.attention_head_count % config.attention_head_count_kv != 0 {
         return Err(invalid(
@@ -2608,7 +2613,6 @@ mod tests {
                 assert!(requested.contains("multimodal"));
                 assert!(requested.contains("sliding_window_attention"));
                 assert!(requested.contains("shared_kv_layers"));
-                assert!(requested.contains("final_logit_softcap"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
             }
@@ -2663,11 +2667,37 @@ mod tests {
                 assert!(requested.contains("multimodal"));
                 assert!(requested.contains("sliding_window_attention"));
                 assert!(requested.contains("shared_kv_layers"));
-                assert!(requested.contains("final_logit_softcap"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
             }
             other => panic!("expected Unsupported for real Gemma4 text forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemma4_text_model_new_rejects_invalid_final_logit_softcap() {
+        let mut cfg = tiny_text_config();
+        cfg.final_logit_softcap = Some(0.0);
+        let weights = Gemma4TextWeights {
+            token_embd: Vec::new(),
+            layers: Vec::new(),
+            output_norm_w: Vec::new(),
+            lm_head_w: Vec::new(),
+            tie_word_embeddings: true,
+        };
+
+        let err = Gemma4TextModel::new(cfg, weights)
+            .expect_err("non-positive Gemma4 final logit softcap must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("gemma4.final_logit_softcapping")
+                );
+                assert!(invalid.message.contains("finite and > 0"));
+            }
+            other => panic!("expected InvalidModel for invalid softcap, got {other:?}"),
         }
     }
 
