@@ -172,6 +172,92 @@ pub(crate) fn scaled_dot_product_attention_optimized(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn scaled_dot_product_attention_windowed(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention_windowed(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        sliding_window,
+        out,
+    )?;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0_f32; sliding_window.min(seq_len)];
+    scaled_dot_product_attention_windowed_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        sliding_window,
+        scale,
+        &mut scores,
+        out,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_windowed_optimized(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention_windowed(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        sliding_window,
+        out,
+    )?;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0_f32; sliding_window.min(seq_len)];
+    scaled_dot_product_attention_windowed_optimized_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        sliding_window,
+        scale,
+        &mut scores,
+        out,
+    );
+    Ok(())
+}
+
 /// Scalar SDPA compute body. Inputs are assumed pre-validated. Writes the
 /// output rows for query positions `i_start..i_end` into `out_chunk`, which
 /// must be exactly `(i_end - i_start) * num_q_heads * head_dim` long. Reads
@@ -225,6 +311,58 @@ pub(crate) fn scaled_dot_product_attention_compute(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_windowed_compute(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    i_start: usize,
+    i_end: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    group_size: usize,
+    sliding_window: usize,
+    scale: f32,
+    scores: &mut [f32],
+    out_chunk: &mut [f32],
+) {
+    for i in i_start..i_end {
+        let out_row_base = (i - i_start) * num_q_heads * head_dim;
+        let visible_end = i.saturating_add(1);
+        let visible_start = visible_end.saturating_sub(sliding_window);
+        let visible_len = visible_end - visible_start;
+        for h in 0..num_q_heads {
+            let kh = h / group_size;
+
+            let q_base = (i * num_q_heads + h) * head_dim;
+            for (offset, score) in scores.iter_mut().enumerate().take(visible_len) {
+                let j = visible_start + offset;
+                let mut acc = 0.0_f32;
+                let k_base = (j * num_kv_heads + kh) * head_dim;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+
+            softmax(&mut scores[..visible_len]);
+
+            let out_base = out_row_base + h * head_dim;
+            for d in 0..head_dim {
+                out_chunk[out_base + d] = 0.0_f32;
+            }
+            for (offset, &p) in scores.iter().enumerate().take(visible_len) {
+                let j = visible_start + offset;
+                let v_base = (j * num_kv_heads + kh) * head_dim;
+                for d in 0..head_dim {
+                    out_chunk[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+}
+
 /// Optimized SDPA compute body (rows borrowed into `&[f32]` once per head;
 /// otherwise identical accumulation order to the scalar path).
 #[allow(clippy::too_many_arguments)]
@@ -265,6 +403,60 @@ pub(crate) fn scaled_dot_product_attention_optimized_compute(
             let out_row = &mut out_chunk[out_base..out_base + head_dim];
             out_row.fill(0.0);
             for (j, &p) in scores.iter().enumerate().take(i + 1) {
+                let v_base = (j * num_kv_heads + kh) * head_dim;
+                let v_row = &v[v_base..v_base + head_dim];
+                for d in 0..head_dim {
+                    out_row[d] += p * v_row[d];
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_windowed_optimized_compute(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    i_start: usize,
+    i_end: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    group_size: usize,
+    sliding_window: usize,
+    scale: f32,
+    scores: &mut [f32],
+    out_chunk: &mut [f32],
+) {
+    for i in i_start..i_end {
+        let out_row_base = (i - i_start) * num_q_heads * head_dim;
+        let visible_end = i.saturating_add(1);
+        let visible_start = visible_end.saturating_sub(sliding_window);
+        let visible_len = visible_end - visible_start;
+        for h in 0..num_q_heads {
+            let kh = h / group_size;
+            let q_base = (i * num_q_heads + h) * head_dim;
+            let q_row = &q[q_base..q_base + head_dim];
+
+            for (offset, score) in scores.iter_mut().enumerate().take(visible_len) {
+                let j = visible_start + offset;
+                let k_base = (j * num_kv_heads + kh) * head_dim;
+                let k_row = &k[k_base..k_base + head_dim];
+                let mut acc = 0.0_f32;
+                for d in 0..head_dim {
+                    acc += q_row[d] * k_row[d];
+                }
+                *score = acc * scale;
+            }
+
+            softmax(&mut scores[..visible_len]);
+
+            let out_base = out_row_base + h * head_dim;
+            let out_row = &mut out_chunk[out_base..out_base + head_dim];
+            out_row.fill(0.0);
+            for (offset, &p) in scores.iter().enumerate().take(visible_len) {
+                let j = visible_start + offset;
                 let v_base = (j * num_kv_heads + kh) * head_dim;
                 let v_row = &v[v_base..v_base + head_dim];
                 for d in 0..head_dim {
@@ -460,6 +652,35 @@ fn validate_scaled_dot_product_attention(
     Ok(num_q_heads / num_kv_heads)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_scaled_dot_product_attention_windowed(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    out: &[f32],
+) -> Result<usize> {
+    if sliding_window == 0 {
+        return Err(kernel_err(
+            "scaled_dot_product_attention_windowed sliding_window must be non-zero".to_string(),
+        ));
+    }
+    validate_scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        out,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +854,67 @@ mod tests {
                 "causal-mask attention mismatch at position {idx}: got {got}, want {want}"
             );
         }
+    }
+
+    #[test]
+    fn sliding_window_mask_excludes_old_prefix_positions() {
+        let seq_len = 4_usize;
+        let head_dim = 1_usize;
+
+        let q = [1.0_f32, 1.0, 1.0, 1.0];
+        let k = [0.0_f32, 0.0, 0.0, 0.0];
+        let v = [1.0_f32, 100.0, 10.0, 20.0];
+        let mut out = [0.0_f32; 4];
+
+        scaled_dot_product_attention_windowed(&q, &k, &v, seq_len, 1, 1, head_dim, 2, &mut out)
+            .expect("well-formed sliding-window attention call must succeed");
+
+        let expected = [1.0_f32, 50.5, 55.0, 15.0];
+        let tol = 5.0e-6_f32;
+        for (idx, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < tol,
+                "sliding-window attention mismatch at position {idx}: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn sliding_window_larger_than_sequence_matches_full_causal_attention() {
+        let seq_len = 3_usize;
+        let head_dim = 2_usize;
+        let q = [1.0_f32, 0.0, 0.0, 1.0, 0.25, 0.75];
+        let k = [1.0_f32, 0.0, 0.5, 0.5, -1.0, 1.0];
+        let v = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut full = [0.0_f32; 6];
+        let mut windowed = [0.0_f32; 6];
+
+        scaled_dot_product_attention(&q, &k, &v, seq_len, 1, 1, head_dim, &mut full)
+            .expect("full causal attention must succeed");
+        scaled_dot_product_attention_windowed(
+            &q,
+            &k,
+            &v,
+            seq_len,
+            1,
+            1,
+            head_dim,
+            99,
+            &mut windowed,
+        )
+        .expect("oversized sliding window must succeed");
+
+        assert_eq!(full, windowed);
+    }
+
+    #[test]
+    fn sliding_window_rejects_zero_window() {
+        let (q, k, v, mut out) = valid_args();
+
+        let err = scaled_dot_product_attention_windowed(&q, &k, &v, 2, 1, 1, 2, 0, &mut out)
+            .expect_err("zero sliding window must fail");
+
+        assert_kernel_err_contains(err, "sliding_window");
     }
 
     // --- Validation tests (launch boundary) ---

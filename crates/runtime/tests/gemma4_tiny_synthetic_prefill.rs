@@ -2,9 +2,9 @@
 //!
 //! This test is intentionally narrower than the selected real Gemma4 Q4_K_M
 //! artifact. It pins the first supported execution subset: text-only, dense
-//! F32 weights, no multimodal inputs, and no sliding-window/shared-KV
-//! attention. The real GGUF artifact remains rejected until those features,
-//! quantized-origin execution, and reference parity are complete.
+//! F32 weights, no multimodal inputs, and no shared-KV attention. The real
+//! GGUF artifact remains rejected until those features, quantized-origin
+//! execution, and reference parity are complete.
 
 use ocelotl_core::{OcelotlError, TokenId};
 use ocelotl_models::gemma::{
@@ -14,6 +14,7 @@ use ocelotl_runtime::gemma::{decode_one_token, prefill};
 
 const FIXTURE_PATH: &str = "../../fixtures/logits/gemma4_tiny_synthetic_text_prefill.json";
 const TOLERANCE: f32 = 1.0e-4;
+const SLIDING_WINDOW_DRIFT_TOLERANCE: f32 = 1.0e-8;
 
 fn synth(seed: u32, len: usize) -> Vec<f32> {
     (0..len)
@@ -199,6 +200,34 @@ fn gemma4_prefill_applies_final_logit_softcap_through_runtime_path() {
     assert!(
         changed,
         "softcap test must prove at least one logit changed"
+    );
+}
+
+#[test]
+fn gemma4_prefill_applies_sliding_window_mask_through_runtime_path() {
+    let fixture = load_fixture();
+    let prompt: Vec<TokenId> = fixture.prompt_tokens.iter().copied().map(TokenId).collect();
+    let full_model = tiny_model();
+
+    let mut cfg = tiny_config();
+    cfg.attention_sliding_window = Some(1);
+    let windowed_model = Gemma4TextModel::new(cfg.clone(), tiny_weights(&cfg))
+        .expect("sliding-window tiny Gemma4 text model must build");
+
+    let full_logits = prefill(&full_model, &prompt).expect("full Gemma4 prefill must succeed");
+    let windowed_logits =
+        prefill(&windowed_model, &prompt).expect("windowed Gemma4 prefill must succeed");
+
+    assert_eq!(windowed_logits.len(), fixture.expected_logits.len());
+    assert!(windowed_logits.iter().all(|value| value.is_finite()));
+    let max_diff = full_logits
+        .iter()
+        .zip(windowed_logits.iter())
+        .map(|(full, windowed)| (full - windowed).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_diff > SLIDING_WINDOW_DRIFT_TOLERANCE,
+        "sliding-window mask must produce a distinct output on the tripwire prompt; max diff {max_diff}"
     );
 }
 

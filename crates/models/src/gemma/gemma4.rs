@@ -88,16 +88,13 @@ impl Gemma4Config {
 
     /// Return `Ok(())` only for the explicitly supported MF.7 text-forward
     /// subset. Real Gemma4 GGUF artifacts still fail here because they carry
-    /// multimodal, sliding-window/shared-KV, and quantized-origin features
-    /// whose execution semantics are not implemented yet.
+    /// multimodal, sliding-window pattern/shared-KV, and quantized-origin
+    /// features whose execution semantics are not implemented yet.
     pub fn ensure_supported_for_text_forward(&self) -> Result<()> {
         let mut requested = Vec::new();
 
         if self.multimodal {
             requested.push("multimodal".to_string());
-        }
-        if self.attention_sliding_window.is_some() {
-            requested.push("sliding_window_attention".to_string());
         }
         if self.attention_shared_kv_layers.is_some() {
             requested.push("shared_kv_layers".to_string());
@@ -131,7 +128,7 @@ impl Gemma4Config {
             feature: "gemma4.text_forward_features".to_string(),
             requested: Some(requested.join(",")),
             supported: vec![
-                "text-only unquantized dense F32 synthetic subset with full attention, layer-specific SWA/global widths, and final logit softcap"
+                "text-only unquantized dense F32 synthetic subset with full or sliding-window causal attention, layer-specific SWA/global widths, and final logit softcap"
                     .to_string(),
             ],
         }))
@@ -814,16 +811,33 @@ impl Gemma4TextModel {
                 )?;
             }
 
-            self.kernels.scaled_dot_product_attention(
-                &q_norm_buf,
-                &k_norm_buf,
-                &v_buf,
-                seq,
-                q_heads,
-                kv_heads,
-                head_dim,
-                &mut attn_out,
-            )?;
+            if let Some(sliding_window) = cfg
+                .attention_sliding_window
+                .filter(|_| !gemma4_uses_global_attention(layer_idx))
+            {
+                self.kernels.scaled_dot_product_attention_windowed(
+                    &q_norm_buf,
+                    &k_norm_buf,
+                    &v_buf,
+                    seq,
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                    sliding_window,
+                    &mut attn_out,
+                )?;
+            } else {
+                self.kernels.scaled_dot_product_attention(
+                    &q_norm_buf,
+                    &k_norm_buf,
+                    &v_buf,
+                    seq,
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                    &mut attn_out,
+                )?;
+            }
 
             self.kernels.matmul(
                 &attn_out,
@@ -913,6 +927,9 @@ fn validate_gemma4_text_weight_config(config: &Gemma4Config) -> Result<()> {
         "gemma4.attention.value_length_swa",
         config.attention_value_length_swa,
     )?;
+    if let Some(value) = config.attention_sliding_window {
+        validate_positive("gemma4.attention.sliding_window", value)?;
+    }
     validate_positive("gemma4.rope.dimension_count", config.rope_dimension_count)?;
     validate_positive(
         "gemma4.rope.dimension_count_swa",
@@ -2611,7 +2628,7 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("sliding_window_attention"));
+                assert!(requested.contains("sliding_window_pattern"));
                 assert!(requested.contains("shared_kv_layers"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
@@ -2665,7 +2682,7 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("sliding_window_attention"));
+                assert!(requested.contains("sliding_window_pattern"));
                 assert!(requested.contains("shared_kv_layers"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));

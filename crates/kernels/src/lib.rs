@@ -128,6 +128,32 @@ pub trait KernelBackend: Debug + Send + Sync {
         out: &mut [f32],
     ) -> Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention_windowed(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        attention::scaled_dot_product_attention_windowed(
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window,
+            out,
+        )
+    }
+
     fn rope_apply_inplace(
         &self,
         x: &mut [f32],
@@ -2007,6 +2033,47 @@ impl CpuKernelBackend {
             }
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scaled_dot_product_attention_windowed(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        match self.mode {
+            CpuKernelMode::Scalar => attention::scaled_dot_product_attention_windowed(
+                q,
+                k,
+                v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                sliding_window,
+                out,
+            ),
+            CpuKernelMode::Optimized | CpuKernelMode::Avx2 => {
+                attention::scaled_dot_product_attention_windowed_optimized(
+                    q,
+                    k,
+                    v,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    sliding_window,
+                    out,
+                )
+            }
+        }
+    }
 }
 
 impl KernelBackend for CpuKernelBackend {
@@ -2077,6 +2144,33 @@ impl KernelBackend for CpuKernelBackend {
             num_q_heads,
             num_kv_heads,
             head_dim,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention_windowed(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        CpuKernelBackend::scaled_dot_product_attention_windowed(
+            self,
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window,
             out,
         )
     }
