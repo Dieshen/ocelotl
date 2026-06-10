@@ -732,6 +732,10 @@ impl Gemma4TextModel {
             let dst = pos * h;
             hidden[dst..dst + h].copy_from_slice(&self.weights.token_embd[src..src + h]);
         }
+        let embedding_scale = (h as f32).sqrt();
+        for value in &mut hidden {
+            *value *= embedding_scale;
+        }
 
         let mut norm_buf = vec![0.0_f32; seq * h];
         let mut o_buf = vec![0.0_f32; seq * h];
@@ -1918,6 +1922,135 @@ mod tests {
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
 
+    #[derive(Debug)]
+    struct CaptureFirstRmsnormBackend {
+        context: ocelotl_kernels::KernelContext,
+        first_input: std::sync::Mutex<Option<Vec<f32>>>,
+    }
+
+    impl CaptureFirstRmsnormBackend {
+        fn new() -> Self {
+            Self {
+                context: ocelotl_kernels::KernelContext {
+                    device: ocelotl_core::Device::Cpu,
+                },
+                first_input: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn captured_input(&self) -> Option<Vec<f32>> {
+            self.first_input.lock().unwrap().clone()
+        }
+    }
+
+    impl KernelBackend for CaptureFirstRmsnormBackend {
+        fn name(&self) -> &'static str {
+            "capture-first-rmsnorm"
+        }
+
+        fn context(&self) -> &ocelotl_kernels::KernelContext {
+            &self.context
+        }
+
+        fn matmul(
+            &self,
+            _a: &[f32],
+            _a_shape: (usize, usize),
+            _b: &[f32],
+            _b_shape: (usize, usize),
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(capture_backend_error("matmul should not run in this test"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn linear_out_by_in(
+            &self,
+            _x: &[f32],
+            _rows: usize,
+            _in_features: usize,
+            _weight_out_by_in: &[f32],
+            _out_features: usize,
+            _bias: Option<&[f32]>,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(capture_backend_error(
+                "linear_out_by_in should not run in this test",
+            ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn scaled_dot_product_attention(
+            &self,
+            _q: &[f32],
+            _k: &[f32],
+            _v: &[f32],
+            _seq_len: usize,
+            _num_q_heads: usize,
+            _num_kv_heads: usize,
+            _head_dim: usize,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(capture_backend_error(
+                "attention should not run in this test",
+            ))
+        }
+
+        fn rope_apply_inplace(
+            &self,
+            _x: &mut [f32],
+            _head_dim: usize,
+            _position: usize,
+            _theta: f32,
+        ) -> Result<()> {
+            Err(capture_backend_error("rope should not run in this test"))
+        }
+
+        fn rmsnorm(
+            &self,
+            x: &[f32],
+            _rows: usize,
+            _hidden: usize,
+            _weight: &[f32],
+            _epsilon: f32,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            let mut first_input = self.first_input.lock().unwrap();
+            if first_input.is_none() {
+                *first_input = Some(x.to_vec());
+            }
+            Err(capture_backend_error("captured first rmsnorm input"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn mlp_gated_silu(
+            &self,
+            _x: &[f32],
+            _rows: usize,
+            _hidden: usize,
+            _intermediate: usize,
+            _gate_w: &[f32],
+            _up_w: &[f32],
+            _down_w: &[f32],
+            _gate_buf: &mut [f32],
+            _up_buf: &mut [f32],
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(capture_backend_error("mlp should not run in this test"))
+        }
+
+        fn vec_add(&self, _a: &[f32], _b: &[f32], _out: &mut [f32]) -> Result<()> {
+            Err(capture_backend_error("vec_add should not run in this test"))
+        }
+    }
+
+    fn capture_backend_error(message: &str) -> OcelotlError {
+        OcelotlError::Kernel(ocelotl_core::KernelError {
+            backend: "capture-first-rmsnorm".to_string(),
+            message: message.to_string(),
+        })
+    }
+
     #[derive(Debug, Deserialize)]
     struct Gemma4Fixture {
         gguf: Gemma4FixtureGguf,
@@ -2808,6 +2941,42 @@ mod tests {
             }
             other => panic!("expected InvalidModel for missing text tensor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gemma4_text_prefill_scales_token_embeddings_before_first_block() {
+        let cfg = tiny_text_config();
+        let h = cfg.embedding_length;
+        let weights =
+            Gemma4TextWeights::from_loaded_tensors(&cfg, complete_text_loaded_tensors(&cfg))
+                .expect("tiny Gemma4 text tensors must map into weights");
+        let token = TokenId(2);
+        let token_start = token.0 as usize * h;
+        let expected: Vec<f32> = weights.token_embd[token_start..token_start + h]
+            .iter()
+            .map(|value| value * (h as f32).sqrt())
+            .collect();
+        let backend = std::sync::Arc::new(CaptureFirstRmsnormBackend::new());
+        let model = Gemma4TextModel::with_kernel_backend(cfg, weights, backend.clone())
+            .expect("capture-backed Gemma4 model must construct");
+
+        let err = model
+            .prefill(&[token])
+            .expect_err("capture backend stops after the first RMSNorm input");
+
+        match err {
+            OcelotlError::Kernel(kernel) => {
+                assert_eq!(kernel.backend, "capture-first-rmsnorm");
+                assert!(kernel.message.contains("captured first rmsnorm input"));
+            }
+            other => panic!("expected capture backend Kernel error, got {other:?}"),
+        }
+        assert_eq!(
+            backend
+                .captured_input()
+                .expect("first RMSNorm input must be captured"),
+            expected
+        );
     }
 
     #[test]

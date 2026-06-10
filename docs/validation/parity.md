@@ -199,6 +199,15 @@ materialization of the required Q4_K_M-origin text tensors.
   `ocelotl_runtime::gemma::prefill`, and compares every final-position logit
   against llama.cpp.
 
+Current status: the latest local proof run after the embedding-scale fix on
+2026-06-10 completed the llama.cpp side and Ocelotl side against llama.cpp
+`856c3adac1709be15e1ea2529a0e89f742d25fe0`, but parity is still red. It failed
+at token 0 with `Ocelotl 4.8630633`, llama.cpp `-18.2152`, diff `23.078264`.
+The first fixed semantic gap from the full-proof work is llama.cpp-style
+`sqrt(hidden)` token embedding scaling before the first Gemma4 block; the
+remaining text decoder operations still need parity work before this proof can
+pass.
+
 The `0.05` tolerance is deliberately wider than the synthetic `1e-4` fixture
 because this compares Ocelotl's eagerly dequantized F32 path against llama.cpp's
 GGML Q4_K_M execution path on a 42-layer real artifact. Tighten it only after a

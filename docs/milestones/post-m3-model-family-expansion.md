@@ -150,6 +150,14 @@ Gemma4:
   Ocelotl's configured-BOS GGUF path, clears `Gemma4Config.multimodal` only for
   this text-only harness, loads dequantized F32 text weights, and compares
   every final-position logit through `ocelotl_runtime::gemma::prefill`.
+  The latest local run after the embedding-scale fix on 2026-06-10 proved the
+  harness works but parity is still red: token 0 differed by `23.078264`
+  against llama.cpp
+  `856c3adac1709be15e1ea2529a0e89f742d25fe0`.
+- A follow-up Gemma4 text semantics slice applies llama.cpp-style
+  `sqrt(hidden)` token embedding scaling before the first block and pins it
+  with a model-level activation-boundary test. This is the first closed drift
+  item from the failed real-artifact logits proof, not the end of MF.8 parity.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

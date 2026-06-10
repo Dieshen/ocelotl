@@ -191,6 +191,11 @@ and does not modify the closed M3.6 MLP task.
   path. Raw quantized loaded tensors still reject before compute. The selected
   real Q4_K_M artifact remains blocked on multimodal handling and reference
   parity.
+- `Follow-up`: Gemma4 token embedding scaling landed 2026-06-10.
+  `Gemma4TextModel::prefill` now applies llama.cpp-style `sqrt(hidden)`
+  scaling to token embeddings before the first block, and
+  `gemma4_text_prefill_scales_token_embeddings_before_first_block` pins that
+  activation boundary before attention or MLP compute can hide it.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 
@@ -209,6 +214,12 @@ and does not modify the closed M3.6 MLP task.
   text-only path by clearing `multimodal`, loads required tensors through
   `load_gemma4_dequantized_tensors_from_gguf`, and compares every
   final-position logit through `ocelotl_runtime::gemma::prefill`.
+- `Status`: latest local proof run after the embedding-scale fix completed on
+  2026-06-10 against llama.cpp
+  `856c3adac1709be15e1ea2529a0e89f742d25fe0`, but parity is still red. The
+  run failed at output token 0 (`Ocelotl 4.8630633`, llama.cpp `-18.2152`,
+  diff `23.078264`). The harness is now useful as a drift detector; remaining
+  Gemma4 text semantics still need to be brought in before MF.8 can close.
 
 ## Track Closure
 
