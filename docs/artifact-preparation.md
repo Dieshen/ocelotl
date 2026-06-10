@@ -307,6 +307,39 @@ setting. For prompt fixtures with shell-sensitive whitespace, escapes, or
 chat-template output, prefer a future file/stdin-backed fixture rather than a
 literal `--prompt` command.
 
+MF.8 adds an opt-in Gemma4 logits reference harness. It uses the same selected
+GGUF artifact, but needs a llama.cpp `examples/debug` binary (`llama-debug`) in
+addition to the tokenizer tool. The fixture that documents the prompt, BOS
+policy, selected probe IDs, tolerance, and command shape is:
+
+```text
+fixtures/logits/gemma4_q4_k_m_basic_prompt_logits_reference.json
+```
+
+Build llama.cpp at the pinned reference revision named in that fixture, then
+run:
+
+```powershell
+$env:OCELOTL_GEMMA4_GGUF_PATH="D:\path\to\google_gemma-4-E4B-it-Q4_K_M.gguf"
+$env:OCELOTL_LLAMA_DEBUG_PATH="D:\path\to\llama-debug.exe"
+cargo test -p ocelotl local_gemma4_q4_k_m_prefill_logits_match_llama_cpp_debug -- --ignored --nocapture
+```
+
+The harness invokes:
+
+```powershell
+llama-debug --model <model.gguf> --prompt "Hello" --no-escape --save-logits --logits-output-dir <temp-dir>
+```
+
+`llama-debug` writes the full final-token logits vector to
+`llamacpp-<model-stem>.txt` in the temporary output directory. Ocelotl parses
+that file, tokenizes `Hello` with the GGUF configured-BOS path, loads the GGUF
+through `load_gemma4_dequantized_tensors_from_gguf`, clears
+`Gemma4Config.multimodal` only for this text-only harness, runs
+`Gemma4TextModel` through `ocelotl_runtime::gemma::prefill`, and compares every
+final-position logit within the fixture tolerance. This is an eager-dequant F32
+text-decoder parity proof, not an audio/image/video multimodal proof.
+
 ## 6. Keeping Artifacts Out Of Git
 
 `local-artifacts/` is listed in `.gitignore`. This is intentional and

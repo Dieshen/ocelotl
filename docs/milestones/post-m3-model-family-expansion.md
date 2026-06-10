@@ -142,6 +142,14 @@ Gemma4:
   quantization metadata. Raw quantized loaded tensors remain rejected by the
   dequantized tensor validator. The selected real artifact remains blocked on
   multimodal handling and real-artifact logits parity.
+- A follow-up real-artifact logits harness slice adds an MF.8 opt-in
+  llama.cpp reference proof for the selected Gemma4 Q4_K_M GGUF. The default
+  suite validates the small logits-reference fixture and `llama-debug
+  --save-logits` command schema. The ignored local test runs llama.cpp to emit
+  the full final-token logits vector for `Hello`, tokenizes the same prompt with
+  Ocelotl's configured-BOS GGUF path, clears `Gemma4Config.multimodal` only for
+  this text-only harness, loads dequantized F32 text weights, and compares
+  every final-position logit through `ocelotl_runtime::gemma::prefill`.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

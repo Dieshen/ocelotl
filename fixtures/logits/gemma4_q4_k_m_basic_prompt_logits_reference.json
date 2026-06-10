@@ -1,0 +1,21 @@
+{
+  "fixture_version": 1,
+  "name": "gemma4_q4_k_m_basic_prompt_logits_reference",
+  "source": "bartowski/google_gemma-4-E4B-it-GGUF google_gemma-4-E4B-it-Q4_K_M.gguf at revision c04cb322fd63e347db759a08b6249b867488ccf8; final-token logits reference is produced by llama.cpp examples/debug with --save-logits.",
+  "input": "Hello",
+  "token_ids": [2, 9259],
+  "selected_logit_token_ids": [0, 1, 2, 9259, 262143],
+  "tolerance": 0.05,
+  "reference_status": "Live opt-in llama.cpp reference harness. The repository does not commit the full 262k-logit dump; the ignored test runs llama-debug locally, parses the full final-token logits vector, and compares every Ocelotl dequantized text-path logit against those values.",
+  "llama_cpp_reference": {
+    "tool": "llama-debug",
+    "revision": "856c3adac1709be15e1ea2529a0e89f742d25fe0 (describe b9127-1-g856c3adac)",
+    "source": "ggml-org/llama.cpp examples/debug; llama-debug evaluates the prompt, then --save-logits writes the final-token logits to llamacpp-<model-stem>.txt in the selected output directory.",
+    "command": ["llama-debug", "--model", "<model.gguf>", "--prompt", "Hello", "--no-escape", "--save-logits", "--logits-output-dir", "<output-dir>"]
+  },
+  "ocelotl_reference": {
+    "command": "OCELOTL_GEMMA4_GGUF_PATH=<model.gguf> OCELOTL_LLAMA_DEBUG_PATH=<llama-debug> cargo test -p ocelotl local_gemma4_q4_k_m_prefill_logits_match_llama_cpp_debug -- --ignored --nocapture",
+    "notes": "The Ocelotl side tokenizes with the GGUF tokenizer configured-BOS path, clears Gemma4Config.multimodal for this text-only harness, loads required tensors with load_gemma4_dequantized_tensors_from_gguf, builds Gemma4TextModel, and compares the full final-position logits vector."
+  },
+  "regeneration": "Build llama.cpp examples/debug at the pinned revision, set OCELOTL_GEMMA4_GGUF_PATH and OCELOTL_LLAMA_DEBUG_PATH, then run the ignored local parity test. If the selected artifact, prompt, tokenizer, llama.cpp revision, selected token IDs, or tolerance changes, update this fixture plus docs/validation/parity.md, docs/artifact-preparation.md, and docs/validation/test-matrix.md together."
+}

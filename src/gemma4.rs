@@ -56,16 +56,24 @@ fn tokenizer_error(message: impl Into<String>) -> OcelotlError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
         path::{Path, PathBuf},
         process::Command,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
+    use ocelotl_models::gemma::{
+        Gemma4TextModel, Gemma4TextWeights, load_gemma4_dequantized_tensors_from_gguf,
+    };
+    use ocelotl_runtime::gemma::prefill;
     use ocelotl_tokenizer::Tokenizer;
     use serde::Deserialize;
 
     use super::*;
 
     const GEMMA4_GGUF_REVISION: &str = "c04cb322fd63e347db759a08b6249b867488ccf8";
+    const GEMMA4_LOGITS_FIXTURE_NAME: &str = "gemma4_q4_k_m_basic_prompt_logits_reference";
 
     #[derive(Debug, Deserialize)]
     struct Gemma4TokenizerFixture {
@@ -89,6 +97,35 @@ mod tests {
         configured_bos_command: Vec<String>,
         expected_stdout_token_ids: Vec<u32>,
         expected_stdout_with_bos_token_ids: Vec<u32>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Gemma4LogitsReferenceFixture {
+        fixture_version: u32,
+        name: String,
+        source: String,
+        input: String,
+        token_ids: Vec<u32>,
+        selected_logit_token_ids: Vec<u32>,
+        tolerance: f32,
+        reference_status: String,
+        llama_cpp_reference: LlamaCppLogitsReference,
+        ocelotl_reference: OcelotlLogitsReference,
+        regeneration: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LlamaCppLogitsReference {
+        tool: String,
+        revision: String,
+        source: String,
+        command: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OcelotlLogitsReference {
+        command: String,
+        notes: String,
     }
 
     fn tiny_metadata() -> GgufTokenizerMetadata {
@@ -138,8 +175,23 @@ mod tests {
             .join("gemma4_gguf_basic_prompt.json")
     }
 
+    fn gemma4_logits_fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("logits")
+            .join(format!("{GEMMA4_LOGITS_FIXTURE_NAME}.json"))
+    }
+
     fn load_gemma4_tokenizer_fixture() -> Gemma4TokenizerFixture {
         let path = gemma4_tokenizer_fixture_path();
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read fixture at {}: {err}", path.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|err| panic!("failed to parse fixture at {}: {err}", path.display()))
+    }
+
+    fn load_gemma4_logits_fixture() -> Gemma4LogitsReferenceFixture {
+        let path = gemma4_logits_fixture_path();
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("failed to read fixture at {}: {err}", path.display()));
         serde_json::from_str(&raw)
@@ -213,6 +265,95 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_q4_k_m_logits_reference_fixture_is_well_formed_and_populated() {
+        let fixture = load_gemma4_logits_fixture();
+
+        assert_eq!(fixture.fixture_version, 1);
+        assert_eq!(fixture.name, GEMMA4_LOGITS_FIXTURE_NAME);
+        assert!(
+            fixture.source.contains(GEMMA4_GGUF_REVISION),
+            "Gemma4 logits fixture must reference pinned GGUF revision {GEMMA4_GGUF_REVISION}"
+        );
+        assert_eq!(
+            fixture.input, "Hello",
+            "logits fixture must stay aligned with the tokenizer fixture prompt"
+        );
+        assert_eq!(
+            fixture.token_ids,
+            vec![2, 9259],
+            "logits fixture must pin configured-BOS token IDs for the prompt"
+        );
+        assert!(
+            !fixture.selected_logit_token_ids.is_empty(),
+            "selected_logit_token_ids must not be empty"
+        );
+        let unique: BTreeSet<u32> = fixture.selected_logit_token_ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            fixture.selected_logit_token_ids.len(),
+            "selected_logit_token_ids must be unique"
+        );
+        assert!(
+            fixture
+                .selected_logit_token_ids
+                .iter()
+                .all(|token| *token < 262_144),
+            "selected Gemma4 logit IDs must fit the pinned artifact vocab"
+        );
+        assert!(
+            fixture.tolerance.is_finite() && fixture.tolerance > 0.0 && fixture.tolerance <= 0.05,
+            "Gemma4 logits tolerance must be finite, positive, and explicit"
+        );
+        assert!(
+            fixture.reference_status.contains("llama.cpp"),
+            "fixture must describe the llama.cpp reference state"
+        );
+        assert_eq!(fixture.llama_cpp_reference.tool, "llama-debug");
+        assert!(
+            fixture.llama_cpp_reference.revision.contains("856c3ad"),
+            "fixture must record the pinned llama.cpp reference revision"
+        );
+        assert!(
+            fixture
+                .llama_cpp_reference
+                .source
+                .contains("examples/debug"),
+            "fixture must name llama.cpp examples/debug as the logits source"
+        );
+        assert!(
+            fixture
+                .llama_cpp_reference
+                .command
+                .iter()
+                .any(|arg| arg == "--save-logits"),
+            "llama.cpp logits reference command must save logits"
+        );
+        assert!(
+            fixture
+                .llama_cpp_reference
+                .command
+                .iter()
+                .any(|arg| arg == "--logits-output-dir"),
+            "llama.cpp logits reference command must choose an output directory"
+        );
+        assert!(
+            fixture
+                .ocelotl_reference
+                .command
+                .contains("cargo test -p ocelotl"),
+            "fixture must name the Ocelotl ignored parity command"
+        );
+        assert!(
+            fixture.ocelotl_reference.notes.contains("multimodal"),
+            "fixture notes must document the text-only multimodal projection"
+        );
+        assert!(
+            fixture.regeneration.contains("docs/validation/parity.md"),
+            "fixture regeneration notes must name the parity docs"
+        );
+    }
+
+    #[test]
     fn llama_tokenize_ids_parser_accepts_python_style_id_list() {
         assert_eq!(
             parse_llama_tokenize_ids(b" [2, 9259]\r\n").expect("ID list should parse"),
@@ -226,6 +367,38 @@ mod tests {
             .expect_err("non-list llama-tokenize output must reject");
 
         assert!(err.contains("missing '['"), "unexpected parse error: {err}");
+    }
+
+    #[test]
+    fn llama_debug_logits_parser_extracts_selected_token_values() {
+        let parsed =
+            parse_llama_debug_selected_logits_text("0: -1.25\n1: 0.5\n9259: 3.75\n", &[9259, 0])
+                .expect("selected llama-debug logits should parse");
+
+        assert_eq!(parsed.get(&0), Some(&-1.25));
+        assert_eq!(parsed.get(&9259), Some(&3.75));
+    }
+
+    #[test]
+    fn llama_debug_logits_parser_rejects_missing_selected_token() {
+        let err = parse_llama_debug_selected_logits_text("0: -1.25\n", &[0, 2])
+            .expect_err("missing selected token must reject");
+
+        assert!(
+            err.contains("missing selected logit token id 2"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn llama_debug_logits_parser_rejects_non_contiguous_full_vector() {
+        let err = parse_llama_debug_logits_text("0: -1.25\n2: 0.5\n")
+            .expect_err("non-contiguous full llama-debug logits must reject");
+
+        assert!(
+            err.contains("expected token id 1"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]
@@ -393,6 +566,84 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires Gemma4 GGUF plus OCELOTL_LLAMA_DEBUG_PATH or local-artifacts/llama_cpp/llama-debug.exe; see docs/artifact-preparation.md"]
+    fn local_gemma4_q4_k_m_prefill_logits_match_llama_cpp_debug() {
+        let model_path = local_gemma4_gguf_path();
+        assert!(
+            model_path.exists(),
+            "missing Gemma4 GGUF at {}; see docs/artifact-preparation.md",
+            model_path.display()
+        );
+        let llama_debug = local_llama_debug_path();
+        assert!(
+            llama_debug.exists(),
+            "missing llama-debug at {}; set OCELOTL_LLAMA_DEBUG_PATH or see docs/artifact-preparation.md",
+            llama_debug.display()
+        );
+
+        let fixture = load_gemma4_logits_fixture();
+        let tokenizer = load_gemma4_gguf_tokenizer(&model_path)
+            .expect("local Gemma4 GGUF tokenizer must build");
+        let tokens = tokenizer
+            .encode_with_configured_bos(&fixture.input)
+            .expect("Gemma4 GGUF tokenizer must encode logits fixture prompt");
+        let token_ids: Vec<u32> = tokens.iter().map(|token| token.0).collect();
+        assert_eq!(
+            token_ids, fixture.token_ids,
+            "Ocelotl tokenization must match the logits fixture before comparing logits"
+        );
+
+        let output_dir = unique_llama_debug_output_dir();
+        let llama_logits =
+            run_llama_debug_logits(&llama_debug, &model_path, &fixture.input, &output_dir);
+        let _ = fs::remove_dir_all(&output_dir);
+
+        let (mut config, tensors) = load_gemma4_dequantized_tensors_from_gguf(&model_path)
+            .expect("local Gemma4 GGUF tensors must load through explicit F32 dequantization");
+        assert!(
+            config.multimodal,
+            "selected real Gemma4 artifact should still be recorded as multimodal"
+        );
+        config.multimodal = false;
+        let weights = Gemma4TextWeights::from_loaded_tensors(&config, tensors)
+            .expect("dequantized local Gemma4 tensors must map into text weights");
+        let model = Gemma4TextModel::new(config, weights)
+            .expect("text-projected dequantized Gemma4 model must build");
+        let ocelotl_logits = prefill(&model, &tokens).expect("Gemma4 text prefill must run");
+        assert_eq!(
+            ocelotl_logits.len(),
+            model.config().tokenizer_token_count,
+            "Gemma4 prefill must return one final-position logit per token"
+        );
+        assert_eq!(
+            llama_logits.len(),
+            ocelotl_logits.len(),
+            "llama.cpp and Ocelotl must expose the same Gemma4 final-logit vector length"
+        );
+        for token_id in &fixture.selected_logit_token_ids {
+            assert!(
+                (*token_id as usize) < llama_logits.len(),
+                "selected fixture token id {token_id} must fit llama.cpp logits"
+            );
+        }
+
+        let mut max_diff = 0.0_f32;
+        let mut max_diff_token_id = 0_usize;
+        for (token_id, (got, want)) in ocelotl_logits.iter().zip(llama_logits.iter()).enumerate() {
+            let diff = (got - want).abs();
+            if diff > max_diff {
+                max_diff = diff;
+                max_diff_token_id = token_id;
+            }
+            assert!(
+                diff <= fixture.tolerance,
+                "Gemma4 logit token {token_id}: got {got}, llama.cpp {want}, diff {diff} exceeds tolerance {}; max diff so far token {max_diff_token_id} diff {max_diff}",
+                fixture.tolerance
+            );
+        }
+    }
+
     fn local_gemma4_gguf_path() -> PathBuf {
         if let Ok(path) = std::env::var("OCELOTL_GEMMA4_GGUF_PATH") {
             return PathBuf::from(path);
@@ -411,6 +662,21 @@ mod tests {
             "llama-tokenize.exe"
         } else {
             "llama-tokenize"
+        };
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("local-artifacts")
+            .join("llama_cpp")
+            .join(executable)
+    }
+
+    fn local_llama_debug_path() -> PathBuf {
+        if let Ok(path) = std::env::var("OCELOTL_LLAMA_DEBUG_PATH") {
+            return PathBuf::from(path);
+        }
+        let executable = if cfg!(windows) {
+            "llama-debug.exe"
+        } else {
+            "llama-debug"
         };
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("local-artifacts")
@@ -481,5 +747,192 @@ mod tests {
                     .map_err(|err| format!("invalid llama-tokenize token id {trimmed:?}: {err}"))
             })
             .collect()
+    }
+
+    fn unique_llama_debug_output_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ocelotl-gemma4-llama-debug-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn run_llama_debug_logits(
+        llama_debug: &Path,
+        model_path: &Path,
+        input: &str,
+        output_dir: &Path,
+    ) -> Vec<f32> {
+        fs::create_dir_all(output_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create llama-debug output dir {}: {err}",
+                output_dir.display()
+            )
+        });
+
+        let output = Command::new(llama_debug)
+            .arg("--model")
+            .arg(model_path)
+            .arg("--prompt")
+            .arg(input)
+            .arg("--no-escape")
+            .arg("--save-logits")
+            .arg("--logits-output-dir")
+            .arg(output_dir)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to run llama-debug at {}: {err}",
+                    llama_debug.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "llama-debug failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let logits_path = llama_debug_logits_text_path(output_dir);
+        let raw = fs::read_to_string(&logits_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read llama-debug logits text at {}: {err}",
+                logits_path.display()
+            )
+        });
+        parse_llama_debug_logits_text(&raw).unwrap_or_else(|err| {
+            panic!(
+                "failed to parse llama-debug logits text at {}: {err}",
+                logits_path.display()
+            )
+        })
+    }
+
+    fn llama_debug_logits_text_path(output_dir: &Path) -> PathBuf {
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(output_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to read llama-debug output dir {}: {err}",
+                output_dir.display()
+            )
+        }) {
+            let path = entry
+                .unwrap_or_else(|err| panic!("failed to read llama-debug output entry: {err}"))
+                .path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.ends_with("-prompt.txt") {
+                continue;
+            }
+            candidates.push(path);
+        }
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one llama-debug logits .txt file in {}, got {:?}",
+            output_dir.display(),
+            candidates
+        );
+        candidates.remove(0)
+    }
+
+    fn parse_llama_debug_selected_logits_text(
+        raw: &str,
+        selected_token_ids: &[u32],
+    ) -> std::result::Result<BTreeMap<u32, f32>, String> {
+        let mut selected = BTreeMap::new();
+        for token_id in selected_token_ids {
+            if selected.insert(*token_id, None).is_some() {
+                return Err(format!("duplicate selected logit token id {token_id}"));
+            }
+        }
+
+        for (line_idx, line) in raw.lines().enumerate() {
+            let Some((left, right)) = line.split_once(':') else {
+                continue;
+            };
+            let token_id = left.trim().parse::<u32>().map_err(|err| {
+                format!(
+                    "invalid llama-debug logit token id {:?} on line {}: {err}",
+                    left.trim(),
+                    line_idx + 1
+                )
+            })?;
+            let Some(slot) = selected.get_mut(&token_id) else {
+                continue;
+            };
+            let value = right.trim().parse::<f32>().map_err(|err| {
+                format!(
+                    "invalid llama-debug logit value {:?} for token id {} on line {}: {err}",
+                    right.trim(),
+                    token_id,
+                    line_idx + 1
+                )
+            })?;
+            if !value.is_finite() {
+                return Err(format!(
+                    "non-finite llama-debug logit value {value} for token id {token_id}"
+                ));
+            }
+            *slot = Some(value);
+        }
+
+        let mut parsed = BTreeMap::new();
+        for (token_id, value) in selected {
+            let value =
+                value.ok_or_else(|| format!("missing selected logit token id {token_id}"))?;
+            parsed.insert(token_id, value);
+        }
+        Ok(parsed)
+    }
+
+    fn parse_llama_debug_logits_text(raw: &str) -> std::result::Result<Vec<f32>, String> {
+        let mut logits = Vec::new();
+        for (line_idx, line) in raw.lines().enumerate() {
+            let Some((left, right)) = line.split_once(':') else {
+                continue;
+            };
+            let token_id = left.trim().parse::<usize>().map_err(|err| {
+                format!(
+                    "invalid llama-debug logit token id {:?} on line {}: {err}",
+                    left.trim(),
+                    line_idx + 1
+                )
+            })?;
+            if token_id != logits.len() {
+                return Err(format!(
+                    "expected token id {}, got {token_id} on line {}",
+                    logits.len(),
+                    line_idx + 1
+                ));
+            }
+            let value = right.trim().parse::<f32>().map_err(|err| {
+                format!(
+                    "invalid llama-debug logit value {:?} for token id {} on line {}: {err}",
+                    right.trim(),
+                    token_id,
+                    line_idx + 1
+                )
+            })?;
+            if !value.is_finite() {
+                return Err(format!(
+                    "non-finite llama-debug logit value {value} for token id {token_id}"
+                ));
+            }
+            logits.push(value);
+        }
+        if logits.is_empty() {
+            return Err("llama-debug logits text did not contain any `id: value` rows".to_string());
+        }
+        Ok(logits)
     }
 }

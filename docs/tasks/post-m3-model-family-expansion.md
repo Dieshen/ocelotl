@@ -199,6 +199,16 @@ and does not modify the closed M3.6 MLP task.
   pinned reference output or token/logit fixture.
 - `Done when`: the test explains exact artifact paths and tolerance, and default
   CI remains offline.
+- `Status`: Gemma4 logits harness slice landed 2026-06-10. The default suite
+  validates `fixtures/logits/gemma4_q4_k_m_basic_prompt_logits_reference.json`
+  for the selected Q4_K_M artifact, configured-BOS prompt token IDs, tolerance,
+  selected probe IDs, and llama.cpp `llama-debug --save-logits` command shape.
+  The ignored `local_gemma4_q4_k_m_prefill_logits_match_llama_cpp_debug` proof
+  requires the selected GGUF plus `OCELOTL_LLAMA_DEBUG_PATH`, emits full
+  final-token logits from llama.cpp, projects Ocelotl's loaded config to the
+  text-only path by clearing `multimodal`, loads required tensors through
+  `load_gemma4_dequantized_tensors_from_gguf`, and compares every
+  final-position logit through `ocelotl_runtime::gemma::prefill`.
 
 ## Track Closure
 

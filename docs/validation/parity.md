@@ -174,6 +174,43 @@ Exact token equality is the parity contract. Before claiming independent
 llama.cpp parity, refresh the ignored reference proof with a pinned llama.cpp
 tag/commit and record that build identity in the tokenizer fixture.
 
+## Post-M3 Gemma4 GGUF Logits
+
+Gemma4 real-artifact logits parity is opt-in because it requires the selected
+5 GB GGUF artifact, a local llama.cpp `llama-debug` build, and eager F32
+materialization of the required Q4_K_M-origin text tensors.
+
+- **Gemma4 Q4_K_M logits fixture, default-on**:
+  `fixtures/logits/gemma4_q4_k_m_basic_prompt_logits_reference.json` pins the
+  selected `bartowski/google_gemma-4-E4B-it-GGUF` Q4_K_M artifact at revision
+  `c04cb322fd63e347db759a08b6249b867488ccf8`, prompt `Hello`,
+  configured-BOS token IDs `[2, 9259]`, a `0.05` real-artifact tolerance, and
+  the llama.cpp `examples/debug` command shape used by the opt-in proof. The
+  default test validates schema, prompt/token alignment, tolerance, selected
+  probe token IDs, and reference-tool identity without running llama.cpp or
+  reading local artifacts.
+- **llama.cpp logits reference, opt-in local execution**:
+  `local_gemma4_q4_k_m_prefill_logits_match_llama_cpp_debug` runs
+  `llama-debug --save-logits`, parses the full final-token logits text file,
+  tokenizes the same prompt with Ocelotl's GGUF tokenizer configured-BOS path,
+  clears `Gemma4Config.multimodal` for this explicitly text-only harness, loads
+  the selected GGUF tensors through
+  `load_gemma4_dequantized_tensors_from_gguf`, builds `Gemma4TextModel`, runs
+  `ocelotl_runtime::gemma::prefill`, and compares every final-position logit
+  against llama.cpp.
+
+The `0.05` tolerance is deliberately wider than the synthetic `1e-4` fixture
+because this compares Ocelotl's eagerly dequantized F32 path against llama.cpp's
+GGML Q4_K_M execution path on a 42-layer real artifact. Tighten it only after a
+local reference run reports the observed worst-case difference. Exact
+configured-BOS token equality is checked before logits so a BOS-policy mismatch
+cannot masquerade as numeric drift.
+
+This is not a multimodal parity claim. The selected artifact remains recorded
+as multimodal in `Gemma4Config`; the opt-in test projects that flag out only to
+exercise the text decoder path whose tensors and execution semantics Ocelotl
+currently owns.
+
 ## Post-M3 Whisper ASR
 
 Whisper ASR parity is split into default-on synthetic coverage and an opt-in
