@@ -133,8 +133,9 @@ Gemma4:
   shared dense/global layers reuse `kv_from_start - 1`. `Gemma4TextModel`
   reuses cached post-K-RMSNorm, post-RoPE K activations plus V activations from
   the source layer while keeping current-layer Q, output projection, and MLP
-  behavior. Real Q4_K_M execution remains blocked on multimodal handling and
-  real-artifact logits parity.
+  behavior. A later semantics slice normalizes V before it is cached. Real
+  Q4_K_M execution remains blocked on multimodal handling and real-artifact
+  logits parity.
 - A follow-up dequantized-origin slice allows the same text-forward path to
   execute Q4_K_M-origin Gemma4 text tensors after they have been explicitly
   materialized through `load_gguf_tensors_dequantized_f32`. The gate now trusts
@@ -150,14 +151,22 @@ Gemma4:
   Ocelotl's configured-BOS GGUF path, clears `Gemma4Config.multimodal` only for
   this text-only harness, loads dequantized F32 text weights, and compares
   every final-position logit through `ocelotl_runtime::gemma::prefill`.
-  The latest local run after the embedding-scale fix on 2026-06-10 proved the
-  harness works but parity is still red: token 0 differed by `23.078264`
-  against llama.cpp
+  The latest local run after the attention-scale, V-RMSNorm, and tanh-GEGLU
+  fixes on 2026-06-10 proved the harness works but parity is still red: token 0
+  differed by `3.7689028` against llama.cpp
   `856c3adac1709be15e1ea2529a0e89f742d25fe0`.
 - A follow-up Gemma4 text semantics slice applies llama.cpp-style
   `sqrt(hidden)` token embedding scaling before the first block and pins it
   with a model-level activation-boundary test. This is the first closed drift
   item from the failed real-artifact logits proof, not the end of MF.8 parity.
+- A follow-up Gemma4 attention/FFN semantics slice adds llama.cpp's text path
+  score scale (`1.0` instead of `1/sqrt(head_dim)`), unweighted V RMSNorm
+  before KV storage/reuse, and tanh-approx GEGLU FFN activation. Kernel tests
+  pin explicit-scale full/windowed attention and ggml-style GEGLU values;
+  `gemma4_text_prefill_normalizes_v_and_uses_explicit_attention_scale` pins the
+  model boundary. Real-artifact parity is still expected to remain red until
+  post-attention/post-FFN norms, per-layer embeddings, layer-output scale, PLE,
+  and RoPE frequency-factor behavior are aligned.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

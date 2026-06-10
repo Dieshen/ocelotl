@@ -21,6 +21,7 @@ use std::{
 };
 
 const GEMMA4_ARCHITECTURE: &str = "gemma4";
+const GEMMA4_TEXT_ATTENTION_SCALE: f32 = 1.0;
 const GGUF_FILE_TYPE_Q4_K_M: u32 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -819,6 +820,7 @@ impl Gemma4TextModel {
                 let mut k_buf = vec![0.0_f32; seq * k_out];
                 let mut k_norm_buf = vec![0.0_f32; seq * k_out];
                 let mut v_buf = vec![0.0_f32; seq * v_out];
+                let mut v_norm_buf = vec![0.0_f32; seq * v_out];
                 self.kernels.matmul(
                     &norm_buf,
                     (seq, h),
@@ -850,10 +852,19 @@ impl Gemma4TextModel {
                         theta,
                     )?;
                 }
+                let v_norm_w = vec![1.0_f32; head_dim];
+                self.kernels.rmsnorm(
+                    &v_buf,
+                    seq * kv_heads,
+                    head_dim,
+                    &v_norm_w,
+                    eps,
+                    &mut v_norm_buf,
+                )?;
                 produced_kv = Some(Gemma4LayerKvActivations {
                     attention,
                     k: k_norm_buf,
-                    v: v_buf,
+                    v: v_norm_buf,
                 });
                 let produced = produced_kv
                     .as_ref()
@@ -865,19 +876,21 @@ impl Gemma4TextModel {
                 .attention_sliding_window
                 .filter(|_| !gemma4_uses_global_attention(cfg, layer_idx))
             {
-                self.kernels.scaled_dot_product_attention_windowed(
-                    &q_norm_buf,
-                    k_for_attention,
-                    v_for_attention,
-                    seq,
-                    q_heads,
-                    kv_heads,
-                    head_dim,
-                    sliding_window,
-                    &mut attn_out,
-                )?;
+                self.kernels
+                    .scaled_dot_product_attention_windowed_with_scale(
+                        &q_norm_buf,
+                        k_for_attention,
+                        v_for_attention,
+                        seq,
+                        q_heads,
+                        kv_heads,
+                        head_dim,
+                        sliding_window,
+                        GEMMA4_TEXT_ATTENTION_SCALE,
+                        &mut attn_out,
+                    )?;
             } else {
-                self.kernels.scaled_dot_product_attention(
+                self.kernels.scaled_dot_product_attention_with_scale(
                     &q_norm_buf,
                     k_for_attention,
                     v_for_attention,
@@ -885,6 +898,7 @@ impl Gemma4TextModel {
                     q_heads,
                     kv_heads,
                     head_dim,
+                    GEMMA4_TEXT_ATTENTION_SCALE,
                     &mut attn_out,
                 )?;
             }
@@ -904,7 +918,7 @@ impl Gemma4TextModel {
             residual_buf.copy_from_slice(&hidden);
             self.kernels
                 .rmsnorm(&hidden, seq, h, &layer.ffn_norm_w, eps, &mut norm_buf)?;
-            self.kernels.mlp_gated_silu(
+            self.kernels.mlp_gated_gelu(
                 &norm_buf,
                 seq,
                 h,
@@ -2044,9 +2058,195 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct CapturedAttentionCall {
+        scale: f32,
+        v: Vec<f32>,
+        windowed: bool,
+    }
+
+    #[derive(Debug)]
+    struct CaptureAttentionBackend {
+        context: ocelotl_kernels::KernelContext,
+        cpu: ocelotl_kernels::CpuKernelBackend,
+        captured: std::sync::Mutex<Option<CapturedAttentionCall>>,
+    }
+
+    impl CaptureAttentionBackend {
+        fn new() -> Self {
+            Self {
+                context: ocelotl_kernels::KernelContext {
+                    device: ocelotl_core::Device::Cpu,
+                },
+                cpu: ocelotl_kernels::CpuKernelBackend::scalar(),
+                captured: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn captured_attention(&self) -> Option<CapturedAttentionCall> {
+            self.captured.lock().unwrap().clone()
+        }
+
+        fn capture_attention(&self, v: &[f32], scale: f32, windowed: bool) -> Result<()> {
+            *self.captured.lock().unwrap() = Some(CapturedAttentionCall {
+                scale,
+                v: v.to_vec(),
+                windowed,
+            });
+            Err(capture_attention_backend_error("captured attention input"))
+        }
+    }
+
+    impl KernelBackend for CaptureAttentionBackend {
+        fn name(&self) -> &'static str {
+            "capture-attention"
+        }
+
+        fn context(&self) -> &ocelotl_kernels::KernelContext {
+            &self.context
+        }
+
+        fn matmul(
+            &self,
+            a: &[f32],
+            a_shape: (usize, usize),
+            b: &[f32],
+            b_shape: (usize, usize),
+            out: &mut [f32],
+        ) -> Result<()> {
+            self.cpu.matmul(a, a_shape, b, b_shape, out)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn linear_out_by_in(
+            &self,
+            x: &[f32],
+            rows: usize,
+            in_features: usize,
+            weight_out_by_in: &[f32],
+            out_features: usize,
+            bias: Option<&[f32]>,
+            out: &mut [f32],
+        ) -> Result<()> {
+            self.cpu.linear_out_by_in(
+                x,
+                rows,
+                in_features,
+                weight_out_by_in,
+                out_features,
+                bias,
+                out,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn scaled_dot_product_attention(
+            &self,
+            _q: &[f32],
+            _k: &[f32],
+            _v: &[f32],
+            _seq_len: usize,
+            _num_q_heads: usize,
+            _num_kv_heads: usize,
+            _head_dim: usize,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(capture_attention_backend_error(
+                "Gemma4 must use explicit-scale attention",
+            ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn scaled_dot_product_attention_with_scale(
+            &self,
+            _q: &[f32],
+            _k: &[f32],
+            v: &[f32],
+            _seq_len: usize,
+            _num_q_heads: usize,
+            _num_kv_heads: usize,
+            _head_dim: usize,
+            scale: f32,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            self.capture_attention(v, scale, false)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn scaled_dot_product_attention_windowed_with_scale(
+            &self,
+            _q: &[f32],
+            _k: &[f32],
+            v: &[f32],
+            _seq_len: usize,
+            _num_q_heads: usize,
+            _num_kv_heads: usize,
+            _head_dim: usize,
+            _sliding_window: usize,
+            scale: f32,
+            _out: &mut [f32],
+        ) -> Result<()> {
+            self.capture_attention(v, scale, true)
+        }
+
+        fn rope_apply_inplace(
+            &self,
+            x: &mut [f32],
+            head_dim: usize,
+            position: usize,
+            theta: f32,
+        ) -> Result<()> {
+            self.cpu.rope_apply_inplace(x, head_dim, position, theta)
+        }
+
+        fn rmsnorm(
+            &self,
+            x: &[f32],
+            rows: usize,
+            hidden: usize,
+            weight: &[f32],
+            epsilon: f32,
+            out: &mut [f32],
+        ) -> Result<()> {
+            self.cpu.rmsnorm(x, rows, hidden, weight, epsilon, out)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn mlp_gated_silu(
+            &self,
+            _x: &[f32],
+            _rows: usize,
+            _hidden: usize,
+            _intermediate: usize,
+            _gate_w: &[f32],
+            _up_w: &[f32],
+            _down_w: &[f32],
+            _gate_buf: &mut [f32],
+            _up_buf: &mut [f32],
+            _out: &mut [f32],
+        ) -> Result<()> {
+            Err(capture_attention_backend_error(
+                "mlp should not run in this test",
+            ))
+        }
+
+        fn vec_add(&self, _a: &[f32], _b: &[f32], _out: &mut [f32]) -> Result<()> {
+            Err(capture_attention_backend_error(
+                "vec_add should not run in this test",
+            ))
+        }
+    }
+
     fn capture_backend_error(message: &str) -> OcelotlError {
         OcelotlError::Kernel(ocelotl_core::KernelError {
             backend: "capture-first-rmsnorm".to_string(),
+            message: message.to_string(),
+        })
+    }
+
+    fn capture_attention_backend_error(message: &str) -> OcelotlError {
+        OcelotlError::Kernel(ocelotl_core::KernelError {
+            backend: "capture-attention".to_string(),
             message: message.to_string(),
         })
     }
@@ -2977,6 +3177,93 @@ mod tests {
                 .expect("first RMSNorm input must be captured"),
             expected
         );
+    }
+
+    #[test]
+    fn gemma4_text_prefill_normalizes_v_and_uses_explicit_attention_scale() {
+        let cfg = tiny_text_config();
+        let h = cfg.embedding_length;
+        let head_dim = cfg.attention_key_length;
+        let q_out = cfg.attention_head_count * cfg.attention_key_length;
+        let k_out = cfg.attention_head_count_kv * cfg.attention_key_length;
+        let v_out = cfg.attention_head_count_kv * cfg.attention_value_length;
+        let f = cfg.feed_forward_length;
+
+        let mut token_embd = vec![0.0_f32; cfg.tokenizer_token_count * h];
+        token_embd[0] = 1.0;
+        let mut attn_v_w = vec![0.0_f32; h * v_out];
+        attn_v_w[0] = 1.5;
+        attn_v_w[1] = 2.0;
+        let weights = Gemma4TextWeights {
+            token_embd,
+            layers: vec![Gemma4TextLayerWeights {
+                attn_norm_w: vec![1.0; h],
+                attn_q_w: vec![0.0; h * q_out],
+                attn_k_w: vec![0.0; h * k_out],
+                attn_v_w,
+                attn_o_w: vec![0.0; q_out * h],
+                attn_q_norm_w: vec![1.0; head_dim],
+                attn_k_norm_w: vec![1.0; head_dim],
+                ffn_norm_w: vec![1.0; h],
+                ffn_gate_w: vec![0.0; h * f],
+                ffn_up_w: vec![0.0; h * f],
+                ffn_down_w: vec![0.0; f * h],
+            }],
+            output_norm_w: vec![1.0; h],
+            lm_head_w: vec![0.0; h * cfg.tokenizer_token_count],
+            tie_word_embeddings: true,
+        };
+        let backend = std::sync::Arc::new(CaptureAttentionBackend::new());
+        let model = Gemma4TextModel::with_kernel_backend(cfg.clone(), weights, backend.clone())
+            .expect("capture-backed Gemma4 text model must construct");
+
+        let err = model
+            .prefill(&[TokenId(0)])
+            .expect_err("capture backend stops at the first attention call");
+
+        match err {
+            OcelotlError::Kernel(kernel) => {
+                assert_eq!(kernel.backend, "capture-attention");
+                assert!(kernel.message.contains("captured attention input"));
+            }
+            other => panic!("expected capture backend Kernel error, got {other:?}"),
+        }
+
+        let mut scaled_embedding = vec![0.0_f32; h];
+        scaled_embedding[0] = (h as f32).sqrt();
+        let mut norm_hidden = vec![0.0_f32; h];
+        ocelotl_kernels::rmsnorm::rmsnorm(
+            &scaled_embedding,
+            1,
+            h,
+            &vec![1.0; h],
+            cfg.rms_norm_eps,
+            &mut norm_hidden,
+        )
+        .expect("expected hidden RMSNorm must be well-formed");
+        let raw_v = vec![norm_hidden[0] * 1.5, norm_hidden[0] * 2.0];
+        let mut expected_v = vec![0.0_f32; v_out];
+        ocelotl_kernels::rmsnorm::rmsnorm(
+            &raw_v,
+            1,
+            head_dim,
+            &vec![1.0; head_dim],
+            cfg.rms_norm_eps,
+            &mut expected_v,
+        )
+        .expect("expected V RMSNorm must be well-formed");
+
+        let captured = backend
+            .captured_attention()
+            .expect("explicit-scale attention call must be captured");
+        assert_eq!(captured.scale, GEMMA4_TEXT_ATTENTION_SCALE);
+        assert!(!captured.windowed);
+        for (idx, (got, want)) in captured.v.iter().zip(expected_v.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1.0e-6,
+                "captured V mismatch at flat index {idx}: got {got}, want {want}"
+            );
+        }
     }
 
     #[test]

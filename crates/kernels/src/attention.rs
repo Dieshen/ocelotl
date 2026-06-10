@@ -133,6 +133,47 @@ pub fn scaled_dot_product_attention(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn scaled_dot_product_attention_with_scale(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        out,
+    )?;
+    validate_attention_scale("scaled_dot_product_attention_with_scale", scale)?;
+    let mut scores = vec![0.0_f32; seq_len];
+    scaled_dot_product_attention_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        scale,
+        &mut scores,
+        out,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scaled_dot_product_attention_optimized(
     q: &[f32],
     k: &[f32],
@@ -154,6 +195,47 @@ pub(crate) fn scaled_dot_product_attention_optimized(
         out,
     )?;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0_f32; seq_len];
+    scaled_dot_product_attention_optimized_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        scale,
+        &mut scores,
+        out,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_optimized_with_scale(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        out,
+    )?;
+    validate_attention_scale("scaled_dot_product_attention_optimized_with_scale", scale)?;
     let mut scores = vec![0.0_f32; seq_len];
     scaled_dot_product_attention_optimized_compute(
         q,
@@ -216,6 +298,50 @@ pub fn scaled_dot_product_attention_windowed(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn scaled_dot_product_attention_windowed_with_scale(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention_windowed(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        sliding_window,
+        out,
+    )?;
+    validate_attention_scale("scaled_dot_product_attention_windowed_with_scale", scale)?;
+    let mut scores = vec![0.0_f32; sliding_window.min(seq_len)];
+    scaled_dot_product_attention_windowed_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        sliding_window,
+        scale,
+        &mut scores,
+        out,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scaled_dot_product_attention_windowed_optimized(
     q: &[f32],
     k: &[f32],
@@ -239,6 +365,53 @@ pub(crate) fn scaled_dot_product_attention_windowed_optimized(
         out,
     )?;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0_f32; sliding_window.min(seq_len)];
+    scaled_dot_product_attention_windowed_optimized_compute(
+        q,
+        k,
+        v,
+        0,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group_size,
+        sliding_window,
+        scale,
+        &mut scores,
+        out,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scaled_dot_product_attention_windowed_optimized_with_scale(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention_windowed(
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        sliding_window,
+        out,
+    )?;
+    validate_attention_scale(
+        "scaled_dot_product_attention_windowed_optimized_with_scale",
+        scale,
+    )?;
     let mut scores = vec![0.0_f32; sliding_window.min(seq_len)];
     scaled_dot_product_attention_windowed_optimized_compute(
         q,
@@ -681,6 +854,15 @@ fn validate_scaled_dot_product_attention_windowed(
     )
 }
 
+fn validate_attention_scale(kernel: &str, scale: f32) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(kernel_err(format!(
+            "{kernel} scale must be finite, got {scale}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +927,26 @@ mod tests {
             assert!(
                 (got - want).abs() < tol,
                 "attention mismatch at flat index {idx}: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_attention_scale_overrides_default_sqrt_head_dim_scale() {
+        let q = [1.0_f32, 0.0, 0.0, 1.0];
+        let k = [1.0_f32, 0.0, 0.0, 1.0];
+        let v = [1.0_f32, 2.0, 3.0, 5.0];
+        let mut out = [0.0_f32; 4];
+
+        scaled_dot_product_attention_with_scale(&q, &k, &v, 2, 1, 1, 2, 1.0, &mut out)
+            .expect("well-formed explicitly-scaled attention call must succeed");
+
+        let expected = [1.0_f32, 2.0, 2.462_117_2, 4.193_176];
+        let tol = 5.0e-6_f32;
+        for (idx, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < tol,
+                "explicit-scale attention mismatch at flat index {idx}: got {got}, want {want}"
             );
         }
     }
@@ -905,6 +1107,26 @@ mod tests {
         .expect("oversized sliding window must succeed");
 
         assert_eq!(full, windowed);
+    }
+
+    #[test]
+    fn windowed_attention_accepts_explicit_scale() {
+        let q = [1.0_f32, 0.0, 0.0, 1.0];
+        let k = [1.0_f32, 0.0, 0.0, 1.0];
+        let v = [1.0_f32, 2.0, 3.0, 5.0];
+        let mut out = [0.0_f32; 4];
+
+        scaled_dot_product_attention_windowed_with_scale(&q, &k, &v, 2, 1, 1, 2, 2, 1.0, &mut out)
+            .expect("well-formed explicitly-scaled windowed attention call must succeed");
+
+        let expected = [1.0_f32, 2.0, 2.462_117_2, 4.193_176];
+        let tol = 5.0e-6_f32;
+        for (idx, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < tol,
+                "explicit-scale windowed attention mismatch at flat index {idx}: got {got}, want {want}"
+            );
+        }
     }
 
     #[test]

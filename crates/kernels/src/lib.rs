@@ -129,6 +129,32 @@ pub trait KernelBackend: Debug + Send + Sync {
     ) -> Result<()>;
 
     #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention_with_scale(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        attention::scaled_dot_product_attention_with_scale(
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn scaled_dot_product_attention_windowed(
         &self,
         q: &[f32],
@@ -150,6 +176,34 @@ pub trait KernelBackend: Debug + Send + Sync {
             num_kv_heads,
             head_dim,
             sliding_window,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention_windowed_with_scale(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        attention::scaled_dot_product_attention_windowed_with_scale(
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window,
+            scale,
             out,
         )
     }
@@ -186,6 +240,34 @@ pub trait KernelBackend: Debug + Send + Sync {
         up_buf: &mut [f32],
         out: &mut [f32],
     ) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_gated_gelu(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+        gate_w: &[f32],
+        up_w: &[f32],
+        down_w: &[f32],
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        mlp::mlp_gated_gelu(
+            x,
+            rows,
+            hidden,
+            intermediate,
+            gate_w,
+            up_w,
+            down_w,
+            gate_buf,
+            up_buf,
+            out,
+        )
+    }
 
     fn vec_add(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()>;
 
@@ -2035,6 +2117,47 @@ impl CpuKernelBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn scaled_dot_product_attention_with_scale(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        match self.mode {
+            CpuKernelMode::Scalar => attention::scaled_dot_product_attention_with_scale(
+                q,
+                k,
+                v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                out,
+            ),
+            CpuKernelMode::Optimized | CpuKernelMode::Avx2 => {
+                attention::scaled_dot_product_attention_optimized_with_scale(
+                    q,
+                    k,
+                    v,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    scale,
+                    out,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn scaled_dot_product_attention_windowed(
         &self,
         q: &[f32],
@@ -2069,6 +2192,50 @@ impl CpuKernelBackend {
                     num_kv_heads,
                     head_dim,
                     sliding_window,
+                    out,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scaled_dot_product_attention_windowed_with_scale(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        match self.mode {
+            CpuKernelMode::Scalar => attention::scaled_dot_product_attention_windowed_with_scale(
+                q,
+                k,
+                v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                sliding_window,
+                scale,
+                out,
+            ),
+            CpuKernelMode::Optimized | CpuKernelMode::Avx2 => {
+                attention::scaled_dot_product_attention_windowed_optimized_with_scale(
+                    q,
+                    k,
+                    v,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    sliding_window,
+                    scale,
                     out,
                 )
             }
@@ -2149,6 +2316,33 @@ impl KernelBackend for CpuKernelBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention_with_scale(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        CpuKernelBackend::scaled_dot_product_attention_with_scale(
+            self,
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn scaled_dot_product_attention_windowed(
         &self,
         q: &[f32],
@@ -2171,6 +2365,35 @@ impl KernelBackend for CpuKernelBackend {
             num_kv_heads,
             head_dim,
             sliding_window,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention_windowed_with_scale(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+        scale: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        CpuKernelBackend::scaled_dot_product_attention_windowed_with_scale(
+            self,
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window,
+            scale,
             out,
         )
     }
@@ -2212,6 +2435,34 @@ impl KernelBackend for CpuKernelBackend {
         out: &mut [f32],
     ) -> Result<()> {
         mlp::mlp_gated_silu(
+            x,
+            rows,
+            hidden,
+            intermediate,
+            gate_w,
+            up_w,
+            down_w,
+            gate_buf,
+            up_buf,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_gated_gelu(
+        &self,
+        x: &[f32],
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+        gate_w: &[f32],
+        up_w: &[f32],
+        down_w: &[f32],
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        mlp::mlp_gated_gelu(
             x,
             rows,
             hidden,

@@ -196,6 +196,16 @@ and does not modify the closed M3.6 MLP task.
   scaling to token embeddings before the first block, and
   `gemma4_text_prefill_scales_token_embeddings_before_first_block` pins that
   activation boundary before attention or MLP compute can hide it.
+- `Follow-up`: Gemma4 attention/FFN semantics landed 2026-06-10.
+  `scaled_dot_product_attention_with_scale` and its windowed variant preserve
+  existing default attention behavior while allowing Gemma4 to use llama.cpp's
+  `1.0` score scale. `Gemma4TextModel::prefill` now RMS-normalizes V with an
+  all-ones weight before KV storage/reuse and runs FFN through tanh-approx
+  GEGLU instead of SiLU. Kernel tests pin explicit-scale attention and ggml
+  GEGLU values; `gemma4_text_prefill_normalizes_v_and_uses_explicit_attention_scale`
+  pins the model boundary. Remaining known parity blockers include
+  post-attention/post-FFN norms, per-layer embeddings, layer-output scale, PLE,
+  and RoPE frequency-factor behavior.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 
@@ -214,11 +224,11 @@ and does not modify the closed M3.6 MLP task.
   text-only path by clearing `multimodal`, loads required tensors through
   `load_gemma4_dequantized_tensors_from_gguf`, and compares every
   final-position logit through `ocelotl_runtime::gemma::prefill`.
-- `Status`: latest local proof run after the embedding-scale fix completed on
-  2026-06-10 against llama.cpp
+- `Status`: latest local proof run after the attention-scale, V-RMSNorm, and
+  tanh-GEGLU fixes completed on 2026-06-10 against llama.cpp
   `856c3adac1709be15e1ea2529a0e89f742d25fe0`, but parity is still red. The
-  run failed at output token 0 (`Ocelotl 4.8630633`, llama.cpp `-18.2152`,
-  diff `23.078264`). The harness is now useful as a drift detector; remaining
+  run failed at output token 0 (`Ocelotl -14.446298`, llama.cpp `-18.2152`,
+  diff `3.7689028`). The harness is now useful as a drift detector; remaining
   Gemma4 text semantics still need to be brought in before MF.8 can close.
 
 ## Track Closure

@@ -340,13 +340,13 @@ through `load_gemma4_dequantized_tensors_from_gguf`, clears
 final-position logit within the fixture tolerance. This is an eager-dequant F32
 text-decoder parity proof, not an audio/image/video multimodal proof.
 
-As of the latest local run after the embedding-scale fix on 2026-06-10, this
-harness is operational but the proof is expected to fail until the remaining
-Gemma4 text semantics match llama.cpp. That run used llama.cpp
-`856c3adac1709be15e1ea2529a0e89f742d25fe0` and failed at output token 0
-(`Ocelotl 4.8630633`, llama.cpp `-18.2152`, diff `23.078264`). Treat large
-logit drift here as the active MF.8 parity worklist, not as an artifact setup
-failure, once both local paths are valid.
+As of the latest local run after the attention-scale, V-RMSNorm, and
+tanh-GEGLU fixes on 2026-06-10, this harness is operational but the proof is
+expected to fail until the remaining Gemma4 text semantics match llama.cpp.
+That run used llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0` and failed
+at output token 0 (`Ocelotl -14.446298`, llama.cpp `-18.2152`, diff
+`3.7689028`). Treat remaining logit drift here as the active MF.8 parity
+worklist, not as an artifact setup failure, once both local paths are valid.
 
 ## 6. Keeping Artifacts Out Of Git
 

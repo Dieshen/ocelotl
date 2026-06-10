@@ -86,6 +86,21 @@ pub fn silu_inplace(x: &mut [f32]) {
     }
 }
 
+/// GELU using ggml's `GGML_GLU_OP_GEGLU` tanh approximation.
+///
+/// This intentionally matches llama.cpp/ggml's GEGLU path for Gemma4 instead of
+/// the exact-erf GELU variant used by some other runtimes.
+pub fn gelu_tanh_inplace(x: &mut [f32]) {
+    const GELU_COEF_A: f32 = 0.044_715;
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+
+    for v in x.iter_mut() {
+        let z = *v;
+        *v =
+            0.5_f32 * z * (1.0_f32 + (SQRT_2_OVER_PI * z * (1.0_f32 + GELU_COEF_A * z * z)).tanh());
+    }
+}
+
 /// Gated SiLU MLP: `out = down(silu(gate(x)) * up(x))`.
 ///
 /// Shapes:
@@ -242,6 +257,113 @@ pub fn mlp_gated_silu(
     Ok(())
 }
 
+/// Gated GELU MLP: `out = down(gelu_tanh(gate(x)) * up(x))`.
+///
+/// Shapes and layout match [`mlp_gated_silu`]. The activation is the tanh
+/// approximation used by ggml's GEGLU operator.
+#[allow(clippy::too_many_arguments)]
+pub fn mlp_gated_gelu(
+    x: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_w: &[f32],
+    up_w: &[f32],
+    down_w: &[f32],
+    gate_buf: &mut [f32],
+    up_buf: &mut [f32],
+    out: &mut [f32],
+) -> Result<()> {
+    if seq_len == 0 {
+        return Err(kernel_err(
+            "mlp_gated_gelu seq_len must be non-zero".to_string(),
+        ));
+    }
+    if hidden == 0 {
+        return Err(kernel_err(
+            "mlp_gated_gelu hidden must be non-zero".to_string(),
+        ));
+    }
+    if intermediate == 0 {
+        return Err(kernel_err(
+            "mlp_gated_gelu intermediate must be non-zero".to_string(),
+        ));
+    }
+    let x_expected = checked_len_product("mlp_gated_gelu", "x", &[seq_len, hidden])?;
+    let proj_expected =
+        checked_len_product("mlp_gated_gelu", "projection", &[hidden, intermediate])?;
+    let down_expected =
+        checked_len_product("mlp_gated_gelu", "down projection", &[intermediate, hidden])?;
+    let scratch_expected =
+        checked_len_product("mlp_gated_gelu", "scratch", &[seq_len, intermediate])?;
+
+    if x.len() != x_expected {
+        return Err(kernel_err(format!(
+            "mlp_gated_gelu x slice length {} does not match shape {seq_len}x{hidden}",
+            x.len()
+        )));
+    }
+    if gate_w.len() != proj_expected {
+        return Err(kernel_err(format!(
+            "mlp_gated_gelu gate_w length {} does not match shape {hidden}x{intermediate}",
+            gate_w.len()
+        )));
+    }
+    if up_w.len() != proj_expected {
+        return Err(kernel_err(format!(
+            "mlp_gated_gelu up_w length {} does not match shape {hidden}x{intermediate}",
+            up_w.len()
+        )));
+    }
+    if down_w.len() != down_expected {
+        return Err(kernel_err(format!(
+            "mlp_gated_gelu down_w length {} does not match shape {intermediate}x{hidden}",
+            down_w.len()
+        )));
+    }
+    if gate_buf.len() != scratch_expected {
+        return Err(kernel_err(format!(
+            "mlp_gated_gelu gate_buf length {} does not match shape {seq_len}x{intermediate}",
+            gate_buf.len()
+        )));
+    }
+    if up_buf.len() != scratch_expected {
+        return Err(kernel_err(format!(
+            "mlp_gated_gelu up_buf length {} does not match shape {seq_len}x{intermediate}",
+            up_buf.len()
+        )));
+    }
+    if out.len() != x_expected {
+        return Err(kernel_err(format!(
+            "mlp_gated_gelu out length {} does not match shape {seq_len}x{hidden}",
+            out.len()
+        )));
+    }
+
+    matmul(
+        x,
+        (seq_len, hidden),
+        gate_w,
+        (hidden, intermediate),
+        gate_buf,
+    )?;
+    matmul(x, (seq_len, hidden), up_w, (hidden, intermediate), up_buf)?;
+
+    gelu_tanh_inplace(gate_buf);
+    for i in 0..gate_buf.len() {
+        gate_buf[i] *= up_buf[i];
+    }
+
+    matmul(
+        gate_buf,
+        (seq_len, intermediate),
+        down_w,
+        (intermediate, hidden),
+        out,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use ocelotl_core::{KernelError, OcelotlError};
@@ -293,6 +415,20 @@ mod tests {
         let mut x: [f32; 0] = [];
         silu_inplace(&mut x);
         // No assertion — must not panic.
+    }
+
+    #[test]
+    fn gelu_tanh_inplace_matches_ggml_formula() {
+        let mut x = [0.0_f32, 1.0, -1.0, 2.0, 3.0];
+        gelu_tanh_inplace(&mut x);
+
+        let expected = [0.0_f32, 0.841_192, -0.158_808, 1.954_597_7, 2.996_362_7];
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "ggml GELU mismatch: got {got}, want {want}"
+            );
+        }
     }
 
     // --- mlp_gated_silu ---
@@ -387,6 +523,40 @@ mod tests {
             assert!(
                 (got - want).abs() < 1e-5,
                 "mlp_gated_silu mismatch: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn mlp_gated_gelu_tiny_fixture_matches_ggml_tanh_gelu() {
+        let x = [1.0_f32, 2.0];
+        let gate_w = [1.0_f32, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0];
+        let up_w = [1.0_f32, 1.0, 0.0, 2.0, 1.0, -1.0, 1.0, 0.0];
+        let down_w = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+
+        let mut gate_buf = [0.0_f32; 4];
+        let mut up_buf = [0.0_f32; 4];
+        let mut out = [0.0_f32; 2];
+
+        mlp_gated_gelu(
+            &x,
+            1, // seq_len
+            2, // hidden
+            4, // intermediate
+            &gate_w,
+            &up_w,
+            &down_w,
+            &mut gate_buf,
+            &mut up_buf,
+            &mut out,
+        )
+        .expect("well-formed mlp_gated_gelu must succeed");
+
+        let expected = [8.516_301_f32, -2.272_213_7];
+        for (got, want) in out.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "mlp_gated_gelu mismatch: got {got}, want {want}"
             );
         }
     }
