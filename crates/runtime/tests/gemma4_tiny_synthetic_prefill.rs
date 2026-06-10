@@ -56,7 +56,7 @@ fn tiny_config() -> Gemma4Config {
         rms_norm_eps: 1.0e-6,
         attention_sliding_window: None,
         attention_shared_kv_layers: None,
-        attention_sliding_window_pattern_len: None,
+        attention_sliding_window_pattern: None,
         final_logit_softcap: None,
         tokenizer_model: Some("gemma4".to_string()),
         tokenizer_token_count: 32,

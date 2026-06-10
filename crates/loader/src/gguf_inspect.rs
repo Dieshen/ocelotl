@@ -62,6 +62,7 @@ pub enum GgufMetadataValue {
     F32(f32),
     Bool(bool),
     String(String),
+    BoolArray(Vec<bool>),
     Array {
         element_type: GgufMetadataType,
         len: u64,
@@ -803,10 +804,19 @@ impl GgufReader<'_> {
             ),
             GgufMetadataType::Array => {
                 let (element_type, len) = self.read_array_header(depth)?;
-                for _ in 0..len {
-                    self.skip_metadata_value(element_type, depth + 1)?;
+                if element_type == GgufMetadataType::Bool {
+                    let len_usize = array_len_to_usize(self.path, "metadata bool array", len)?;
+                    let mut values = Vec::with_capacity(len_usize);
+                    for _ in 0..len {
+                        values.push(self.read_bool()?);
+                    }
+                    GgufMetadataValue::BoolArray(values)
+                } else {
+                    for _ in 0..len {
+                        self.skip_metadata_value(element_type, depth + 1)?;
+                    }
+                    GgufMetadataValue::Array { element_type, len }
                 }
-                GgufMetadataValue::Array { element_type, len }
             }
             GgufMetadataType::U64 => GgufMetadataValue::U64(self.read_u64()?),
             GgufMetadataType::I64 => GgufMetadataValue::I64(self.read_i64()?),
@@ -1130,6 +1140,16 @@ mod tests {
         out.push(u8::from(value));
     }
 
+    fn write_bool_array_metadata(out: &mut Vec<u8>, key: &str, values: &[bool]) {
+        write_string(out, key);
+        write_u32(out, 9);
+        write_u32(out, 7);
+        write_u64(out, values.len() as u64);
+        for value in values {
+            out.push(u8::from(*value));
+        }
+    }
+
     fn write_string_array_metadata(out: &mut Vec<u8>, key: &str, values: &[&str]) {
         write_string(out, key);
         write_u32(out, 9);
@@ -1228,6 +1248,35 @@ mod tests {
         );
     }
 
+    fn write_bool_array_fixture(path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        write_u32(&mut bytes, SUPPORTED_GGUF_VERSION);
+        write_u64(&mut bytes, 1);
+        write_u64(&mut bytes, 2);
+
+        write_string_metadata(&mut bytes, "general.architecture", "gemma4");
+        write_bool_array_metadata(
+            &mut bytes,
+            "gemma4.attention.sliding_window_pattern",
+            &[true, true, false, true],
+        );
+
+        write_string(&mut bytes, "blk.0.attn_q.weight");
+        write_u32(&mut bytes, 2);
+        write_u64(&mut bytes, 2);
+        write_u64(&mut bytes, 2);
+        write_u32(&mut bytes, 0);
+        write_u64(&mut bytes, 0);
+
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        bytes.extend(std::iter::repeat_n(0u8, 16));
+
+        std::fs::write(path, bytes).expect("write GGUF bool array fixture");
+    }
+
     fn write_single_tensor_fixture(
         path: &Path,
         tensor_name: &str,
@@ -1292,6 +1341,21 @@ mod tests {
         assert_eq!(tensor.offset, 0);
         assert_eq!(tensor.byte_len, Some(16));
         assert_eq!(tensor.file_offset, manifest.data_start);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inspect_gguf_preserves_bool_array_metadata_values() {
+        let path = tmp_path("bool_array");
+        write_bool_array_fixture(&path);
+
+        let manifest = inspect_gguf(&path).expect("bool array GGUF fixture must inspect");
+
+        assert_eq!(
+            manifest.metadata_value("gemma4.attention.sliding_window_pattern"),
+            Some(&GgufMetadataValue::BoolArray(vec![true, true, false, true]))
+        );
 
         let _ = std::fs::remove_file(path);
     }

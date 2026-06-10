@@ -110,8 +110,8 @@ Gemma4:
 - A follow-up text-forward slice makes the CPU/reference model loop
   layer-aware for SWA/global attention widths and RoPE bases. Mixed SWA/global
   widths are now executable only for the text-only unquantized dense F32
-  full-attention subset; multimodal, sliding-window pattern/shared-KV,
-  quantized-origin, and reference real-artifact parity remain open.
+  full-attention subset; multimodal, shared-KV, quantized-origin, and reference
+  real-artifact parity remain open.
 - A follow-up final-logit softcap slice applies Gemma4's
   `cap * tanh(logit / cap)` transform in the same supported synthetic
   text-forward path and validates the cap before compute. This does not enable
@@ -119,8 +119,14 @@ Gemma4:
 - A follow-up sliding-window mask slice adds a windowed causal GQA kernel and
   routes Gemma4 SWA layers through it when `attention_sliding_window` is set.
   Global layers keep full causal attention. This still does not enable the real
-  Q4_K_M artifact because pattern/shared-KV, multimodal, quantized-origin, and
+  Q4_K_M artifact because shared-KV, multimodal, quantized-origin, and
   reference parity work remain open.
+- A follow-up sliding-window pattern slice preserves GGUF bool array values for
+  `gemma4.attention.sliding_window_pattern`, validates one pattern entry per
+  layer, and uses the pattern as the authority for SWA/global width, RoPE base,
+  and full/windowed attention dispatch. This matches llama.cpp's convention
+  that `true` means SWA/windowed and `false` means dense/global, while keeping
+  shared-KV, multimodal, quantized-origin, and real-artifact logits parity open.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

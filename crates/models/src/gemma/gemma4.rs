@@ -68,7 +68,7 @@ pub struct Gemma4Config {
     pub rms_norm_eps: f32,
     pub attention_sliding_window: Option<usize>,
     pub attention_shared_kv_layers: Option<usize>,
-    pub attention_sliding_window_pattern_len: Option<usize>,
+    pub attention_sliding_window_pattern: Option<Vec<bool>>,
     pub final_logit_softcap: Option<f32>,
     pub tokenizer_model: Option<String>,
     pub tokenizer_token_count: usize,
@@ -88,8 +88,8 @@ impl Gemma4Config {
 
     /// Return `Ok(())` only for the explicitly supported MF.7 text-forward
     /// subset. Real Gemma4 GGUF artifacts still fail here because they carry
-    /// multimodal, sliding-window pattern/shared-KV, and quantized-origin
-    /// features whose execution semantics are not implemented yet.
+    /// multimodal, shared-KV, and quantized-origin features whose execution
+    /// semantics are not implemented yet.
     pub fn ensure_supported_for_text_forward(&self) -> Result<()> {
         let mut requested = Vec::new();
 
@@ -98,9 +98,6 @@ impl Gemma4Config {
         }
         if self.attention_shared_kv_layers.is_some() {
             requested.push("shared_kv_layers".to_string());
-        }
-        if self.attention_sliding_window_pattern_len.is_some() {
-            requested.push("sliding_window_pattern".to_string());
         }
         if self.has_quantized_tensors {
             requested.push("quantized_tensors".to_string());
@@ -128,7 +125,7 @@ impl Gemma4Config {
             feature: "gemma4.text_forward_features".to_string(),
             requested: Some(requested.join(",")),
             supported: vec![
-                "text-only unquantized dense F32 synthetic subset with full or sliding-window causal attention, layer-specific SWA/global widths, and final logit softcap"
+                "text-only unquantized dense F32 synthetic subset with full or sliding-window causal attention, GGUF sliding-window pattern metadata, layer-specific SWA/global widths, and final logit softcap"
                     .to_string(),
             ],
         }))
@@ -235,11 +232,8 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
         let attention_sliding_window = optional_usize(manifest, "gemma4.attention.sliding_window")?;
         let attention_shared_kv_layers =
             optional_usize(manifest, "gemma4.attention.shared_kv_layers")?;
-        let attention_sliding_window_pattern_len = optional_array_len(
-            manifest,
-            "gemma4.attention.sliding_window_pattern",
-            GgufMetadataType::Bool,
-        )?;
+        let attention_sliding_window_pattern =
+            optional_bool_array(manifest, "gemma4.attention.sliding_window_pattern")?;
         let final_logit_softcap = optional_f32(manifest, "gemma4.final_logit_softcapping")?;
 
         if let Some(value) = attention_sliding_window {
@@ -247,6 +241,9 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
         }
         if let Some(value) = attention_shared_kv_layers {
             validate_positive("gemma4.attention.shared_kv_layers", value)?;
+        }
+        if let Some(pattern) = &attention_sliding_window_pattern {
+            validate_sliding_window_pattern_len(pattern, block_count)?;
         }
         if let Some(value) = final_logit_softcap {
             validate_finite_positive("gemma4.final_logit_softcapping", value)?;
@@ -271,7 +268,7 @@ impl TryFrom<&GgufManifest> for Gemma4Config {
             rms_norm_eps,
             attention_sliding_window,
             attention_shared_kv_layers,
-            attention_sliding_window_pattern_len,
+            attention_sliding_window_pattern,
             final_logit_softcap,
             tokenizer_model: optional_string(manifest, "tokenizer.ggml.model"),
             tokenizer_token_count,
@@ -346,7 +343,7 @@ pub fn load_gemma4_dense_tensors_from_gguf(
 ///
 /// This proves the artifact can be read as values; it does not make Gemma4
 /// executable. `Gemma4Config::ensure_supported_for_execution` remains the
-/// execution gate for multimodal, sliding-window/shared-KV, softcap, and family
+/// execution gate for multimodal, shared-KV, softcap, and family
 /// forward-path support.
 pub fn load_gemma4_dequantized_tensors_from_gguf(
     path: impl AsRef<Path>,
@@ -744,7 +741,7 @@ impl Gemma4TextModel {
             let head_dim = attention.key_length;
             let q_out = attention.q_width;
             let kv_out = attention.k_width;
-            let theta = if gemma4_uses_global_attention(layer_idx) {
+            let theta = if gemma4_uses_global_attention(cfg, layer_idx) {
                 cfg.rope_freq_base
             } else {
                 cfg.rope_freq_base_swa
@@ -813,7 +810,7 @@ impl Gemma4TextModel {
 
             if let Some(sliding_window) = cfg
                 .attention_sliding_window
-                .filter(|_| !gemma4_uses_global_attention(layer_idx))
+                .filter(|_| !gemma4_uses_global_attention(cfg, layer_idx))
             {
                 self.kernels.scaled_dot_product_attention_windowed(
                     &q_norm_buf,
@@ -929,6 +926,9 @@ fn validate_gemma4_text_weight_config(config: &Gemma4Config) -> Result<()> {
     )?;
     if let Some(value) = config.attention_sliding_window {
         validate_positive("gemma4.attention.sliding_window", value)?;
+    }
+    if let Some(pattern) = &config.attention_sliding_window_pattern {
+        validate_sliding_window_pattern_len(pattern, config.block_count)?;
     }
     validate_positive("gemma4.rope.dimension_count", config.rope_dimension_count)?;
     validate_positive(
@@ -1098,7 +1098,7 @@ fn gemma4_layer_attention_dims(
     layer: usize,
     path: Option<&Path>,
 ) -> Result<Gemma4LayerAttentionDims> {
-    let is_global_attention = gemma4_uses_global_attention(layer);
+    let is_global_attention = gemma4_uses_global_attention(config, layer);
     let (key_length, value_length) = if is_global_attention {
         (config.attention_key_length, config.attention_value_length)
     } else {
@@ -1206,7 +1206,7 @@ fn required_gemma4_tensor_specs(config: &Gemma4Config) -> Vec<Gemma4TensorSpec> 
     ));
 
     for layer in 0..config.block_count {
-        let is_global_attention = gemma4_uses_global_attention(layer);
+        let is_global_attention = gemma4_uses_global_attention(config, layer);
         let (key_length, value_length) = if is_global_attention {
             (config.attention_key_length, config.attention_value_length)
         } else {
@@ -1323,8 +1323,16 @@ fn tensor_spec(name: &str, shape: &[usize], kind: Gemma4TensorKind) -> Gemma4Ten
     }
 }
 
-fn gemma4_uses_global_attention(layer: usize) -> bool {
-    layer % 6 == 5
+fn gemma4_uses_global_attention(config: &Gemma4Config, layer: usize) -> bool {
+    !gemma4_uses_swa_attention(config, layer)
+}
+
+fn gemma4_uses_swa_attention(config: &Gemma4Config, layer: usize) -> bool {
+    config
+        .attention_sliding_window_pattern
+        .as_ref()
+        .and_then(|pattern| pattern.get(layer).copied())
+        .unwrap_or(layer % 6 != 5)
 }
 
 fn validate_gemma4_tensor_dimensions(config: &Gemma4Config, path: Option<&Path>) -> Result<()> {
@@ -1635,30 +1643,26 @@ fn optional_f32(manifest: &GgufManifest, key: &str) -> Result<Option<f32>> {
     required_f32(manifest, key).map(Some)
 }
 
-fn optional_array_len(
-    manifest: &GgufManifest,
-    key: &str,
-    expected_element_type: GgufMetadataType,
-) -> Result<Option<usize>> {
+fn optional_bool_array(manifest: &GgufManifest, key: &str) -> Result<Option<Vec<bool>>> {
     match manifest.metadata_value(key) {
         None => Ok(None),
-        Some(GgufMetadataValue::Array { element_type, len })
-            if *element_type == expected_element_type =>
-        {
-            (*len)
-                .try_into()
-                .map(Some)
-                .map_err(|_| invalid(key, &format!("array length {len} does not fit in usize")))
-        }
-        Some(GgufMetadataValue::Array { element_type, .. }) => Err(invalid(
+        Some(GgufMetadataValue::BoolArray(values)) => Ok(Some(values.clone())),
+        Some(GgufMetadataValue::Array {
+            element_type: GgufMetadataType::Bool,
+            len,
+        }) => Err(invalid(
             key,
             &format!(
-                "must be a GGUF {expected_element_type:?} array metadata value, got {element_type:?} array",
+                "must preserve GGUF bool array values, got summarized bool array of length {len}",
             ),
+        )),
+        Some(GgufMetadataValue::Array { element_type, .. }) => Err(invalid(
+            key,
+            &format!("must be a GGUF Bool array metadata value, got {element_type:?} array"),
         )),
         Some(other) => Err(invalid(
             key,
-            &format!("must be a GGUF array metadata value, got {other:?}"),
+            &format!("must be a GGUF bool array metadata value, got {other:?}"),
         )),
     }
 }
@@ -1699,6 +1703,20 @@ fn validate_finite_positive(field: &str, value: f32) -> Result<()> {
         Err(invalid(
             field,
             &format!("must be finite and > 0; got {value}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sliding_window_pattern_len(pattern: &[bool], block_count: usize) -> Result<()> {
+    if pattern.len() != block_count {
+        Err(invalid(
+            "gemma4.attention.sliding_window_pattern",
+            &format!(
+                "must contain exactly one bool per block_count layer; got {}, expected {block_count}",
+                pattern.len()
+            ),
         ))
     } else {
         Ok(())
@@ -1763,10 +1781,21 @@ mod tests {
     #[derive(Debug, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum FixtureMetadataValue {
-        U32 { value: u32 },
-        F32 { value: f32 },
-        String { value: String },
-        Array { element_type: String, len: u64 },
+        U32 {
+            value: u32,
+        },
+        F32 {
+            value: f32,
+        },
+        String {
+            value: String,
+        },
+        Array {
+            element_type: String,
+            len: u64,
+            #[serde(default)]
+            values: Option<Vec<bool>>,
+        },
     }
 
     #[derive(Debug, Deserialize)]
@@ -1814,7 +1843,11 @@ mod tests {
                         FixtureMetadataValue::U32 { value } => GgufMetadataValue::U32(value),
                         FixtureMetadataValue::F32 { value } => GgufMetadataValue::F32(value),
                         FixtureMetadataValue::String { value } => GgufMetadataValue::String(value),
-                        FixtureMetadataValue::Array { element_type, len } => {
+                        FixtureMetadataValue::Array {
+                            element_type,
+                            len,
+                            values,
+                        } => {
                             let element_type = match element_type.as_str() {
                                 "bool" => GgufMetadataType::Bool,
                                 "string" => GgufMetadataType::String,
@@ -1822,7 +1855,20 @@ mod tests {
                                     "unexpected metadata array element type in fixture: {other}"
                                 ),
                             };
-                            GgufMetadataValue::Array { element_type, len }
+                            match (element_type, values) {
+                                (GgufMetadataType::Bool, Some(values)) => {
+                                    assert_eq!(values.len() as u64, len);
+                                    GgufMetadataValue::BoolArray(values)
+                                }
+                                (element_type, None) => {
+                                    GgufMetadataValue::Array { element_type, len }
+                                }
+                                (element_type, Some(_)) => {
+                                    panic!(
+                                        "fixture values are only supported for bool arrays, got {element_type:?}"
+                                    )
+                                }
+                            }
                         }
                     },
                 })
@@ -1877,7 +1923,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             attention_sliding_window: Some(4),
             attention_shared_kv_layers: Some(1),
-            attention_sliding_window_pattern_len: Some(1),
+            attention_sliding_window_pattern: Some(vec![true]),
             final_logit_softcap: Some(30.0),
             tokenizer_model: Some("gemma4".to_string()),
             tokenizer_token_count: 16,
@@ -1908,7 +1954,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             attention_sliding_window: None,
             attention_shared_kv_layers: None,
-            attention_sliding_window_pattern_len: None,
+            attention_sliding_window_pattern: None,
             final_logit_softcap: None,
             tokenizer_model: Some("gemma4".to_string()),
             tokenizer_token_count: 8,
@@ -1939,7 +1985,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             attention_sliding_window: Some(4),
             attention_shared_kv_layers: Some(2),
-            attention_sliding_window_pattern_len: Some(6),
+            attention_sliding_window_pattern: Some(vec![true, true, true, true, true, false]),
             final_logit_softcap: Some(30.0),
             tokenizer_model: Some("gemma4".to_string()),
             tokenizer_token_count: 16,
@@ -1970,7 +2016,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             attention_sliding_window: None,
             attention_shared_kv_layers: None,
-            attention_sliding_window_pattern_len: None,
+            attention_sliding_window_pattern: None,
             final_logit_softcap: None,
             tokenizer_model: Some("gemma4".to_string()),
             tokenizer_token_count: 12,
@@ -2142,12 +2188,14 @@ mod tests {
         write_f32(out, value);
     }
 
-    fn write_bool_array_metadata(out: &mut Vec<u8>, key: &str, len: usize) {
+    fn write_bool_array_metadata(out: &mut Vec<u8>, key: &str, values: &[bool]) {
         write_string(out, key);
         write_u32(out, 9);
         write_u32(out, 7);
-        write_u64(out, len as u64);
-        out.extend(std::iter::repeat_n(1u8, len));
+        write_u64(out, values.len() as u64);
+        for value in values {
+            out.push(u8::from(*value));
+        }
     }
 
     fn write_string_array_metadata(out: &mut Vec<u8>, key: &str, len: usize) {
@@ -2285,7 +2333,7 @@ mod tests {
         write_bool_array_metadata(
             &mut bytes,
             "gemma4.attention.sliding_window_pattern",
-            config.attention_sliding_window_pattern_len.unwrap(),
+            config.attention_sliding_window_pattern.as_deref().unwrap(),
         );
         write_f32_metadata(
             &mut bytes,
@@ -2352,7 +2400,11 @@ mod tests {
         assert_eq!(cfg.rope_freq_base_swa, 10_000.0);
         assert_eq!(cfg.attention_sliding_window, Some(512));
         assert_eq!(cfg.attention_shared_kv_layers, Some(18));
-        assert_eq!(cfg.attention_sliding_window_pattern_len, Some(42));
+        let expected_pattern: Vec<bool> = (0..42).map(|layer| layer % 6 != 5).collect();
+        assert_eq!(
+            cfg.attention_sliding_window_pattern.as_ref(),
+            Some(&expected_pattern)
+        );
         assert_eq!(cfg.final_logit_softcap, Some(30.0));
         assert_eq!(cfg.tokenizer_model.as_deref(), Some("gemma4"));
         assert_eq!(cfg.tokenizer_token_count, 262_144);
@@ -2628,7 +2680,6 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("sliding_window_pattern"));
                 assert!(requested.contains("shared_kv_layers"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
@@ -2664,6 +2715,34 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_text_prefill_uses_explicit_sliding_window_pattern_for_layer_widths() {
+        let mut cfg = tiny_mixed_attention_text_config();
+        cfg.attention_sliding_window = Some(2);
+        cfg.attention_sliding_window_pattern = Some(vec![false, true, true, true, true, true]);
+        let tensors = complete_dequantized_loaded_tensors(&cfg);
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("explicit-pattern synthetic Gemma4 text tensors must map into weights");
+
+        assert_eq!(
+            weights.layers[0].attn_q_w.len(),
+            cfg.embedding_length * cfg.attention_head_count * cfg.attention_key_length
+        );
+        assert_eq!(
+            weights.layers[5].attn_q_w.len(),
+            cfg.embedding_length * cfg.attention_head_count * cfg.attention_key_length_swa
+        );
+
+        let model = Gemma4TextModel::new(cfg.clone(), weights)
+            .expect("valid explicit sliding-window pattern must not reject text forward");
+        let logits = model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("explicit-pattern Gemma4 text prefill must execute");
+
+        assert_eq!(logits.len(), cfg.tokenizer_token_count);
+        assert!(logits.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn gemma4_text_model_new_rejects_real_q4_k_m_execution_features() {
         let cfg = fixture_config();
         let weights = Gemma4TextWeights {
@@ -2682,7 +2761,6 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("sliding_window_pattern"));
                 assert!(requested.contains("shared_kv_layers"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
@@ -2984,6 +3062,59 @@ mod tests {
     }
 
     #[test]
+    fn try_from_gguf_manifest_rejects_summarized_sliding_window_pattern() {
+        let mut manifest = fixture_manifest();
+        let pattern = manifest
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.key == "gemma4.attention.sliding_window_pattern")
+            .unwrap();
+        pattern.value = GgufMetadataValue::Array {
+            element_type: GgufMetadataType::Bool,
+            len: 42,
+        };
+
+        let err = Gemma4Config::try_from(&manifest)
+            .expect_err("summarized bool pattern values cannot drive Gemma4 layer semantics");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("gemma4.attention.sliding_window_pattern")
+                );
+                assert!(invalid.message.contains("preserve"));
+            }
+            other => panic!("expected InvalidModel for summarized pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_from_gguf_manifest_rejects_wrong_sliding_window_pattern_length() {
+        let mut manifest = fixture_manifest();
+        let pattern = manifest
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.key == "gemma4.attention.sliding_window_pattern")
+            .unwrap();
+        pattern.value = GgufMetadataValue::BoolArray(vec![true, false]);
+
+        let err = Gemma4Config::try_from(&manifest)
+            .expect_err("sliding-window pattern must cover every layer");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("gemma4.attention.sliding_window_pattern")
+                );
+                assert!(invalid.message.contains("block_count"));
+            }
+            other => panic!("expected InvalidModel for bad pattern length, got {other:?}"),
+        }
+    }
+
+    #[test]
     #[ignore = "requires local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf or OCELOTL_GEMMA4_GGUF_PATH"]
     fn local_gemma4_q4_k_m_gguf_header_converts_to_gemma4_config() {
         let path = local_gemma4_gguf_path();
@@ -3000,6 +3131,10 @@ mod tests {
         assert_eq!(cfg.context_length, 131_072);
         assert_eq!(cfg.attention_sliding_window, Some(512));
         assert_eq!(cfg.attention_shared_kv_layers, Some(18));
+        assert_eq!(
+            cfg.attention_sliding_window_pattern.as_ref().map(Vec::len),
+            Some(42)
+        );
         assert_eq!(cfg.final_logit_softcap, Some(30.0));
         assert_eq!(cfg.quantization, Gemma4Quantization::Q4KM);
         validate_gemma4_tensor_inventory(&manifest, &cfg, Some(&path))
