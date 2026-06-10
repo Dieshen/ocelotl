@@ -54,12 +54,14 @@ The Q4K/Q5K/Q6K dequantizers use ggml's current K-quant layouts and bit packing
 from `ggml/src/ggml-common.h` and `ggml/src/ggml-quants.c`. Default tests pin
 small exact dequantized vectors for each format, including Q4/Q5 scale/min
 packing, Q5 high-bit lanes, and Q6 signed scales. This is still a loader value
-contract, not a real Gemma4 Q4_K_M execution claim. MF.7 adds only an
-unquantized dense F32 synthetic text subset; follow-up text-forward slices
-handle mixed SWA/global layer widths, GGUF sliding-window pattern metadata,
+contract, not a native quantized-kernel execution claim. MF.7 adds a dense
+F32/dequantized-F32 text subset; follow-up text-forward slices handle mixed
+SWA/global layer widths, GGUF sliding-window pattern metadata,
 sliding-window masking, shared-KV reuse, and final logit softcap for that
-subset. Real Gemma4 Q4_K_M execution remains blocked until quantized-origin,
-multimodal, and reference parity tests exist.
+subset. Follow-up coverage also executes explicitly dequantized Q4_K_M-origin
+text tensors in that path. Raw quantized GGUF tensors remain rejected before
+compute. The selected real Gemma4 GGUF artifact remains blocked until
+multimodal handling and reference parity tests exist.
 
 ## Kernel Contract
 

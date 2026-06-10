@@ -88,19 +88,26 @@ impl Gemma4Config {
 
     /// Return `Ok(())` only for the explicitly supported MF.7 text-forward
     /// subset. Real Gemma4 GGUF artifacts still fail here because they carry
-    /// multimodal and quantized-origin features whose execution semantics are
-    /// not implemented yet.
+    /// multimodal features whose execution semantics are not implemented yet.
     pub fn ensure_supported_for_text_forward(&self) -> Result<()> {
         let mut requested = Vec::new();
 
         if self.multimodal {
             requested.push("multimodal".to_string());
         }
-        if self.has_quantized_tensors {
-            requested.push("quantized_tensors".to_string());
-        }
-        if self.quantization != Gemma4Quantization::Unquantized {
-            requested.push(format!("quantization={}", self.quantization.label()));
+        match (&self.quantization, self.has_quantized_tensors) {
+            (Gemma4Quantization::Unquantized, false) | (Gemma4Quantization::Q4KM, true) => {}
+            (Gemma4Quantization::Unquantized, true) => {
+                requested
+                    .push("quantization_metadata=unquantized_with_quantized_tensors".to_string());
+            }
+            (Gemma4Quantization::Q4KM, false) => {
+                requested
+                    .push("quantization_metadata=q4_k_m_without_quantized_tensors".to_string());
+            }
+            (Gemma4Quantization::FileType(_), _) => {
+                requested.push(format!("quantization={}", self.quantization.label()));
+            }
         }
         if self.attention_key_length != self.attention_value_length {
             requested.push("distinct_global_key_value_widths".to_string());
@@ -122,7 +129,7 @@ impl Gemma4Config {
             feature: "gemma4.text_forward_features".to_string(),
             requested: Some(requested.join(",")),
             supported: vec![
-                "text-only unquantized dense F32 synthetic subset with full or sliding-window causal attention, GGUF sliding-window pattern metadata, shared-KV reuse, layer-specific SWA/global widths, and final logit softcap"
+                "text-only dense F32/dequantized-F32 subset with full or sliding-window causal attention, GGUF sliding-window pattern metadata, shared-KV reuse, layer-specific SWA/global widths, and final logit softcap"
                     .to_string(),
             ],
         }))
@@ -340,8 +347,8 @@ pub fn load_gemma4_dense_tensors_from_gguf(
 ///
 /// This proves the artifact can be read as values; it does not make Gemma4
 /// executable. `Gemma4Config::ensure_supported_for_execution` remains the
-/// conservative full-artifact execution gate until multimodal,
-/// quantized-origin, and real-artifact parity work land.
+/// conservative full-artifact execution gate until multimodal and
+/// real-artifact parity work land.
 pub fn load_gemma4_dequantized_tensors_from_gguf(
     path: impl AsRef<Path>,
 ) -> Result<(Gemma4Config, Vec<LoadedTensor>)> {
@@ -2839,11 +2846,32 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("quantized_tensors"));
-                assert!(requested.contains("quantization=q4_k_m"));
             }
             other => panic!("expected Unsupported for real Gemma4 text forward, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gemma4_text_prefill_accepts_dequantized_q4_k_m_origin_when_text_only() {
+        let cfg = tiny_real_shaped_text_config();
+        let path = tmp_path("dequantized_q4_k_m_text_forward");
+        write_tiny_gemma4_gguf(&path, &cfg);
+
+        let (mut loaded_cfg, tensors) = load_gemma4_dequantized_tensors_from_gguf(&path)
+            .expect("tiny real-shaped Gemma4 GGUF dequantized tensors must load");
+        loaded_cfg.multimodal = false;
+        let weights = Gemma4TextWeights::from_loaded_tensors(&loaded_cfg, tensors)
+            .expect("dequantized Q4_K_M-origin Gemma4 tensors must map into text weights");
+        let model = Gemma4TextModel::new(loaded_cfg.clone(), weights)
+            .expect("text-only dequantized Q4_K_M-origin Gemma4 model must construct");
+        let logits = model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("text-only dequantized Q4_K_M-origin Gemma4 prefill must execute");
+
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(logits.len(), loaded_cfg.tokenizer_token_count);
+        assert!(logits.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -3045,10 +3073,56 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("quantized_tensors"));
-                assert!(requested.contains("quantization=q4_k_m"));
             }
             other => panic!("expected Unsupported for real Gemma4 text forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemma4_text_model_new_rejects_unknown_or_inconsistent_quantization_metadata() {
+        let mut unknown = tiny_text_config();
+        unknown.quantization = Gemma4Quantization::FileType(99);
+        unknown.has_quantized_tensors = true;
+
+        let mut inconsistent_unquantized = tiny_text_config();
+        inconsistent_unquantized.has_quantized_tensors = true;
+
+        let mut inconsistent_q4_k_m = tiny_text_config();
+        inconsistent_q4_k_m.quantization = Gemma4Quantization::Q4KM;
+
+        for (cfg, expected) in [
+            (unknown, "quantization=gguf_file_type_99"),
+            (
+                inconsistent_unquantized,
+                "quantization_metadata=unquantized_with_quantized_tensors",
+            ),
+            (
+                inconsistent_q4_k_m,
+                "quantization_metadata=q4_k_m_without_quantized_tensors",
+            ),
+        ] {
+            let weights = Gemma4TextWeights {
+                token_embd: Vec::new(),
+                layers: Vec::new(),
+                output_norm_w: Vec::new(),
+                lm_head_w: Vec::new(),
+                tie_word_embeddings: true,
+            };
+
+            let err = Gemma4TextModel::new(cfg, weights)
+                .expect_err("unsupported quantization metadata must fail before weight checks");
+
+            match err {
+                OcelotlError::Unsupported(unsupported) => {
+                    assert_eq!(unsupported.feature, "gemma4.text_forward_features");
+                    let requested = unsupported.requested.unwrap();
+                    assert!(
+                        requested.contains(expected),
+                        "expected requested `{requested}` to contain `{expected}`"
+                    );
+                }
+                other => panic!("expected Unsupported for quantization metadata, got {other:?}"),
+            }
         }
     }
 

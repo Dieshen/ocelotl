@@ -110,31 +110,38 @@ Gemma4:
 - A follow-up text-forward slice makes the CPU/reference model loop
   layer-aware for SWA/global attention widths and RoPE bases. Mixed SWA/global
   widths are now executable only for the text-only unquantized dense F32
-  full-attention subset; multimodal, quantized-origin, and reference
-  real-artifact parity remain open.
+  full-attention subset; multimodal and reference real-artifact parity remain
+  open.
 - A follow-up final-logit softcap slice applies Gemma4's
   `cap * tanh(logit / cap)` transform in the same supported synthetic
   text-forward path and validates the cap before compute. This does not enable
-  real Q4_K_M execution yet.
+  the selected multimodal real artifact yet.
 - A follow-up sliding-window mask slice adds a windowed causal GQA kernel and
   routes Gemma4 SWA layers through it when `attention_sliding_window` is set.
   Global layers keep full causal attention. This still does not enable the real
-  Q4_K_M artifact because multimodal, quantized-origin, and reference parity
-  work remain open.
+  Q4_K_M artifact because multimodal handling and reference parity work remain
+  open.
 - A follow-up sliding-window pattern slice preserves GGUF bool array values for
   `gemma4.attention.sliding_window_pattern`, validates one pattern entry per
   layer, and uses the pattern as the authority for SWA/global width, RoPE base,
   and full/windowed attention dispatch. This matches llama.cpp's convention
   that `true` means SWA/windowed and `false` means dense/global, while keeping
-  multimodal, quantized-origin, and real-artifact logits parity open.
+  multimodal handling and real-artifact logits parity open.
 - A follow-up shared-KV slice implements the llama.cpp source-layer mapping for
   the supported synthetic text path: `kv_from_start = block_count -
   shared_kv_layers`, shared SWA/windowed layers reuse `kv_from_start - 2`, and
   shared dense/global layers reuse `kv_from_start - 1`. `Gemma4TextModel`
   reuses cached post-K-RMSNorm, post-RoPE K activations plus V activations from
   the source layer while keeping current-layer Q, output projection, and MLP
-  behavior. Real Q4_K_M execution remains blocked on multimodal,
-  quantized-origin, and real-artifact logits parity.
+  behavior. Real Q4_K_M execution remains blocked on multimodal handling and
+  real-artifact logits parity.
+- A follow-up dequantized-origin slice allows the same text-forward path to
+  execute Q4_K_M-origin Gemma4 text tensors after they have been explicitly
+  materialized through `load_gguf_tensors_dequantized_f32`. The gate now trusts
+  the Ocelotl-owned F32 `Gemma4TextWeights` bundle rather than the artifact's
+  quantization metadata. Raw quantized loaded tensors remain rejected by the
+  dequantized tensor validator. The selected real artifact remains blocked on
+  multimodal handling and real-artifact logits parity.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

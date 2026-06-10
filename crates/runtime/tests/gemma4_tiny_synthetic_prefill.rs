@@ -3,8 +3,8 @@
 //! This test is intentionally narrower than the selected real Gemma4 Q4_K_M
 //! artifact. It pins the first supported execution subset: text-only, dense
 //! F32 weights, no multimodal inputs, and synthetic shared-KV attention. The
-//! real GGUF artifact remains rejected until multimodal, quantized-origin
-//! execution, and reference parity are complete.
+//! real GGUF artifact remains rejected until multimodal execution and reference
+//! parity are complete.
 
 use ocelotl_core::{OcelotlError, TokenId};
 use ocelotl_models::gemma::{
