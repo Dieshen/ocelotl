@@ -88,16 +88,13 @@ impl Gemma4Config {
 
     /// Return `Ok(())` only for the explicitly supported MF.7 text-forward
     /// subset. Real Gemma4 GGUF artifacts still fail here because they carry
-    /// multimodal, shared-KV, and quantized-origin features whose execution
-    /// semantics are not implemented yet.
+    /// multimodal and quantized-origin features whose execution semantics are
+    /// not implemented yet.
     pub fn ensure_supported_for_text_forward(&self) -> Result<()> {
         let mut requested = Vec::new();
 
         if self.multimodal {
             requested.push("multimodal".to_string());
-        }
-        if self.attention_shared_kv_layers.is_some() {
-            requested.push("shared_kv_layers".to_string());
         }
         if self.has_quantized_tensors {
             requested.push("quantized_tensors".to_string());
@@ -125,7 +122,7 @@ impl Gemma4Config {
             feature: "gemma4.text_forward_features".to_string(),
             requested: Some(requested.join(",")),
             supported: vec![
-                "text-only unquantized dense F32 synthetic subset with full or sliding-window causal attention, GGUF sliding-window pattern metadata, layer-specific SWA/global widths, and final logit softcap"
+                "text-only unquantized dense F32 synthetic subset with full or sliding-window causal attention, GGUF sliding-window pattern metadata, shared-KV reuse, layer-specific SWA/global widths, and final logit softcap"
                     .to_string(),
             ],
         }))
@@ -343,8 +340,8 @@ pub fn load_gemma4_dense_tensors_from_gguf(
 ///
 /// This proves the artifact can be read as values; it does not make Gemma4
 /// executable. `Gemma4Config::ensure_supported_for_execution` remains the
-/// execution gate for multimodal, shared-KV, softcap, and family
-/// forward-path support.
+/// conservative full-artifact execution gate until multimodal,
+/// quantized-origin, and real-artifact parity work land.
 pub fn load_gemma4_dequantized_tensors_from_gguf(
     path: impl AsRef<Path>,
 ) -> Result<(Gemma4Config, Vec<LoadedTensor>)> {
@@ -510,8 +507,8 @@ pub struct Gemma4TextWeights {
 impl Gemma4TextWeights {
     /// Build the MF.7 text-forward weight bundle from loader-owned tensor
     /// values. This intentionally consumes only the decoder-core subset; PLE,
-    /// per-layer token embeddings, output scale, post norms, softcap, and
-    /// sliding/shared KV semantics remain outside the executable subset.
+    /// per-layer token embeddings, output scale, and post norms remain outside
+    /// the executable subset.
     pub fn from_loaded_tensors(config: &Gemma4Config, tensors: Vec<LoadedTensor>) -> Result<Self> {
         validate_gemma4_text_weight_config(config)?;
 
@@ -735,22 +732,23 @@ impl Gemma4TextModel {
         let mut gate_buf = vec![0.0_f32; seq * f];
         let mut up_buf = vec![0.0_f32; seq * f];
         let mut mlp_out = vec![0.0_f32; seq * h];
+        let mut layer_kv_activations: Vec<Option<Gemma4LayerKvActivations>> =
+            (0..cfg.block_count).map(|_| None).collect();
 
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let attention = gemma4_layer_attention_dims(cfg, layer_idx, None)?;
             let head_dim = attention.key_length;
             let q_out = attention.q_width;
-            let kv_out = attention.k_width;
+            let k_out = attention.k_width;
+            let v_out = attention.v_width;
+            let shared_kv_source_layer = gemma4_shared_kv_source_layer(cfg, layer_idx)?;
             let theta = if gemma4_uses_global_attention(cfg, layer_idx) {
                 cfg.rope_freq_base
             } else {
                 cfg.rope_freq_base_swa
             };
             let mut q_buf = vec![0.0_f32; seq * q_out];
-            let mut k_buf = vec![0.0_f32; seq * kv_out];
             let mut q_norm_buf = vec![0.0_f32; seq * q_out];
-            let mut k_norm_buf = vec![0.0_f32; seq * kv_out];
-            let mut v_buf = vec![0.0_f32; seq * attention.v_width];
             let mut attn_out = vec![0.0_f32; seq * q_out];
 
             residual_buf.copy_from_slice(&hidden);
@@ -759,20 +757,6 @@ impl Gemma4TextModel {
                 .rmsnorm(&hidden, seq, h, &layer.attn_norm_w, eps, &mut norm_buf)?;
             self.kernels
                 .matmul(&norm_buf, (seq, h), &layer.attn_q_w, (h, q_out), &mut q_buf)?;
-            self.kernels.matmul(
-                &norm_buf,
-                (seq, h),
-                &layer.attn_k_w,
-                (h, kv_out),
-                &mut k_buf,
-            )?;
-            self.kernels.matmul(
-                &norm_buf,
-                (seq, h),
-                &layer.attn_v_w,
-                (h, kv_out),
-                &mut v_buf,
-            )?;
 
             self.kernels.rmsnorm(
                 &q_buf,
@@ -781,14 +765,6 @@ impl Gemma4TextModel {
                 &layer.attn_q_norm_w,
                 eps,
                 &mut q_norm_buf,
-            )?;
-            self.kernels.rmsnorm(
-                &k_buf,
-                seq * kv_heads,
-                head_dim,
-                &layer.attn_k_norm_w,
-                eps,
-                &mut k_norm_buf,
             )?;
 
             for pos in 0..seq {
@@ -799,14 +775,80 @@ impl Gemma4TextModel {
                     pos,
                     theta,
                 )?;
-                let k_start = pos * kv_out;
-                self.kernels.rope_apply_inplace(
-                    &mut k_norm_buf[k_start..k_start + kv_out],
-                    head_dim,
-                    pos,
-                    theta,
-                )?;
             }
+
+            let mut produced_kv = None;
+            let (k_for_attention, v_for_attention) = if let Some(source_layer) =
+                shared_kv_source_layer
+            {
+                let source_kv = match layer_kv_activations
+                    .get(source_layer)
+                    .and_then(Option::as_ref)
+                {
+                    Some(source_kv) => source_kv,
+                    None => {
+                        return Err(invalid(
+                            "gemma4.attention.shared_kv_layers",
+                            &format!(
+                                "shared KV source layer {source_layer} for layer {layer_idx} has not been computed"
+                            ),
+                        ));
+                    }
+                };
+                if source_kv.attention != attention {
+                    return Err(invalid(
+                        "gemma4.attention.shared_kv_layers",
+                        &format!(
+                            "shared KV source layer {source_layer} dimensions do not match layer {layer_idx}"
+                        ),
+                    ));
+                }
+                (&source_kv.k[..], &source_kv.v[..])
+            } else {
+                let mut k_buf = vec![0.0_f32; seq * k_out];
+                let mut k_norm_buf = vec![0.0_f32; seq * k_out];
+                let mut v_buf = vec![0.0_f32; seq * v_out];
+                self.kernels.matmul(
+                    &norm_buf,
+                    (seq, h),
+                    &layer.attn_k_w,
+                    (h, k_out),
+                    &mut k_buf,
+                )?;
+                self.kernels.matmul(
+                    &norm_buf,
+                    (seq, h),
+                    &layer.attn_v_w,
+                    (h, v_out),
+                    &mut v_buf,
+                )?;
+                self.kernels.rmsnorm(
+                    &k_buf,
+                    seq * kv_heads,
+                    head_dim,
+                    &layer.attn_k_norm_w,
+                    eps,
+                    &mut k_norm_buf,
+                )?;
+                for pos in 0..seq {
+                    let k_start = pos * k_out;
+                    self.kernels.rope_apply_inplace(
+                        &mut k_norm_buf[k_start..k_start + k_out],
+                        head_dim,
+                        pos,
+                        theta,
+                    )?;
+                }
+                produced_kv = Some(Gemma4LayerKvActivations {
+                    attention,
+                    k: k_norm_buf,
+                    v: v_buf,
+                });
+                let produced = produced_kv
+                    .as_ref()
+                    .expect("current layer KV activations were just produced");
+                (&produced.k[..], &produced.v[..])
+            };
 
             if let Some(sliding_window) = cfg
                 .attention_sliding_window
@@ -814,8 +856,8 @@ impl Gemma4TextModel {
             {
                 self.kernels.scaled_dot_product_attention_windowed(
                     &q_norm_buf,
-                    &k_norm_buf,
-                    &v_buf,
+                    k_for_attention,
+                    v_for_attention,
                     seq,
                     q_heads,
                     kv_heads,
@@ -826,14 +868,17 @@ impl Gemma4TextModel {
             } else {
                 self.kernels.scaled_dot_product_attention(
                     &q_norm_buf,
-                    &k_norm_buf,
-                    &v_buf,
+                    k_for_attention,
+                    v_for_attention,
                     seq,
                     q_heads,
                     kv_heads,
                     head_dim,
                     &mut attn_out,
                 )?;
+            }
+            if shared_kv_source_layer.is_none() {
+                layer_kv_activations[layer_idx] = produced_kv;
             }
 
             self.kernels.matmul(
@@ -930,6 +975,7 @@ fn validate_gemma4_text_weight_config(config: &Gemma4Config) -> Result<()> {
     if let Some(pattern) = &config.attention_sliding_window_pattern {
         validate_sliding_window_pattern_len(pattern, config.block_count)?;
     }
+    validate_shared_kv_layers(config)?;
     validate_positive("gemma4.rope.dimension_count", config.rope_dimension_count)?;
     validate_positive(
         "gemma4.rope.dimension_count_swa",
@@ -1086,11 +1132,18 @@ fn validate_gemma4_text_weight_lengths(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gemma4LayerAttentionDims {
     key_length: usize,
     q_width: usize,
     k_width: usize,
     v_width: usize,
+}
+
+struct Gemma4LayerKvActivations {
+    attention: Gemma4LayerAttentionDims,
+    k: Vec<f32>,
+    v: Vec<f32>,
 }
 
 fn gemma4_layer_attention_dims(
@@ -1333,6 +1386,104 @@ fn gemma4_uses_swa_attention(config: &Gemma4Config, layer: usize) -> bool {
         .as_ref()
         .and_then(|pattern| pattern.get(layer).copied())
         .unwrap_or(layer % 6 != 5)
+}
+
+fn gemma4_shared_kv_source_layer(config: &Gemma4Config, layer: usize) -> Result<Option<usize>> {
+    if layer >= config.block_count {
+        return Err(invalid(
+            "gemma4.attention.shared_kv_layers",
+            &format!(
+                "layer index {layer} is out of range for block_count {}",
+                config.block_count
+            ),
+        ));
+    }
+
+    let Some(shared_layers) = config.attention_shared_kv_layers else {
+        return Ok(None);
+    };
+    validate_positive("gemma4.attention.shared_kv_layers", shared_layers)?;
+
+    let kv_from_start = config
+        .block_count
+        .checked_sub(shared_layers)
+        .ok_or_else(|| {
+            invalid(
+                "gemma4.attention.shared_kv_layers",
+                &format!(
+                    "shared layer count {shared_layers} exceeds block_count {}",
+                    config.block_count
+                ),
+            )
+        })?;
+    if layer < kv_from_start {
+        return Ok(None);
+    }
+
+    let (source_layer, target_kind) = if gemma4_uses_swa_attention(config, layer) {
+        (kv_from_start.checked_sub(2), "SWA/windowed attention")
+    } else {
+        (kv_from_start.checked_sub(1), "global/dense attention")
+    };
+    source_layer
+        .filter(|source| *source < layer)
+        .ok_or_else(|| {
+            invalid(
+                "gemma4.attention.shared_kv_layers",
+                &format!(
+                    "shared KV layer {layer} requires an earlier {target_kind} source layer before first shared layer {kv_from_start}"
+                ),
+            )
+        })
+        .map(Some)
+}
+
+fn validate_shared_kv_layers(config: &Gemma4Config) -> Result<()> {
+    let Some(shared_layers) = config.attention_shared_kv_layers else {
+        return Ok(());
+    };
+    validate_positive("gemma4.attention.shared_kv_layers", shared_layers)?;
+
+    let kv_from_start = config
+        .block_count
+        .checked_sub(shared_layers)
+        .ok_or_else(|| {
+            invalid(
+                "gemma4.attention.shared_kv_layers",
+                &format!(
+                    "shared layer count {shared_layers} exceeds block_count {}",
+                    config.block_count
+                ),
+            )
+        })?;
+    for layer in kv_from_start..config.block_count {
+        let source = gemma4_shared_kv_source_layer(config, layer)?.ok_or_else(|| {
+            invalid(
+                "gemma4.attention.shared_kv_layers",
+                &format!("shared layer {layer} did not resolve to a source layer"),
+            )
+        })?;
+        if gemma4_uses_swa_attention(config, source) != gemma4_uses_swa_attention(config, layer) {
+            let target_kind = if gemma4_uses_swa_attention(config, layer) {
+                "SWA/windowed"
+            } else {
+                "global/dense"
+            };
+            let source_kind = if gemma4_uses_swa_attention(config, source) {
+                "SWA/windowed"
+            } else {
+                "global/dense"
+            };
+            return Err(invalid(
+                "gemma4.attention.shared_kv_layers",
+                &format!(
+                    "shared KV source layer {source} is {source_kind}, but layer {layer} is {target_kind}"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_gemma4_tensor_dimensions(config: &Gemma4Config, path: Option<&Path>) -> Result<()> {
@@ -1985,7 +2136,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             attention_sliding_window: Some(4),
             attention_shared_kv_layers: Some(2),
-            attention_sliding_window_pattern: Some(vec![true, true, true, true, true, false]),
+            attention_sliding_window_pattern: Some(vec![true, true, true, false, true, false]),
             final_logit_softcap: Some(30.0),
             tokenizer_model: Some("gemma4".to_string()),
             tokenizer_token_count: 16,
@@ -2098,6 +2249,14 @@ mod tests {
             ]);
         }
         tensors
+    }
+
+    fn poison_text_tensor(tensors: &mut [LoadedTensor], name: &str) {
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("expected test tensor `{name}` to exist"));
+        tensor.values.fill(f32::NAN);
     }
 
     fn loaded_tensor_for_dense_spec(spec: &Gemma4TensorSpec) -> LoadedTensor {
@@ -2680,7 +2839,6 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("shared_kv_layers"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
             }
@@ -2743,6 +2901,132 @@ mod tests {
     }
 
     #[test]
+    fn shared_kv_source_layer_matches_llama_cpp_mapping_for_patterned_layers() {
+        let mut cfg = tiny_mixed_attention_text_config();
+        cfg.block_count = 8;
+        cfg.attention_shared_kv_layers = Some(2);
+        cfg.attention_sliding_window_pattern =
+            Some(vec![true, true, true, true, true, false, true, false]);
+
+        assert_eq!(gemma4_shared_kv_source_layer(&cfg, 0).unwrap(), None);
+        assert_eq!(gemma4_shared_kv_source_layer(&cfg, 5).unwrap(), None);
+        assert_eq!(gemma4_shared_kv_source_layer(&cfg, 6).unwrap(), Some(4));
+        assert_eq!(gemma4_shared_kv_source_layer(&cfg, 7).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn gemma4_text_prefill_reuses_shared_kv_source_activations() {
+        let mut cfg = tiny_mixed_attention_text_config();
+        cfg.block_count = 8;
+        cfg.tensor_count = 142;
+        cfg.attention_sliding_window = Some(2);
+        cfg.attention_shared_kv_layers = Some(2);
+        cfg.attention_sliding_window_pattern =
+            Some(vec![true, true, true, true, true, false, true, false]);
+        let mut tensors = complete_text_loaded_tensors(&cfg);
+        for layer in [6, 7] {
+            poison_text_tensor(&mut tensors, &format!("blk.{layer}.attn_k.weight"));
+            poison_text_tensor(&mut tensors, &format!("blk.{layer}.attn_v.weight"));
+        }
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("shared-KV synthetic Gemma4 text tensors must map into weights");
+
+        let model = Gemma4TextModel::new(cfg.clone(), weights)
+            .expect("valid shared-KV synthetic text config must construct");
+        let logits = model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("shared-KV Gemma4 text prefill must execute");
+
+        assert_eq!(logits.len(), cfg.tokenizer_token_count);
+        assert!(
+            logits.iter().all(|value| value.is_finite()),
+            "shared layers must reuse source K/V activations instead of poisoned local K/V weights"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_prefill_uses_local_kv_when_shared_kv_is_disabled() {
+        let mut cfg = tiny_mixed_attention_text_config();
+        cfg.block_count = 8;
+        cfg.tensor_count = 142;
+        cfg.attention_sliding_window = Some(2);
+        cfg.attention_sliding_window_pattern =
+            Some(vec![true, true, true, true, true, false, true, false]);
+        let mut tensors = complete_text_loaded_tensors(&cfg);
+        poison_text_tensor(&mut tensors, "blk.6.attn_k.weight");
+        poison_text_tensor(&mut tensors, "blk.6.attn_v.weight");
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("non-shared synthetic Gemma4 text tensors must map into weights");
+
+        let model = Gemma4TextModel::new(cfg.clone(), weights)
+            .expect("non-shared synthetic text config must construct");
+        let logits = model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("non-shared Gemma4 text prefill must execute");
+
+        assert!(
+            logits.iter().any(|value| !value.is_finite()),
+            "poisoned local K/V weights must be observable when shared-KV is disabled"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_model_new_rejects_shared_kv_source_kind_mismatch() {
+        let mut cfg = tiny_mixed_attention_text_config();
+        cfg.attention_shared_kv_layers = Some(2);
+        cfg.attention_sliding_window_pattern = Some(vec![true, true, true, true, true, false]);
+        let weights = Gemma4TextWeights {
+            token_embd: Vec::new(),
+            layers: Vec::new(),
+            output_norm_w: Vec::new(),
+            lm_head_w: Vec::new(),
+            tie_word_embeddings: true,
+        };
+
+        let err = Gemma4TextModel::new(cfg, weights)
+            .expect_err("shared-KV source layers must match the target attention kind");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("gemma4.attention.shared_kv_layers")
+                );
+                assert!(invalid.message.contains("source layer"));
+            }
+            other => panic!("expected InvalidModel for bad shared-KV mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemma4_text_model_new_rejects_shared_kv_without_source_layers() {
+        let mut cfg = tiny_text_config();
+        cfg.attention_shared_kv_layers = Some(1);
+        cfg.attention_sliding_window_pattern = Some(vec![true]);
+        let weights = Gemma4TextWeights {
+            token_embd: Vec::new(),
+            layers: Vec::new(),
+            output_norm_w: Vec::new(),
+            lm_head_w: Vec::new(),
+            tie_word_embeddings: true,
+        };
+
+        let err = Gemma4TextModel::new(cfg, weights)
+            .expect_err("shared-KV requires earlier source layers");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(
+                    invalid.field.as_deref(),
+                    Some("gemma4.attention.shared_kv_layers")
+                );
+                assert!(invalid.message.contains("source layer"));
+            }
+            other => panic!("expected InvalidModel for invalid shared-KV count, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn gemma4_text_model_new_rejects_real_q4_k_m_execution_features() {
         let cfg = fixture_config();
         let weights = Gemma4TextWeights {
@@ -2761,7 +3045,6 @@ mod tests {
                 assert_eq!(unsupported.feature, "gemma4.text_forward_features");
                 let requested = unsupported.requested.unwrap();
                 assert!(requested.contains("multimodal"));
-                assert!(requested.contains("shared_kv_layers"));
                 assert!(requested.contains("quantized_tensors"));
                 assert!(requested.contains("quantization=q4_k_m"));
             }

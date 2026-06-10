@@ -2,7 +2,7 @@
 //!
 //! MF.7 supports only `Gemma4TextModel`: a text-only synthetic dense subset.
 //! Real Gemma4 GGUF artifacts remain rejected at the model boundary until the
-//! multimodal, shared-KV, quantized-origin, and full parity policies land.
+//! multimodal, quantized-origin, and full parity policies land.
 
 use ocelotl_core::{Result, TokenId};
 use ocelotl_models::gemma::Gemma4TextModel;

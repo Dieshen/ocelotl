@@ -57,9 +57,9 @@ packing, Q5 high-bit lanes, and Q6 signed scales. This is still a loader value
 contract, not a real Gemma4 Q4_K_M execution claim. MF.7 adds only an
 unquantized dense F32 synthetic text subset; follow-up text-forward slices
 handle mixed SWA/global layer widths, GGUF sliding-window pattern metadata,
-sliding-window masking, and final logit softcap for that subset. Real Gemma4
-Q4_K_M execution remains blocked until shared-KV, quantized-origin, multimodal,
-and reference parity tests exist.
+sliding-window masking, shared-KV reuse, and final logit softcap for that
+subset. Real Gemma4 Q4_K_M execution remains blocked until quantized-origin,
+multimodal, and reference parity tests exist.
 
 ## Kernel Contract
 

@@ -2,8 +2,8 @@
 //!
 //! This test is intentionally narrower than the selected real Gemma4 Q4_K_M
 //! artifact. It pins the first supported execution subset: text-only, dense
-//! F32 weights, no multimodal inputs, and no shared-KV attention. The real
-//! GGUF artifact remains rejected until those features, quantized-origin
+//! F32 weights, no multimodal inputs, and synthetic shared-KV attention. The
+//! real GGUF artifact remains rejected until multimodal, quantized-origin
 //! execution, and reference parity are complete.
 
 use ocelotl_core::{OcelotlError, TokenId};
@@ -228,6 +228,29 @@ fn gemma4_prefill_applies_sliding_window_mask_through_runtime_path() {
     assert!(
         max_diff > SLIDING_WINDOW_DRIFT_TOLERANCE,
         "sliding-window mask must produce a distinct output on the tripwire prompt; max diff {max_diff}"
+    );
+}
+
+#[test]
+fn gemma4_prefill_accepts_shared_kv_through_runtime_path() {
+    let fixture = load_fixture();
+    let prompt: Vec<TokenId> = fixture.prompt_tokens.iter().copied().map(TokenId).collect();
+    let mut cfg = tiny_config();
+    cfg.attention_shared_kv_layers = Some(1);
+    cfg.attention_sliding_window_pattern = Some(vec![false, false]);
+    let mut weights = tiny_weights(&cfg);
+    weights.layers[1].attn_k_w.fill(f32::NAN);
+    weights.layers[1].attn_v_w.fill(f32::NAN);
+    weights.layers[1].attn_k_norm_w.fill(f32::NAN);
+    let model = Gemma4TextModel::new(cfg.clone(), weights)
+        .expect("shared-KV tiny Gemma4 text model must build");
+
+    let logits = prefill(&model, &prompt).expect("shared-KV Gemma4 prefill must succeed");
+
+    assert_eq!(logits.len(), fixture.expected_logits.len());
+    assert!(
+        logits.iter().all(|value| value.is_finite()),
+        "shared-KV runtime path must ignore poisoned K/V tensors on the shared suffix layer"
     );
 }
 

@@ -158,27 +158,33 @@ and does not modify the closed M3.6 MLP task.
   The synthetic text-only forward path now computes each decoder layer with its
   own SWA or global q/k/v widths and RoPE base. This lifts the mixed-width
   blocker only for unquantized dense F32, full-attention synthetic configs;
-  multimodal, shared-KV, and quantized-origin real-artifact execution remain
-  rejected before compute.
+  multimodal and quantized-origin real-artifact execution remain rejected
+  before compute.
 - `Follow-up`: Gemma4 final logit softcap landed 2026-06-05. The supported
   synthetic text-forward path now applies `cap * tanh(logit / cap)` after the
   tied embedding logits projection and rejects invalid non-positive or
   non-finite softcap values before compute. Real Q4_K_M execution remains
-  blocked on multimodal, shared-KV, quantized-origin, and reference parity
-  work.
+  blocked on multimodal, quantized-origin, and reference parity work.
 - `Follow-up`: Gemma4 sliding-window masking landed 2026-06-09. The kernel
   boundary now has a windowed causal GQA attention variant, and
   `Gemma4TextModel::prefill` routes SWA layers through it when
   `attention_sliding_window` is present while global layers keep full causal
   attention. Real Q4_K_M execution remains blocked on multimodal,
-  shared-KV, quantized-origin, and reference parity.
+  quantized-origin, and reference parity.
 - `Follow-up`: Gemma4 sliding-window pattern metadata landed 2026-06-09. GGUF
   header inspection now preserves bool array values, `Gemma4Config` stores and
   validates one `gemma4.attention.sliding_window_pattern` entry per layer, and
   the text-forward path uses that pattern for SWA/global layer widths, RoPE
   base selection, and full/windowed attention dispatch. Real Q4_K_M execution
-  remains blocked on multimodal, shared-KV, quantized-origin, and reference
-  parity.
+  remains blocked on multimodal, quantized-origin, and reference parity.
+- `Follow-up`: Gemma4 shared-KV reuse landed 2026-06-09. The supported
+  synthetic text-forward path now validates llama.cpp-style source mappings
+  with `kv_from_start = block_count - shared_kv_layers`, reuses
+  post-K-RMSNorm/post-RoPE K activations plus V activations from
+  `kv_from_start - 2` for shared SWA/windowed layers and `kv_from_start - 1`
+  for shared dense/global layers, and keeps current-layer Q, output projection,
+  and MLP behavior. Real Q4_K_M execution remains blocked on multimodal,
+  quantized-origin, and reference parity.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 
