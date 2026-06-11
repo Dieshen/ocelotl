@@ -198,18 +198,43 @@ materialization of the required Q4_K_M-origin text tensors.
   `load_gemma4_dequantized_tensors_from_gguf`, builds `Gemma4TextModel`, runs
   `ocelotl_runtime::gemma::prefill`, and compares every final-position logit
   against llama.cpp.
+- **llama.cpp tensor-summary reference, opt-in local execution**:
+  `local_gemma4_q4_k_m_late_tensor_summaries_match_llama_cpp_debug`,
+  `local_gemma4_q4_k_m_layer_output_summaries_match_llama_cpp_debug`, and
+  `local_gemma4_q4_k_m_layer0_substep_summaries_match_llama_cpp_debug` run
+  `llama-debug --verbose --tensor-filter ... --no-warmup` without
+  `--save-logits`. The default suite pins the tensor-summary parser shape and
+  duplicate-callback behavior; the ignored tests compare Ocelotl trace sums
+  against llama.cpp tensor sums without requiring full tensor dumps.
+- **Native K-quant projection discriminator, opt-in local execution**:
+  `local_gemma4_q4_k_m_native_kquant_q8k_qcur_summary_matches_llama_cpp_debug`
+  reads raw `blk.0.attn_q.weight` bytes by GGUF manifest offset, quantizes the
+  matching Ocelotl `attn_norm-0` activation to GGML-style Q8_K, and ports the
+  relevant llama.cpp K-quant/Q8_K dot path. This is a proof harness, not the
+  production execution path.
 
-Current status: the latest local proof run after the attention-scale,
-V-RMSNorm, and tanh-GEGLU fixes on 2026-06-10 completed the llama.cpp side and
-Ocelotl side against llama.cpp
-`856c3adac1709be15e1ea2529a0e89f742d25fe0`, but parity is still red. It failed
-at token 0 with `Ocelotl -14.446298`, llama.cpp `-18.2152`, diff `3.7689028`.
-The closed semantic gaps so far are llama.cpp-style `sqrt(hidden)` token
-embedding scaling, Gemma4 score scale `1.0`, unweighted V RMSNorm before KV
-storage/reuse, and tanh-approx GEGLU FFN. The remaining text decoder operations
-still need parity work before this proof can pass, especially
-post-attention/post-FFN norms, per-layer embeddings, layer-output scale, PLE,
-and RoPE frequency-factor behavior.
+Current status: the full-logit proof was last run before the GGUF matrix-layout
+fix and failed at token 0 with `Ocelotl -2.544672`, llama.cpp `-18.2152`, diff
+`15.670528`. The current discriminator is the 2026-06-11 tensor-summary proof
+against llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0`: after fixing
+Gemma4's GGUF adapter so token embeddings stay in GGUF row order and matrix
+weights transpose into Ocelotl row-major matmul layout, `inp_scaled` and
+`attn_norm-0` match llama.cpp within tolerance. The first remaining mismatch is
+the first layer's quantized Q projection: `Qcur-0` sum `Ocelotl -30.809566`,
+llama.cpp `-14.434416`, diff `16.37515`. The closed semantic gaps so far are
+llama.cpp-style `sqrt(hidden)` token embedding scaling, Gemma4 score scale
+`1.0`, unweighted V RMSNorm before KV storage/reuse, tanh-approx GEGLU FFN,
+weighted post-attention/post-FFN RMSNorm before residual adds, per-layer input
+embeddings, layer output scales, Gemma4 global-attention RoPE frequency factors,
+and GGUF matrix layout at the Gemma4 weight adapter. A local tensor-name scan of
+the selected GGUF found `attn_v.weight` tensors and did not find
+`output.weight` or MoE router/expert tensors, so those optional llama.cpp
+branches are not the current selected-artifact explanation. A follow-up native
+K-quant discriminator passed locally on 2026-06-11: the selected artifact stores
+`blk.0.attn_q.weight` as Q6_K, and the ported Q6_K x Q8_K projection sum matches
+llama.cpp's `Qcur-0` summary. The active implementation gap is therefore the
+public text path's eager F32 dequantized matmul, not scalar K-quant unpacking or
+GGUF matrix layout.
 
 The `0.05` tolerance is deliberately wider than the synthetic `1e-4` fixture
 because this compares Ocelotl's eagerly dequantized F32 path against llama.cpp's

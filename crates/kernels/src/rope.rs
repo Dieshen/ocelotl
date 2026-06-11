@@ -66,8 +66,31 @@ pub fn rope_apply_inplace(
 ) -> Result<()> {
     let half = validate_rope_shape(CPU_BACKEND, x.len(), head_dim)?;
     let (cos, sin) = rope_trig_tables(head_dim, position, theta);
+    apply_rope_tables(x, head_dim, half, &cos, &sin);
 
-    // Walk each head row independently.
+    Ok(())
+}
+
+/// Apply RoPE in place with per-pair frequency factors.
+///
+/// `freq_factors[i]` divides the base inverse frequency for pair `i`, matching
+/// llama.cpp's Gemma4 global-attention path.
+pub fn rope_apply_inplace_with_factors(
+    x: &mut [f32],
+    head_dim: usize,
+    position: usize,
+    theta: f32,
+    freq_factors: &[f32],
+) -> Result<()> {
+    let half = validate_rope_shape(CPU_BACKEND, x.len(), head_dim)?;
+    validate_rope_freq_factors(CPU_BACKEND, freq_factors, half)?;
+    let (cos, sin) = rope_trig_tables_with_factors(head_dim, position, theta, freq_factors);
+    apply_rope_tables(x, head_dim, half, &cos, &sin);
+
+    Ok(())
+}
+
+fn apply_rope_tables(x: &mut [f32], head_dim: usize, half: usize, cos: &[f32], sin: &[f32]) {
     for head_offset in (0..x.len()).step_by(head_dim) {
         for i in 0..half {
             let lo = head_offset + i;
@@ -76,6 +99,32 @@ pub fn rope_apply_inplace(
             let x_hi = x[hi];
             x[lo] = x_lo * cos[i] - x_hi * sin[i];
             x[hi] = x_lo * sin[i] + x_hi * cos[i];
+        }
+    }
+}
+
+fn validate_rope_freq_factors(
+    backend: &'static str,
+    freq_factors: &[f32],
+    expected: usize,
+) -> Result<()> {
+    if freq_factors.len() < expected {
+        return Err(rope_err(
+            backend,
+            format!(
+                "rope_apply_inplace freq_factors.len()={} must be at least head_dim/2={expected}",
+                freq_factors.len()
+            ),
+        ));
+    }
+    for (idx, factor) in freq_factors.iter().take(expected).enumerate() {
+        if !factor.is_finite() || *factor <= 0.0 {
+            return Err(rope_err(
+                backend,
+                format!(
+                    "rope_apply_inplace freq_factors[{idx}] must be finite and > 0, got {factor}"
+                ),
+            ));
         }
     }
 
@@ -125,6 +174,29 @@ pub(crate) fn rope_trig_tables(
     for i in 0..half {
         let exponent = -2.0_f32 * (i as f32) / head_dim_f;
         let inv_freq = theta.powf(exponent);
+        let angle = pos_f * inv_freq;
+        cos.push(angle.cos());
+        sin.push(angle.sin());
+    }
+
+    (cos, sin)
+}
+
+fn rope_trig_tables_with_factors(
+    head_dim: usize,
+    position: usize,
+    theta: f32,
+    freq_factors: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let pos_f = position as f32;
+    let head_dim_f = head_dim as f32;
+    let mut cos = Vec::with_capacity(half);
+    let mut sin = Vec::with_capacity(half);
+
+    for (i, factor) in freq_factors.iter().take(half).enumerate() {
+        let exponent = -2.0_f32 * (i as f32) / head_dim_f;
+        let inv_freq = theta.powf(exponent) / *factor;
         let angle = pos_f * inv_freq;
         cos.push(angle.cos());
         sin.push(angle.sin());
@@ -248,6 +320,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rope_frequency_factors_divide_inverse_frequency_per_pair() {
+        let head_dim = 4_usize;
+        let theta = 10_000.0_f32;
+        let position = 1_usize;
+        let mut x = [1.0_f32, 0.0, 0.0, 1.0];
+
+        rope_apply_inplace_with_factors(&mut x, head_dim, position, theta, &[2.0, 4.0])
+            .expect("well-formed factored RoPE call must succeed");
+
+        let c0 = 0.5_f32.cos();
+        let s0 = 0.5_f32.sin();
+        let c1 = 0.0025_f32.cos();
+        let s1 = 0.0025_f32.sin();
+        let expected = [c0, -s1, s0, c1];
+
+        let tol = 1.0e-6_f32;
+        for (idx, (got, want)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < tol,
+                "factored RoPE mismatch at index {idx}: got {got}, want {want}"
+            );
+        }
+    }
+
     // --- Validation tests ---
 
     #[test]
@@ -305,6 +402,19 @@ mod tests {
         let mut x: [f32; 0] = [];
         let err =
             rope_apply_inplace(&mut x, 4, 0, 10_000.0).expect_err("empty slice must be rejected");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+    }
+
+    #[test]
+    fn rope_frequency_factors_reject_short_or_invalid_tables() {
+        let mut x = [1.0_f32, 0.0, 0.0, 1.0];
+        let err = rope_apply_inplace_with_factors(&mut x, 4, 1, 10_000.0, &[1.0])
+            .expect_err("short factor table must be rejected");
+        assert!(matches!(err, OcelotlError::Kernel(_)));
+
+        let mut x = [1.0_f32, 0.0, 0.0, 1.0];
+        let err = rope_apply_inplace_with_factors(&mut x, 4, 1, 10_000.0, &[1.0, 0.0])
+            .expect_err("zero factor must be rejected");
         assert!(matches!(err, OcelotlError::Kernel(_)));
     }
 }

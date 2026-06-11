@@ -340,13 +340,31 @@ through `load_gemma4_dequantized_tensors_from_gguf`, clears
 final-position logit within the fixture tolerance. This is an eager-dequant F32
 text-decoder parity proof, not an audio/image/video multimodal proof.
 
-As of the latest local run after the attention-scale, V-RMSNorm, and
-tanh-GEGLU fixes on 2026-06-10, this harness is operational but the proof is
-expected to fail until the remaining Gemma4 text semantics match llama.cpp.
-That run used llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0` and failed
-at output token 0 (`Ocelotl -14.446298`, llama.cpp `-18.2152`, diff
-`3.7689028`). Treat remaining logit drift here as the active MF.8 parity
-worklist, not as an artifact setup failure, once both local paths are valid.
+For intermediate tensor triage, use the same paths with one of the ignored
+tensor-summary proofs:
+
+```powershell
+cargo test -p ocelotl local_gemma4_q4_k_m_layer0_substep_summaries_match_llama_cpp_debug -- --ignored --nocapture
+cargo test -p ocelotl local_gemma4_q4_k_m_native_kquant_q8k_qcur_summary_matches_llama_cpp_debug -- --ignored --nocapture
+```
+
+These tensor-summary tests invoke `llama-debug --verbose --tensor-filter ...
+--no-warmup` without `--save-logits`, because local llama.cpp uses separate
+paths for final-logit files and tensor callback output.
+
+As of the 2026-06-11 local tensor-summary run, the full-logit proof has not
+been refreshed after the GGUF matrix-layout fix. The active red proof is inside
+the first layer: `inp_scaled` and `attn_norm-0` match llama.cpp, but `Qcur-0`
+differs (`Ocelotl -30.809566`, llama.cpp `-14.434416`, diff `16.37515`). Treat
+remaining drift here as the active MF.8 parity worklist, not as an artifact
+setup failure, once both local paths are valid. The selected artifact scan found
+`attn_v.weight` tensors and no `output.weight` or MoE router/expert names, so
+the next discriminator is the K-quant projection/dequantized-matmul path rather
+than those optional tensor branches. The native K-quant discriminator passed
+locally on 2026-06-11: `blk.0.attn_q.weight` is Q6_K in this Q4_K_M artifact,
+and a ported Q6_K x Q8_K projection matches llama.cpp's `Qcur-0` summary. The
+remaining production gap is wiring that native/repacked projection behavior into
+the public Gemma4 text path.
 
 ## 6. Keeping Artifacts Out Of Git
 

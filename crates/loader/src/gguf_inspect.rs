@@ -270,8 +270,9 @@ impl GgmlTensorType {
         }
     }
 
-    fn byte_len_for_element_count(
+    fn byte_len_for_shape(
         self,
+        shape: &[usize],
         element_count: u64,
         path: &Path,
         tensor_name: &str,
@@ -290,6 +291,23 @@ impl GgmlTensorType {
         }
 
         if let Some(layout) = self.quant_layout() {
+            let row_element_count = shape.first().copied().ok_or_else(|| {
+                invalid_gguf(
+                    path,
+                    Some(tensor_name),
+                    format!("GGUF tensor `{tensor_name}` has no row dimension"),
+                )
+            })? as u64;
+            if row_element_count % layout.block_element_count != 0 {
+                return Err(invalid_gguf(
+                    path,
+                    Some(tensor_name),
+                    format!(
+                        "GGUF tensor `{tensor_name}` row element count {row_element_count} is not divisible by {:?} quant block size {}",
+                        self, layout.block_element_count
+                    ),
+                ));
+            }
             if element_count % layout.block_element_count != 0 {
                 return Err(invalid_gguf(
                     path,
@@ -425,7 +443,7 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
                 format!("GGUF tensor `{name}` offset {offset} is not aligned to {alignment} bytes"),
             ));
         }
-        let byte_len = tensor_type.byte_len_for_element_count(element_count, path, &name)?;
+        let byte_len = tensor_type.byte_len_for_shape(&shape, element_count, path, &name)?;
 
         tensors.push(GgufTensorEntry {
             name,
@@ -1426,6 +1444,25 @@ mod tests {
                 assert!(invalid.message.contains("256"));
             }
             other => panic!("expected InvalidModel for bad K-quant block count, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inspect_gguf_rejects_k_quant_tensor_with_non_block_multiple_row() {
+        let path = tmp_path("q4k_bad_row_count");
+        write_single_tensor_fixture(&path, "blk.0.attn_q.weight", &[128, 2], 12, 0, 144);
+
+        let err = inspect_gguf(&path).expect_err("bad K-quant row width must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("blk.0.attn_q.weight"));
+                assert!(invalid.message.contains("row element count 128"));
+                assert!(invalid.message.contains("256"));
+            }
+            other => panic!("expected InvalidModel for bad K-quant row width, got {other:?}"),
         }
 
         let _ = std::fs::remove_file(path);

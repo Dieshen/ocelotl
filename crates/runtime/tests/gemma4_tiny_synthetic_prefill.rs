@@ -73,6 +73,8 @@ fn tiny_weights(cfg: &Gemma4Config) -> Gemma4TextWeights {
     let q_out = cfg.attention_head_count * cfg.attention_key_length;
     let kv_out = cfg.attention_head_count_kv * cfg.attention_key_length;
     let f = cfg.feed_forward_length;
+    let epl = cfg.embedding_length_per_layer_input;
+    let per_layer_width = cfg.block_count * epl;
 
     let token_embd = synth(1, v * h);
     let lm_head_w = transpose_2d(&token_embd, v, h);
@@ -91,12 +93,22 @@ fn tiny_weights(cfg: &Gemma4Config) -> Gemma4TextWeights {
                 ffn_gate_w: synth(s + 4, h * f),
                 ffn_up_w: synth(s + 5, h * f),
                 ffn_down_w: synth(s + 6, f * h),
+                attn_post_norm_w: vec![1.0; h],
+                ffn_post_norm_w: vec![1.0; h],
+                per_layer_inp_gate_w: vec![0.0; h * epl],
+                per_layer_proj_w: vec![0.0; epl * h],
+                per_layer_post_norm_w: vec![1.0; h],
+                layer_output_scale: 1.0,
             }
         })
         .collect();
 
     Gemma4TextWeights {
         token_embd,
+        per_layer_token_embd: vec![0.0; v * per_layer_width],
+        per_layer_model_proj_w: vec![0.0; h * per_layer_width],
+        per_layer_proj_norm_w: vec![1.0; epl],
+        rope_freqs: vec![1.0; cfg.rope_dimension_count / 2],
         layers,
         output_norm_w: vec![1.0; h],
         lm_head_w,

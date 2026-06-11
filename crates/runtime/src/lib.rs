@@ -200,7 +200,7 @@ mod tests {
             tokenizer_token_count: 8,
             quantization: Gemma4Quantization::Unquantized,
             has_quantized_tensors: false,
-            tensor_count: 13,
+            tensor_count: 23,
             multimodal: false,
         };
         let h = cfg.embedding_length;
@@ -208,6 +208,8 @@ mod tests {
         let q_out = cfg.attention_head_count * cfg.attention_key_length;
         let kv_out = cfg.attention_head_count_kv * cfg.attention_key_length;
         let f = cfg.feed_forward_length;
+        let epl = cfg.embedding_length_per_layer_input;
+        let per_layer_width = cfg.block_count * epl;
         let token_embd: Vec<f32> = (0..v * h).map(|i| (i as f32) * 0.01).collect();
         let mut lm_head_w = vec![0.0_f32; h * v];
         for token in 0..v {
@@ -229,7 +231,17 @@ mod tests {
                 ffn_gate_w: vec![0.01; h * f],
                 ffn_up_w: vec![0.01; h * f],
                 ffn_down_w: vec![0.01; f * h],
+                attn_post_norm_w: vec![1.0; h],
+                ffn_post_norm_w: vec![1.0; h],
+                per_layer_inp_gate_w: vec![0.0; h * epl],
+                per_layer_proj_w: vec![0.0; epl * h],
+                per_layer_post_norm_w: vec![1.0; h],
+                layer_output_scale: 1.0,
             }],
+            per_layer_token_embd: vec![0.0; v * per_layer_width],
+            per_layer_model_proj_w: vec![0.0; h * per_layer_width],
+            per_layer_proj_norm_w: vec![1.0; epl],
+            rope_freqs: vec![1.0; cfg.rope_dimension_count / 2],
             output_norm_w: vec![1.0; h],
             lm_head_w,
             tie_word_embeddings: true,

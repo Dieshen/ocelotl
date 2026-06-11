@@ -496,6 +496,18 @@ pub struct Gemma4TextLayerWeights {
     pub ffn_up_w: Vec<f32>,
     /// `[feed_forward_length, hidden]`.
     pub ffn_down_w: Vec<f32>,
+    /// `[hidden]`.
+    pub attn_post_norm_w: Vec<f32>,
+    /// `[hidden]`.
+    pub ffn_post_norm_w: Vec<f32>,
+    /// `[hidden, embedding_length_per_layer_input]`.
+    pub per_layer_inp_gate_w: Vec<f32>,
+    /// `[embedding_length_per_layer_input, hidden]`.
+    pub per_layer_proj_w: Vec<f32>,
+    /// `[hidden]`.
+    pub per_layer_post_norm_w: Vec<f32>,
+    /// Scalar applied after the layer residual tail.
+    pub layer_output_scale: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +515,14 @@ pub struct Gemma4TextWeights {
     /// `[vocab, hidden]`. `from_loaded_tensors` transposes GGUF's
     /// `[hidden, vocab]` embedding table into this lookup layout.
     pub token_embd: Vec<f32>,
+    /// `[vocab, block_count * embedding_length_per_layer_input]`.
+    pub per_layer_token_embd: Vec<f32>,
+    /// `[hidden, block_count * embedding_length_per_layer_input]`.
+    pub per_layer_model_proj_w: Vec<f32>,
+    /// `[embedding_length_per_layer_input]`.
+    pub per_layer_proj_norm_w: Vec<f32>,
+    /// `[rope_dimension_count / 2]`.
+    pub rope_freqs: Vec<f32>,
     pub layers: Vec<Gemma4TextLayerWeights>,
     /// `[hidden]`.
     pub output_norm_w: Vec<f32>,
@@ -514,9 +534,9 @@ pub struct Gemma4TextWeights {
 
 impl Gemma4TextWeights {
     /// Build the MF.7 text-forward weight bundle from loader-owned tensor
-    /// values. This intentionally consumes only the decoder-core subset; PLE,
-    /// per-layer token embeddings, output scale, and post norms remain outside
-    /// the executable subset.
+    /// values. This intentionally consumes only the text decoder subset:
+    /// multimodal encoders and MoE-only tensors remain outside the executable
+    /// subset.
     pub fn from_loaded_tensors(config: &Gemma4Config, tensors: Vec<LoadedTensor>) -> Result<Self> {
         validate_gemma4_text_weight_config(config)?;
 
@@ -539,13 +559,51 @@ impl Gemma4TextWeights {
         let h = config.embedding_length;
         let v = config.tokenizer_token_count;
         let f = config.feed_forward_length;
+        let epl = config.embedding_length_per_layer_input;
+        let per_layer_width = checked_dim_product(
+            "gemma4.block_count * embedding_length_per_layer_input",
+            config.block_count,
+            epl,
+            None,
+        )?;
 
         let token_embd_gguf = take_text_tensor(
             &mut by_name,
             tensor_spec("token_embd.weight", &[h, v], Gemma4TensorKind::KQuantized),
         )?;
-        let lm_head_w = token_embd_gguf.clone();
-        let token_embd = transpose_2d(&token_embd_gguf, h, v);
+        let token_embd = token_embd_gguf.clone();
+        let lm_head_w = gguf_matrix_to_ocelotl_weight(&token_embd_gguf, h, v);
+        let per_layer_token_embd_gguf = take_text_tensor(
+            &mut by_name,
+            tensor_spec(
+                "per_layer_token_embd.weight",
+                &[per_layer_width, v],
+                Gemma4TensorKind::KQuantized,
+            ),
+        )?;
+        let per_layer_token_embd = per_layer_token_embd_gguf;
+        let per_layer_model_proj_gguf = take_text_tensor(
+            &mut by_name,
+            tensor_spec(
+                "per_layer_model_proj.weight",
+                &[h, per_layer_width],
+                Gemma4TensorKind::BF16,
+            ),
+        )?;
+        let per_layer_model_proj_w =
+            gguf_matrix_to_ocelotl_weight(&per_layer_model_proj_gguf, h, per_layer_width);
+        let per_layer_proj_norm_w = take_text_tensor(
+            &mut by_name,
+            tensor_spec("per_layer_proj_norm.weight", &[epl], Gemma4TensorKind::F32),
+        )?;
+        let rope_freqs = take_text_tensor(
+            &mut by_name,
+            tensor_spec(
+                "rope_freqs.weight",
+                &[config.rope_dimension_count / 2],
+                Gemma4TensorKind::F32,
+            ),
+        )?;
         let output_norm_w = take_text_tensor(
             &mut by_name,
             tensor_spec("output_norm.weight", &[h], Gemma4TensorKind::F32),
@@ -561,38 +619,50 @@ impl Gemma4TextWeights {
                     &mut by_name,
                     tensor_spec(&name("attn_norm.weight"), &[h], Gemma4TensorKind::F32),
                 )?,
-                attn_q_w: take_text_tensor(
-                    &mut by_name,
-                    tensor_spec(
-                        &name("attn_q.weight"),
-                        &[h, attention.q_width],
-                        Gemma4TensorKind::KQuantized,
-                    ),
-                )?,
-                attn_k_w: take_text_tensor(
-                    &mut by_name,
-                    tensor_spec(
-                        &name("attn_k.weight"),
-                        &[h, attention.k_width],
-                        Gemma4TensorKind::KQuantized,
-                    ),
-                )?,
-                attn_v_w: take_text_tensor(
-                    &mut by_name,
-                    tensor_spec(
-                        &name("attn_v.weight"),
-                        &[h, attention.v_width],
-                        Gemma4TensorKind::KQuantized,
-                    ),
-                )?,
-                attn_o_w: take_text_tensor(
-                    &mut by_name,
-                    tensor_spec(
-                        &name("attn_output.weight"),
-                        &[attention.q_width, h],
-                        Gemma4TensorKind::KQuantized,
-                    ),
-                )?,
+                attn_q_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("attn_q.weight"),
+                            &[h, attention.q_width],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, h, attention.q_width)
+                },
+                attn_k_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("attn_k.weight"),
+                            &[h, attention.k_width],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, h, attention.k_width)
+                },
+                attn_v_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("attn_v.weight"),
+                            &[h, attention.v_width],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, h, attention.v_width)
+                },
+                attn_o_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("attn_output.weight"),
+                            &[attention.q_width, h],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, attention.q_width, h)
+                },
                 attn_q_norm_w: take_text_tensor(
                     &mut by_name,
                     tensor_spec(
@@ -613,35 +683,94 @@ impl Gemma4TextWeights {
                     &mut by_name,
                     tensor_spec(&name("ffn_norm.weight"), &[h], Gemma4TensorKind::F32),
                 )?,
-                ffn_gate_w: take_text_tensor(
+                ffn_gate_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("ffn_gate.weight"),
+                            &[h, f],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, h, f)
+                },
+                ffn_up_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("ffn_up.weight"),
+                            &[h, f],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, h, f)
+                },
+                ffn_down_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("ffn_down.weight"),
+                            &[f, h],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, f, h)
+                },
+                attn_post_norm_w: take_text_tensor(
                     &mut by_name,
                     tensor_spec(
-                        &name("ffn_gate.weight"),
-                        &[h, f],
-                        Gemma4TensorKind::KQuantized,
+                        &name("post_attention_norm.weight"),
+                        &[h],
+                        Gemma4TensorKind::F32,
                     ),
                 )?,
-                ffn_up_w: take_text_tensor(
+                ffn_post_norm_w: take_text_tensor(
+                    &mut by_name,
+                    tensor_spec(&name("post_ffw_norm.weight"), &[h], Gemma4TensorKind::F32),
+                )?,
+                per_layer_inp_gate_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("inp_gate.weight"),
+                            &[h, epl],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, h, epl)
+                },
+                per_layer_proj_w: {
+                    let values = take_text_tensor(
+                        &mut by_name,
+                        tensor_spec(
+                            &name("proj.weight"),
+                            &[epl, h],
+                            Gemma4TensorKind::KQuantized,
+                        ),
+                    )?;
+                    gguf_matrix_to_ocelotl_weight(&values, epl, h)
+                },
+                per_layer_post_norm_w: take_text_tensor(
+                    &mut by_name,
+                    tensor_spec(&name("post_norm.weight"), &[h], Gemma4TensorKind::F32),
+                )?,
+                layer_output_scale: take_text_tensor(
                     &mut by_name,
                     tensor_spec(
-                        &name("ffn_up.weight"),
-                        &[h, f],
-                        Gemma4TensorKind::KQuantized,
+                        &name("layer_output_scale.weight"),
+                        &[1],
+                        Gemma4TensorKind::F32,
                     ),
-                )?,
-                ffn_down_w: take_text_tensor(
-                    &mut by_name,
-                    tensor_spec(
-                        &name("ffn_down.weight"),
-                        &[f, h],
-                        Gemma4TensorKind::KQuantized,
-                    ),
-                )?,
+                )?[0],
             });
         }
 
         Ok(Self {
             token_embd,
+            per_layer_token_embd,
+            per_layer_model_proj_w,
+            per_layer_proj_norm_w,
+            rope_freqs,
             layers,
             output_norm_w,
             lm_head_w,
@@ -655,6 +784,16 @@ pub struct Gemma4TextModel {
     config: Gemma4Config,
     weights: Gemma4TextWeights,
     kernels: Arc<dyn KernelBackend>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gemma4TextPrefillTrace {
+    pub logits: Vec<f32>,
+    pub named_tensors: BTreeMap<String, Vec<f32>>,
+    pub layer_outputs: Vec<Vec<f32>>,
+    pub result_norm: Vec<f32>,
+    pub result_output: Vec<f32>,
 }
 
 impl Gemma4TextModel {
@@ -688,7 +827,82 @@ impl Gemma4TextModel {
         self.kernels.as_ref()
     }
 
+    fn build_per_layer_inputs(
+        &self,
+        tokens: &[TokenId],
+        scaled_hidden: &[f32],
+        eps: f32,
+    ) -> Result<Vec<f32>> {
+        let seq = tokens.len();
+        let h = self.config.embedding_length;
+        let epl = self.config.embedding_length_per_layer_input;
+        let per_layer_width = checked_dim_product(
+            "gemma4.block_count * embedding_length_per_layer_input",
+            self.config.block_count,
+            epl,
+            None,
+        )?;
+        let mut token_inputs = vec![0.0_f32; seq * per_layer_width];
+        let token_scale = (epl as f32).sqrt();
+        for (pos, token) in tokens.iter().enumerate() {
+            let src = (token.0 as usize) * per_layer_width;
+            let dst = pos * per_layer_width;
+            for i in 0..per_layer_width {
+                token_inputs[dst + i] = self.weights.per_layer_token_embd[src + i] * token_scale;
+            }
+        }
+
+        let mut projected = vec![0.0_f32; seq * per_layer_width];
+        self.kernels.matmul(
+            scaled_hidden,
+            (seq, h),
+            &self.weights.per_layer_model_proj_w,
+            (h, per_layer_width),
+            &mut projected,
+        )?;
+        let projection_scale = 1.0_f32 / (h as f32).sqrt();
+        for value in &mut projected {
+            *value *= projection_scale;
+        }
+
+        let mut projected_norm = vec![0.0_f32; seq * per_layer_width];
+        self.kernels.rmsnorm(
+            &projected,
+            seq * self.config.block_count,
+            epl,
+            &self.weights.per_layer_proj_norm_w,
+            eps,
+            &mut projected_norm,
+        )?;
+
+        let input_scale = 1.0_f32 / 2.0_f32.sqrt();
+        for (dst, projected) in token_inputs.iter_mut().zip(projected_norm.iter()) {
+            *dst = (*dst + *projected) * input_scale;
+        }
+
+        Ok(token_inputs)
+    }
+
     pub fn prefill(&self, tokens: &[TokenId]) -> Result<Vec<f32>> {
+        let (logits, _) = self.prefill_inner(tokens, false)?;
+        Ok(logits)
+    }
+
+    #[doc(hidden)]
+    pub fn prefill_with_trace(&self, tokens: &[TokenId]) -> Result<Gemma4TextPrefillTrace> {
+        let (logits, trace) = self.prefill_inner(tokens, true)?;
+        let Some(mut trace) = trace else {
+            unreachable!("trace collection was requested");
+        };
+        trace.logits = logits;
+        Ok(trace)
+    }
+
+    fn prefill_inner(
+        &self,
+        tokens: &[TokenId],
+        collect_trace: bool,
+    ) -> Result<(Vec<f32>, Option<Gemma4TextPrefillTrace>)> {
         if tokens.is_empty() {
             return Err(OcelotlError::InvalidRequest(InvalidRequestError {
                 field: "tokens".to_string(),
@@ -724,6 +938,13 @@ impl Gemma4TextModel {
         let q_heads = cfg.attention_head_count;
         let kv_heads = cfg.attention_head_count_kv;
         let f = cfg.feed_forward_length;
+        let epl = cfg.embedding_length_per_layer_input;
+        let per_layer_width = checked_dim_product(
+            "gemma4.block_count * embedding_length_per_layer_input",
+            cfg.block_count,
+            epl,
+            None,
+        )?;
         let vocab = cfg.tokenizer_token_count;
         let eps = cfg.rms_norm_eps;
 
@@ -737,13 +958,20 @@ impl Gemma4TextModel {
         for value in &mut hidden {
             *value *= embedding_scale;
         }
+        let mut named_tensors = collect_trace.then(BTreeMap::new);
+        trace_named_tensor(&mut named_tensors, "inp_scaled", &hidden);
+        let per_layer_inputs = self.build_per_layer_inputs(tokens, &hidden, eps)?;
 
         let mut norm_buf = vec![0.0_f32; seq * h];
         let mut o_buf = vec![0.0_f32; seq * h];
+        let mut post_norm_buf = vec![0.0_f32; seq * h];
         let mut residual_buf = vec![0.0_f32; seq * h];
         let mut gate_buf = vec![0.0_f32; seq * f];
         let mut up_buf = vec![0.0_f32; seq * f];
         let mut mlp_out = vec![0.0_f32; seq * h];
+        let mut ple_gate_buf = vec![0.0_f32; seq * epl];
+        let mut ple_proj_buf = vec![0.0_f32; seq * h];
+        let mut layer_outputs = collect_trace.then(Vec::new);
         let mut layer_kv_activations: Vec<Option<Gemma4LayerKvActivations>> =
             (0..cfg.block_count).map(|_| None).collect();
 
@@ -754,7 +982,8 @@ impl Gemma4TextModel {
             let k_out = attention.k_width;
             let v_out = attention.v_width;
             let shared_kv_source_layer = gemma4_shared_kv_source_layer(cfg, layer_idx)?;
-            let theta = if gemma4_uses_global_attention(cfg, layer_idx) {
+            let is_global_attention = gemma4_uses_global_attention(cfg, layer_idx);
+            let theta = if is_global_attention {
                 cfg.rope_freq_base
             } else {
                 cfg.rope_freq_base_swa
@@ -767,8 +996,14 @@ impl Gemma4TextModel {
 
             self.kernels
                 .rmsnorm(&hidden, seq, h, &layer.attn_norm_w, eps, &mut norm_buf)?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "attn_norm-0", &norm_buf);
+            }
             self.kernels
                 .matmul(&norm_buf, (seq, h), &layer.attn_q_w, (h, q_out), &mut q_buf)?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "Qcur-0", &q_buf);
+            }
 
             self.kernels.rmsnorm(
                 &q_buf,
@@ -778,15 +1013,31 @@ impl Gemma4TextModel {
                 eps,
                 &mut q_norm_buf,
             )?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "Qcur_normed-0", &q_norm_buf);
+            }
 
             for pos in 0..seq {
                 let q_start = pos * q_out;
-                self.kernels.rope_apply_inplace(
-                    &mut q_norm_buf[q_start..q_start + q_out],
-                    head_dim,
-                    pos,
-                    theta,
-                )?;
+                if is_global_attention {
+                    self.kernels.rope_apply_inplace_with_factors(
+                        &mut q_norm_buf[q_start..q_start + q_out],
+                        head_dim,
+                        pos,
+                        theta,
+                        &self.weights.rope_freqs,
+                    )?;
+                } else {
+                    self.kernels.rope_apply_inplace(
+                        &mut q_norm_buf[q_start..q_start + q_out],
+                        head_dim,
+                        pos,
+                        theta,
+                    )?;
+                }
+            }
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "Qcur_pos-0", &q_norm_buf);
             }
 
             let mut produced_kv = None;
@@ -828,6 +1079,9 @@ impl Gemma4TextModel {
                     (h, k_out),
                     &mut k_buf,
                 )?;
+                if layer_idx == 0 {
+                    trace_named_tensor(&mut named_tensors, "Kcur-0", &k_buf);
+                }
                 self.kernels.matmul(
                     &norm_buf,
                     (seq, h),
@@ -835,6 +1089,9 @@ impl Gemma4TextModel {
                     (h, v_out),
                     &mut v_buf,
                 )?;
+                if layer_idx == 0 {
+                    trace_named_tensor(&mut named_tensors, "Vcur-0", &v_buf);
+                }
                 self.kernels.rmsnorm(
                     &k_buf,
                     seq * kv_heads,
@@ -843,14 +1100,30 @@ impl Gemma4TextModel {
                     eps,
                     &mut k_norm_buf,
                 )?;
+                if layer_idx == 0 {
+                    trace_named_tensor(&mut named_tensors, "Kcur_normed-0", &k_norm_buf);
+                }
                 for pos in 0..seq {
                     let k_start = pos * k_out;
-                    self.kernels.rope_apply_inplace(
-                        &mut k_norm_buf[k_start..k_start + k_out],
-                        head_dim,
-                        pos,
-                        theta,
-                    )?;
+                    if is_global_attention {
+                        self.kernels.rope_apply_inplace_with_factors(
+                            &mut k_norm_buf[k_start..k_start + k_out],
+                            head_dim,
+                            pos,
+                            theta,
+                            &self.weights.rope_freqs,
+                        )?;
+                    } else {
+                        self.kernels.rope_apply_inplace(
+                            &mut k_norm_buf[k_start..k_start + k_out],
+                            head_dim,
+                            pos,
+                            theta,
+                        )?;
+                    }
+                }
+                if layer_idx == 0 {
+                    trace_named_tensor(&mut named_tensors, "Kcur_pos-0", &k_norm_buf);
                 }
                 let v_norm_w = vec![1.0_f32; head_dim];
                 self.kernels.rmsnorm(
@@ -861,6 +1134,9 @@ impl Gemma4TextModel {
                     eps,
                     &mut v_norm_buf,
                 )?;
+                if layer_idx == 0 {
+                    trace_named_tensor(&mut named_tensors, "Vcur_normed-0", &v_norm_buf);
+                }
                 produced_kv = Some(Gemma4LayerKvActivations {
                     attention,
                     k: k_norm_buf,
@@ -874,7 +1150,7 @@ impl Gemma4TextModel {
 
             if let Some(sliding_window) = cfg
                 .attention_sliding_window
-                .filter(|_| !gemma4_uses_global_attention(cfg, layer_idx))
+                .filter(|_| !is_global_attention)
             {
                 self.kernels
                     .scaled_dot_product_attention_windowed_with_scale(
@@ -913,11 +1189,29 @@ impl Gemma4TextModel {
                 (q_out, h),
                 &mut o_buf,
             )?;
-            self.kernels.vec_add(&residual_buf, &o_buf, &mut hidden)?;
+            self.kernels.rmsnorm(
+                &o_buf,
+                seq,
+                h,
+                &layer.attn_post_norm_w,
+                eps,
+                &mut post_norm_buf,
+            )?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "attn_post_norm-0", &post_norm_buf);
+            }
+            self.kernels
+                .vec_add(&residual_buf, &post_norm_buf, &mut hidden)?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "attn_out-0", &hidden);
+            }
 
             residual_buf.copy_from_slice(&hidden);
             self.kernels
                 .rmsnorm(&hidden, seq, h, &layer.ffn_norm_w, eps, &mut norm_buf)?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "ffn_norm-0", &norm_buf);
+            }
             self.kernels.mlp_gated_gelu(
                 &norm_buf,
                 seq,
@@ -930,7 +1224,72 @@ impl Gemma4TextModel {
                 &mut up_buf,
                 &mut mlp_out,
             )?;
-            self.kernels.vec_add(&residual_buf, &mlp_out, &mut hidden)?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "ffn_out-0", &mlp_out);
+            }
+            self.kernels.rmsnorm(
+                &mlp_out,
+                seq,
+                h,
+                &layer.ffn_post_norm_w,
+                eps,
+                &mut post_norm_buf,
+            )?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "ffn_post_norm-0", &post_norm_buf);
+            }
+            self.kernels
+                .vec_add(&residual_buf, &post_norm_buf, &mut hidden)?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "pe_in-0", &hidden);
+            }
+
+            residual_buf.copy_from_slice(&hidden);
+            self.kernels.matmul(
+                &hidden,
+                (seq, h),
+                &layer.per_layer_inp_gate_w,
+                (h, epl),
+                &mut ple_gate_buf,
+            )?;
+            ocelotl_kernels::mlp::gelu_tanh_inplace(&mut ple_gate_buf);
+            for pos in 0..seq {
+                let gate_start = pos * epl;
+                let input_start = pos * per_layer_width + layer_idx * epl;
+                for offset in 0..epl {
+                    ple_gate_buf[gate_start + offset] *= per_layer_inputs[input_start + offset];
+                }
+            }
+            self.kernels.matmul(
+                &ple_gate_buf,
+                (seq, epl),
+                &layer.per_layer_proj_w,
+                (epl, h),
+                &mut ple_proj_buf,
+            )?;
+            self.kernels.rmsnorm(
+                &ple_proj_buf,
+                seq,
+                h,
+                &layer.per_layer_post_norm_w,
+                eps,
+                &mut post_norm_buf,
+            )?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "per_layer_embd_out-0", &post_norm_buf);
+            }
+            self.kernels
+                .vec_add(&residual_buf, &post_norm_buf, &mut hidden)?;
+            for value in &mut hidden {
+                *value *= layer.layer_output_scale;
+            }
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "out_scaled-0", &hidden);
+                trace_named_tensor(&mut named_tensors, "l_out-0", &hidden);
+            }
+            if let Some(outputs) = &mut layer_outputs {
+                outputs.push(hidden.clone());
+            }
         }
 
         self.kernels.rmsnorm(
@@ -941,6 +1300,7 @@ impl Gemma4TextModel {
             eps,
             &mut norm_buf,
         )?;
+        let result_norm = collect_trace.then(|| norm_buf.clone());
 
         let last_start = (seq - 1) * h;
         let last_row = &norm_buf[last_start..last_start + h];
@@ -957,8 +1317,37 @@ impl Gemma4TextModel {
                 *logit = cap * (*logit / cap).tanh();
             }
         }
+        let result_output = collect_trace.then(|| logits.clone());
 
-        Ok(logits)
+        let trace = if let (
+            Some(named_tensors),
+            Some(layer_outputs),
+            Some(result_norm),
+            Some(result_output),
+        ) = (named_tensors, layer_outputs, result_norm, result_output)
+        {
+            Some(Gemma4TextPrefillTrace {
+                logits: logits.clone(),
+                named_tensors,
+                layer_outputs,
+                result_norm,
+                result_output,
+            })
+        } else {
+            None
+        };
+
+        Ok((logits, trace))
+    }
+}
+
+fn trace_named_tensor(
+    named_tensors: &mut Option<BTreeMap<String, Vec<f32>>>,
+    name: &str,
+    values: &[f32],
+) {
+    if let Some(named_tensors) = named_tensors {
+        named_tensors.insert(name.to_string(), values.to_vec());
     }
 }
 
@@ -1003,6 +1392,11 @@ fn validate_gemma4_text_weight_config(config: &Gemma4Config) -> Result<()> {
     validate_shared_kv_layers(config)?;
     validate_positive("gemma4.rope.dimension_count", config.rope_dimension_count)?;
     validate_positive(
+        "gemma4.rope.dimension_count_swa",
+        config.rope_dimension_count_swa,
+    )?;
+    validate_even("gemma4.rope.dimension_count", config.rope_dimension_count)?;
+    validate_even(
         "gemma4.rope.dimension_count_swa",
         config.rope_dimension_count_swa,
     )?;
@@ -1079,6 +1473,13 @@ fn validate_gemma4_text_weight_lengths(
     let h = config.embedding_length;
     let vocab = config.tokenizer_token_count;
     let f = config.feed_forward_length;
+    let epl = config.embedding_length_per_layer_input;
+    let per_layer_width = checked_dim_product(
+        "gemma4.block_count * embedding_length_per_layer_input",
+        config.block_count,
+        epl,
+        None,
+    )?;
 
     check_text_len(
         "token_embd.weight",
@@ -1091,6 +1492,34 @@ fn validate_gemma4_text_weight_lengths(
         weights.lm_head_w.len(),
         checked_dim_product("lm_head.weight", h, vocab, None)?,
     )?;
+    check_text_len(
+        "per_layer_token_embd.weight",
+        weights.per_layer_token_embd.len(),
+        checked_dim_product("per_layer_token_embd.weight", vocab, per_layer_width, None)?,
+    )?;
+    check_text_len(
+        "per_layer_model_proj.weight",
+        weights.per_layer_model_proj_w.len(),
+        checked_dim_product("per_layer_model_proj.weight", h, per_layer_width, None)?,
+    )?;
+    check_text_len(
+        "per_layer_proj_norm.weight",
+        weights.per_layer_proj_norm_w.len(),
+        epl,
+    )?;
+    check_text_len(
+        "rope_freqs.weight",
+        weights.rope_freqs.len(),
+        config.rope_dimension_count / 2,
+    )?;
+    for (idx, factor) in weights.rope_freqs.iter().enumerate() {
+        if !factor.is_finite() || *factor <= 0.0 {
+            return Err(invalid(
+                "rope_freqs.weight",
+                &format!("factor {idx} must be finite and > 0, got {factor}"),
+            ));
+        }
+    }
     if weights.layers.len() != config.block_count {
         return Err(invalid(
             "layers",
@@ -1152,6 +1581,37 @@ fn validate_gemma4_text_weight_lengths(
             layer.ffn_down_w.len(),
             checked_dim_product("ffn_down_w", f, h, None)?,
         )?;
+        check_text_len(
+            &format!("{prefix}.attn_post_norm_w"),
+            layer.attn_post_norm_w.len(),
+            h,
+        )?;
+        check_text_len(
+            &format!("{prefix}.ffn_post_norm_w"),
+            layer.ffn_post_norm_w.len(),
+            h,
+        )?;
+        check_text_len(
+            &format!("{prefix}.per_layer_inp_gate_w"),
+            layer.per_layer_inp_gate_w.len(),
+            checked_dim_product("per_layer_inp_gate_w", h, epl, None)?,
+        )?;
+        check_text_len(
+            &format!("{prefix}.per_layer_proj_w"),
+            layer.per_layer_proj_w.len(),
+            checked_dim_product("per_layer_proj_w", epl, h, None)?,
+        )?;
+        check_text_len(
+            &format!("{prefix}.per_layer_post_norm_w"),
+            layer.per_layer_post_norm_w.len(),
+            h,
+        )?;
+        if !layer.layer_output_scale.is_finite() {
+            return Err(invalid(
+                &format!("{prefix}.layer_output_scale"),
+                &format!("must be finite, got {}", layer.layer_output_scale),
+            ));
+        }
     }
 
     Ok(())
@@ -1234,6 +1694,10 @@ fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     dst
 }
 
+fn gguf_matrix_to_ocelotl_weight(src: &[f32], input_dim: usize, output_dim: usize) -> Vec<f32> {
+    transpose_2d(src, output_dim, input_dim)
+}
+
 fn check_text_len(field: &str, got: usize, expected: usize) -> Result<()> {
     if got == expected {
         Ok(())
@@ -1264,7 +1728,7 @@ fn required_gemma4_tensor_specs(config: &Gemma4Config) -> Vec<Gemma4TensorSpec> 
     ));
     specs.push(tensor_spec(
         "rope_freqs.weight",
-        &[config.rope_dimension_count_swa],
+        &[config.rope_dimension_count / 2],
         Gemma4TensorKind::F32,
     ));
     specs.push(tensor_spec(
@@ -1874,6 +2338,14 @@ fn validate_positive(field: &str, value: usize) -> Result<()> {
     }
 }
 
+fn validate_even(field: &str, value: usize) -> Result<()> {
+    if value % 2 != 0 {
+        Err(invalid(field, &format!("must be even; got {value}")))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_finite_positive(field: &str, value: f32) -> Result<()> {
     if !value.is_finite() || value <= 0.0 {
         Err(invalid(
@@ -1968,13 +2440,17 @@ mod tests {
 
         fn matmul(
             &self,
-            _a: &[f32],
+            a: &[f32],
             _a_shape: (usize, usize),
             _b: &[f32],
             _b_shape: (usize, usize),
             _out: &mut [f32],
         ) -> Result<()> {
-            Err(capture_backend_error("matmul should not run in this test"))
+            let mut first_input = self.first_input.lock().unwrap();
+            if first_input.is_none() {
+                *first_input = Some(a.to_vec());
+            }
+            Err(capture_backend_error("captured first matmul input"))
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -2065,11 +2541,19 @@ mod tests {
         windowed: bool,
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct CapturedRopeCalls {
+        plain: usize,
+        factored: usize,
+        first_factors: Option<Vec<f32>>,
+    }
+
     #[derive(Debug)]
     struct CaptureAttentionBackend {
         context: ocelotl_kernels::KernelContext,
         cpu: ocelotl_kernels::CpuKernelBackend,
         captured: std::sync::Mutex<Option<CapturedAttentionCall>>,
+        rope_calls: std::sync::Mutex<CapturedRopeCalls>,
     }
 
     impl CaptureAttentionBackend {
@@ -2080,11 +2564,16 @@ mod tests {
                 },
                 cpu: ocelotl_kernels::CpuKernelBackend::scalar(),
                 captured: std::sync::Mutex::new(None),
+                rope_calls: std::sync::Mutex::new(CapturedRopeCalls::default()),
             }
         }
 
         fn captured_attention(&self) -> Option<CapturedAttentionCall> {
             self.captured.lock().unwrap().clone()
+        }
+
+        fn captured_rope_calls(&self) -> CapturedRopeCalls {
+            self.rope_calls.lock().unwrap().clone()
         }
 
         fn capture_attention(&self, v: &[f32], scale: f32, windowed: bool) -> Result<()> {
@@ -2196,7 +2685,26 @@ mod tests {
             position: usize,
             theta: f32,
         ) -> Result<()> {
+            self.rope_calls.lock().unwrap().plain += 1;
             self.cpu.rope_apply_inplace(x, head_dim, position, theta)
+        }
+
+        fn rope_apply_inplace_with_factors(
+            &self,
+            x: &mut [f32],
+            head_dim: usize,
+            position: usize,
+            theta: f32,
+            freq_factors: &[f32],
+        ) -> Result<()> {
+            let mut calls = self.rope_calls.lock().unwrap();
+            calls.factored += 1;
+            if calls.first_factors.is_none() {
+                calls.first_factors = Some(freq_factors[..head_dim / 2].to_vec());
+            }
+            drop(calls);
+            self.cpu
+                .rope_apply_inplace_with_factors(x, head_dim, position, theta, freq_factors)
         }
 
         fn rmsnorm(
@@ -2425,6 +2933,22 @@ mod tests {
         }
     }
 
+    fn row_valid_tiny_gguf_config() -> Gemma4Config {
+        let mut config = tiny_config();
+        config.embedding_length = 256;
+        config.embedding_length_per_layer_input = 256;
+        config.feed_forward_length = 256;
+        config.attention_head_count = 4;
+        config.attention_head_count_kv = 1;
+        config.attention_key_length = 64;
+        config.attention_value_length = 64;
+        config.attention_key_length_swa = 64;
+        config.attention_value_length_swa = 64;
+        config.rope_dimension_count = 64;
+        config.rope_dimension_count_swa = 64;
+        config
+    }
+
     fn tiny_text_config() -> Gemma4Config {
         Gemma4Config {
             context_length: 16,
@@ -2451,7 +2975,7 @@ mod tests {
             tokenizer_token_count: 8,
             quantization: Gemma4Quantization::Unquantized,
             has_quantized_tensors: false,
-            tensor_count: 13,
+            tensor_count: 23,
             multimodal: false,
         }
     }
@@ -2485,6 +3009,22 @@ mod tests {
             tensor_count: 108,
             multimodal: true,
         }
+    }
+
+    fn row_valid_tiny_real_shaped_gguf_config() -> Gemma4Config {
+        let mut config = tiny_real_shaped_text_config();
+        config.embedding_length = 256;
+        config.embedding_length_per_layer_input = 256;
+        config.feed_forward_length = 256;
+        config.attention_head_count = 4;
+        config.attention_head_count_kv = 2;
+        config.attention_key_length = 128;
+        config.attention_value_length = 128;
+        config.attention_key_length_swa = 64;
+        config.attention_value_length_swa = 64;
+        config.rope_dimension_count = 128;
+        config.rope_dimension_count_swa = 64;
+        config
     }
 
     fn tiny_mixed_attention_text_config() -> Gemma4Config {
@@ -2566,8 +3106,23 @@ mod tests {
         let h = config.embedding_length;
         let vocab = config.tokenizer_token_count;
         let f = config.feed_forward_length;
+        let epl = config.embedding_length_per_layer_input;
+        let per_layer_width = config.block_count * epl;
         let mut tensors = vec![
             text_loaded_tensor("token_embd.weight", &[h, vocab], 0.01),
+            text_loaded_tensor(
+                "per_layer_token_embd.weight",
+                &[per_layer_width, vocab],
+                0.015,
+            ),
+            text_loaded_tensor_with_dtype(
+                "per_layer_model_proj.weight",
+                &[h, per_layer_width],
+                0.025,
+                SupportedDtype::BF16,
+            ),
+            text_loaded_tensor("per_layer_proj_norm.weight", &[epl], 1.0),
+            text_loaded_tensor("rope_freqs.weight", &[config.rope_dimension_count / 2], 1.0),
             text_loaded_tensor("output_norm.weight", &[h], 1.0),
         ];
         for layer in 0..config.block_count {
@@ -2586,9 +3141,23 @@ mod tests {
                 text_loaded_tensor(&name("ffn_gate.weight"), &[h, f], 0.06),
                 text_loaded_tensor(&name("ffn_up.weight"), &[h, f], 0.07),
                 text_loaded_tensor(&name("ffn_down.weight"), &[f, h], 0.08),
+                text_loaded_tensor(&name("post_attention_norm.weight"), &[h], 1.0),
+                text_loaded_tensor(&name("post_ffw_norm.weight"), &[h], 1.0),
+                text_loaded_tensor(&name("inp_gate.weight"), &[h, epl], 0.09),
+                text_loaded_tensor(&name("proj.weight"), &[epl, h], 0.10),
+                text_loaded_tensor(&name("post_norm.weight"), &[h], 1.0),
+                text_loaded_tensor(&name("layer_output_scale.weight"), &[1], 1.0),
             ]);
         }
         tensors
+    }
+
+    fn fill_text_tensor(tensors: &mut [LoadedTensor], name: &str, value: f32) {
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("expected test tensor `{name}` to exist"));
+        tensor.values.fill(value);
     }
 
     fn poison_text_tensor(tensors: &mut [LoadedTensor], name: &str) {
@@ -2614,11 +3183,20 @@ mod tests {
     }
 
     fn text_loaded_tensor(name: &str, shape: &[usize], scale: f32) -> LoadedTensor {
+        text_loaded_tensor_with_dtype(name, shape, scale, SupportedDtype::F32)
+    }
+
+    fn text_loaded_tensor_with_dtype(
+        name: &str,
+        shape: &[usize],
+        scale: f32,
+        dtype: SupportedDtype,
+    ) -> LoadedTensor {
         let len = checked_shape_len(name, shape, None).unwrap();
         LoadedTensor {
             name: name.to_string(),
             shape: shape.to_vec(),
-            dtype: SupportedDtype::F32,
+            dtype,
             values: (0..len).map(|idx| scale + idx as f32 * 0.01).collect(),
         }
     }
@@ -3113,15 +3691,15 @@ mod tests {
             weights.lm_head_w.len(),
             cfg.embedding_length * cfg.tokenizer_token_count
         );
-        assert_eq!(weights.lm_head_w, source_embedding);
+        assert_eq!(weights.rope_freqs.len(), cfg.rope_dimension_count / 2);
+        assert_eq!(weights.token_embd, source_embedding);
         assert_eq!(
-            &weights.token_embd[0..cfg.embedding_length],
-            &[
-                source_embedding[0],
-                source_embedding[8],
-                source_embedding[16],
-                source_embedding[24]
-            ]
+            weights.lm_head_w,
+            gguf_matrix_to_ocelotl_weight(
+                &source_embedding,
+                cfg.embedding_length,
+                cfg.tokenizer_token_count,
+            )
         );
     }
 
@@ -3167,7 +3745,7 @@ mod tests {
         match err {
             OcelotlError::Kernel(kernel) => {
                 assert_eq!(kernel.backend, "capture-first-rmsnorm");
-                assert!(kernel.message.contains("captured first rmsnorm input"));
+                assert!(kernel.message.contains("captured first matmul input"));
             }
             other => panic!("expected capture backend Kernel error, got {other:?}"),
         }
@@ -3188,6 +3766,8 @@ mod tests {
         let k_out = cfg.attention_head_count_kv * cfg.attention_key_length;
         let v_out = cfg.attention_head_count_kv * cfg.attention_value_length;
         let f = cfg.feed_forward_length;
+        let epl = cfg.embedding_length_per_layer_input;
+        let per_layer_width = cfg.block_count * epl;
 
         let mut token_embd = vec![0.0_f32; cfg.tokenizer_token_count * h];
         token_embd[0] = 1.0;
@@ -3208,7 +3788,17 @@ mod tests {
                 ffn_gate_w: vec![0.0; h * f],
                 ffn_up_w: vec![0.0; h * f],
                 ffn_down_w: vec![0.0; f * h],
+                attn_post_norm_w: vec![1.0; h],
+                ffn_post_norm_w: vec![1.0; h],
+                per_layer_inp_gate_w: vec![0.0; h * epl],
+                per_layer_proj_w: vec![0.0; epl * h],
+                per_layer_post_norm_w: vec![1.0; h],
+                layer_output_scale: 1.0,
             }],
+            per_layer_token_embd: vec![0.0; cfg.tokenizer_token_count * per_layer_width],
+            per_layer_model_proj_w: vec![0.0; h * per_layer_width],
+            per_layer_proj_norm_w: vec![1.0; epl],
+            rope_freqs: vec![1.0; cfg.rope_dimension_count / 2],
             output_norm_w: vec![1.0; h],
             lm_head_w: vec![0.0; h * cfg.tokenizer_token_count],
             tie_word_embeddings: true,
@@ -3267,8 +3857,180 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_text_prefill_uses_post_attention_and_ffn_norm_weights() {
+        let cfg = tiny_text_config();
+        let base_tensors = complete_text_loaded_tensors(&cfg);
+        let mut changed_tensors = base_tensors.clone();
+        fill_text_tensor(
+            &mut changed_tensors,
+            "blk.0.post_attention_norm.weight",
+            1.5,
+        );
+        fill_text_tensor(&mut changed_tensors, "blk.0.post_ffw_norm.weight", 0.5);
+
+        let base_weights = Gemma4TextWeights::from_loaded_tensors(&cfg, base_tensors)
+            .expect("base Gemma4 text tensors must map into weights");
+        let changed_weights = Gemma4TextWeights::from_loaded_tensors(&cfg, changed_tensors)
+            .expect("changed Gemma4 text tensors must map into weights");
+
+        let base_model = Gemma4TextModel::new(cfg.clone(), base_weights)
+            .expect("base Gemma4 text model must construct");
+        let changed_model = Gemma4TextModel::new(cfg, changed_weights)
+            .expect("changed Gemma4 text model must construct");
+        let base_logits = base_model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("base Gemma4 text prefill must execute");
+        let changed_logits = changed_model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("changed Gemma4 text prefill must execute");
+
+        assert!(
+            base_logits
+                .iter()
+                .zip(changed_logits.iter())
+                .any(|(base, changed)| (base - changed).abs() > 1.0e-4),
+            "post attention/FFN norm weights must affect Gemma4 text logits"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_prefill_uses_layer_output_scale_weight() {
+        let mut cfg = tiny_text_config();
+        cfg.block_count = 2;
+        cfg.tensor_count = 40;
+        let base_tensors = complete_text_loaded_tensors(&cfg);
+        let mut changed_tensors = base_tensors.clone();
+        fill_text_tensor(
+            &mut changed_tensors,
+            "blk.0.layer_output_scale.weight",
+            0.25,
+        );
+
+        let base_weights = Gemma4TextWeights::from_loaded_tensors(&cfg, base_tensors)
+            .expect("base Gemma4 text tensors must map into weights");
+        let changed_weights = Gemma4TextWeights::from_loaded_tensors(&cfg, changed_tensors)
+            .expect("changed Gemma4 text tensors must map into weights");
+
+        let base_model = Gemma4TextModel::new(cfg.clone(), base_weights)
+            .expect("base Gemma4 text model must construct");
+        let changed_model = Gemma4TextModel::new(cfg, changed_weights)
+            .expect("changed Gemma4 text model must construct");
+        let base_logits = base_model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("base Gemma4 text prefill must execute");
+        let changed_logits = changed_model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("changed Gemma4 text prefill must execute");
+
+        assert!(
+            base_logits
+                .iter()
+                .zip(changed_logits.iter())
+                .any(|(base, changed)| (base - changed).abs() > 1.0e-4),
+            "layer output scale weight must affect Gemma4 text logits"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_prefill_uses_per_layer_embedding_block() {
+        let mut cfg = tiny_text_config();
+        cfg.block_count = 2;
+        cfg.tensor_count = 40;
+        let base_tensors = complete_text_loaded_tensors(&cfg);
+        let mut changed_tensors = base_tensors.clone();
+        fill_text_tensor(&mut changed_tensors, "blk.0.inp_gate.weight", 0.0);
+
+        let base_weights = Gemma4TextWeights::from_loaded_tensors(&cfg, base_tensors)
+            .expect("base Gemma4 text tensors must map into weights");
+        let changed_weights = Gemma4TextWeights::from_loaded_tensors(&cfg, changed_tensors)
+            .expect("changed Gemma4 text tensors must map into weights");
+
+        let base_model = Gemma4TextModel::new(cfg.clone(), base_weights)
+            .expect("base Gemma4 text model must construct");
+        let changed_model = Gemma4TextModel::new(cfg, changed_weights)
+            .expect("changed Gemma4 text model must construct");
+        let base_logits = base_model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("base Gemma4 text prefill must execute");
+        let changed_logits = changed_model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect("changed Gemma4 text prefill must execute");
+
+        assert!(
+            base_logits
+                .iter()
+                .zip(changed_logits.iter())
+                .any(|(base, changed)| (base - changed).abs() > 1.0e-4),
+            "per-layer embedding block must affect Gemma4 text logits"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_prefill_uses_rope_frequency_factors_for_global_attention() {
+        let mut cfg = tiny_text_config();
+        cfg.attention_sliding_window_pattern = Some(vec![false]);
+        let mut tensors = complete_text_loaded_tensors(&cfg);
+        fill_text_tensor(&mut tensors, "rope_freqs.weight", 2.0);
+
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("changed Gemma4 text tensors must map into weights");
+        let backend = std::sync::Arc::new(CaptureAttentionBackend::new());
+
+        let model = Gemma4TextModel::with_kernel_backend(cfg, weights, backend.clone())
+            .expect("changed Gemma4 text model must construct");
+
+        let err = model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect_err("capture backend stops at the first attention call");
+
+        match err {
+            OcelotlError::Kernel(kernel) => {
+                assert_eq!(kernel.backend, "capture-attention");
+                assert!(kernel.message.contains("captured attention input"));
+            }
+            other => panic!("expected capture backend Kernel error, got {other:?}"),
+        }
+        let rope_calls = backend.captured_rope_calls();
+        assert_eq!(rope_calls.plain, 0);
+        assert_eq!(rope_calls.factored, 6);
+        assert_eq!(rope_calls.first_factors, Some(vec![2.0]));
+    }
+
+    #[test]
+    fn gemma4_text_prefill_ignores_rope_frequency_factors_for_swa_attention() {
+        let mut cfg = tiny_text_config();
+        cfg.attention_sliding_window = Some(4);
+        cfg.attention_sliding_window_pattern = Some(vec![true]);
+        let mut tensors = complete_text_loaded_tensors(&cfg);
+        fill_text_tensor(&mut tensors, "rope_freqs.weight", 2.0);
+
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("changed Gemma4 text tensors must map into weights");
+        let backend = std::sync::Arc::new(CaptureAttentionBackend::new());
+
+        let model = Gemma4TextModel::with_kernel_backend(cfg, weights, backend.clone())
+            .expect("changed Gemma4 text model must construct");
+
+        let err = model
+            .prefill(&[TokenId(1), TokenId(2), TokenId(3)])
+            .expect_err("capture backend stops at the first attention call");
+
+        match err {
+            OcelotlError::Kernel(kernel) => {
+                assert_eq!(kernel.backend, "capture-attention");
+                assert!(kernel.message.contains("captured attention input"));
+            }
+            other => panic!("expected capture backend Kernel error, got {other:?}"),
+        }
+        let rope_calls = backend.captured_rope_calls();
+        assert_eq!(rope_calls.plain, 6);
+        assert_eq!(rope_calls.factored, 0);
+        assert_eq!(rope_calls.first_factors, None);
+    }
+
+    #[test]
     fn gemma4_text_weights_map_real_shaped_dequantized_subset_before_execution_support() {
-        let cfg = tiny_real_shaped_text_config();
+        let cfg = row_valid_tiny_real_shaped_gguf_config();
         let path = tmp_path("real_shaped_text_weights");
         write_tiny_gemma4_gguf(&path, &cfg);
 
@@ -3309,7 +4071,7 @@ mod tests {
 
     #[test]
     fn gemma4_text_prefill_accepts_dequantized_q4_k_m_origin_when_text_only() {
-        let cfg = tiny_real_shaped_text_config();
+        let cfg = row_valid_tiny_real_shaped_gguf_config();
         let path = tmp_path("dequantized_q4_k_m_text_forward");
         write_tiny_gemma4_gguf(&path, &cfg);
 
@@ -3461,6 +4223,10 @@ mod tests {
         cfg.attention_sliding_window_pattern = Some(vec![true, true, true, true, true, false]);
         let weights = Gemma4TextWeights {
             token_embd: Vec::new(),
+            per_layer_token_embd: Vec::new(),
+            per_layer_model_proj_w: Vec::new(),
+            per_layer_proj_norm_w: Vec::new(),
+            rope_freqs: Vec::new(),
             layers: Vec::new(),
             output_norm_w: Vec::new(),
             lm_head_w: Vec::new(),
@@ -3489,6 +4255,10 @@ mod tests {
         cfg.attention_sliding_window_pattern = Some(vec![true]);
         let weights = Gemma4TextWeights {
             token_embd: Vec::new(),
+            per_layer_token_embd: Vec::new(),
+            per_layer_model_proj_w: Vec::new(),
+            per_layer_proj_norm_w: Vec::new(),
+            rope_freqs: Vec::new(),
             layers: Vec::new(),
             output_norm_w: Vec::new(),
             lm_head_w: Vec::new(),
@@ -3515,6 +4285,10 @@ mod tests {
         let cfg = fixture_config();
         let weights = Gemma4TextWeights {
             token_embd: Vec::new(),
+            per_layer_token_embd: Vec::new(),
+            per_layer_model_proj_w: Vec::new(),
+            per_layer_proj_norm_w: Vec::new(),
+            rope_freqs: Vec::new(),
             layers: Vec::new(),
             output_norm_w: Vec::new(),
             lm_head_w: Vec::new(),
@@ -3559,6 +4333,10 @@ mod tests {
         ] {
             let weights = Gemma4TextWeights {
                 token_embd: Vec::new(),
+                per_layer_token_embd: Vec::new(),
+                per_layer_model_proj_w: Vec::new(),
+                per_layer_proj_norm_w: Vec::new(),
+                rope_freqs: Vec::new(),
                 layers: Vec::new(),
                 output_norm_w: Vec::new(),
                 lm_head_w: Vec::new(),
@@ -3588,6 +4366,10 @@ mod tests {
         cfg.final_logit_softcap = Some(0.0);
         let weights = Gemma4TextWeights {
             token_embd: Vec::new(),
+            per_layer_token_embd: Vec::new(),
+            per_layer_model_proj_w: Vec::new(),
+            per_layer_proj_norm_w: Vec::new(),
+            rope_freqs: Vec::new(),
             layers: Vec::new(),
             output_norm_w: Vec::new(),
             lm_head_w: Vec::new(),
@@ -3624,6 +4406,41 @@ mod tests {
 
         assert_eq!(logits.len(), cfg.tokenizer_token_count);
         assert!(logits.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn gemma4_text_prefill_trace_matches_public_prefill_logits() {
+        let cfg = tiny_text_config();
+        let tensors = complete_text_loaded_tensors(&cfg);
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("tiny Gemma4 text tensors must map into weights");
+        let model = Gemma4TextModel::new(cfg.clone(), weights)
+            .expect("tiny Gemma4 text model must construct");
+        let tokens = [TokenId(1), TokenId(2)];
+
+        let logits = model
+            .prefill(&tokens)
+            .expect("tiny Gemma4 text prefill must succeed");
+        let trace = model
+            .prefill_with_trace(&tokens)
+            .expect("tiny Gemma4 text prefill trace must succeed");
+
+        assert_eq!(trace.logits, logits);
+        assert_eq!(trace.result_output, logits);
+        assert!(trace.named_tensors.contains_key("inp_scaled"));
+        assert!(trace.named_tensors.contains_key("l_out-0"));
+        for values in trace.named_tensors.values() {
+            assert!(values.iter().all(|value| value.is_finite()));
+        }
+        assert_eq!(trace.layer_outputs.len(), cfg.block_count);
+        for layer_output in &trace.layer_outputs {
+            assert_eq!(layer_output.len(), tokens.len() * cfg.embedding_length);
+            assert!(layer_output.iter().all(|value| value.is_finite()));
+        }
+        assert_eq!(trace.result_norm.len(), tokens.len() * cfg.embedding_length);
+        assert_eq!(trace.result_output.len(), cfg.tokenizer_token_count);
+        assert!(trace.result_norm.iter().all(|value| value.is_finite()));
+        assert!(trace.result_output.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -3712,7 +4529,7 @@ mod tests {
 
     #[test]
     fn load_gemma4_dense_tensors_from_gguf_loads_tiny_synthetic_dense_subset() {
-        let cfg = tiny_config();
+        let cfg = row_valid_tiny_gguf_config();
         let path = tmp_path("dense_values");
         write_tiny_gemma4_gguf(&path, &cfg);
 
@@ -3747,7 +4564,7 @@ mod tests {
 
     #[test]
     fn load_gemma4_dequantized_tensors_from_gguf_loads_tiny_synthetic_all_tensors() {
-        let cfg = tiny_config();
+        let cfg = row_valid_tiny_gguf_config();
         let path = tmp_path("dequantized_values");
         write_tiny_gemma4_gguf(&path, &cfg);
 

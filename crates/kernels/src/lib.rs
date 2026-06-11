@@ -29,7 +29,7 @@
 use std::{fmt::Debug, sync::Arc};
 
 pub mod rope;
-pub use rope::rope_apply_inplace;
+pub use rope::{rope_apply_inplace, rope_apply_inplace_with_factors};
 
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
@@ -215,6 +215,17 @@ pub trait KernelBackend: Debug + Send + Sync {
         position: usize,
         theta: f32,
     ) -> Result<()>;
+
+    fn rope_apply_inplace_with_factors(
+        &self,
+        x: &mut [f32],
+        head_dim: usize,
+        position: usize,
+        theta: f32,
+        freq_factors: &[f32],
+    ) -> Result<()> {
+        rope_apply_inplace_with_factors(x, head_dim, position, theta, freq_factors)
+    }
 
     fn rmsnorm(
         &self,

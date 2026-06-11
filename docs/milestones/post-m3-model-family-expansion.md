@@ -151,9 +151,10 @@ Gemma4:
   Ocelotl's configured-BOS GGUF path, clears `Gemma4Config.multimodal` only for
   this text-only harness, loads dequantized F32 text weights, and compares
   every final-position logit through `ocelotl_runtime::gemma::prefill`.
-  The latest local run after the attention-scale, V-RMSNorm, and tanh-GEGLU
-  fixes on 2026-06-10 proved the harness works but parity is still red: token 0
-  differed by `3.7689028` against llama.cpp
+  The 2026-06-10 local run after the attention-scale, V-RMSNorm, tanh-GEGLU,
+  post-branch RMSNorm, per-layer embedding, layer-output-scale, and RoPE
+  frequency-factor fixes on 2026-06-10 proved the harness works but parity is
+  still red: token 0 differed by `15.670528` against llama.cpp
   `856c3adac1709be15e1ea2529a0e89f742d25fe0`.
 - A follow-up Gemma4 text semantics slice applies llama.cpp-style
   `sqrt(hidden)` token embedding scaling before the first block and pins it
@@ -164,9 +165,32 @@ Gemma4:
   before KV storage/reuse, and tanh-approx GEGLU FFN activation. Kernel tests
   pin explicit-scale full/windowed attention and ggml-style GEGLU values;
   `gemma4_text_prefill_normalizes_v_and_uses_explicit_attention_scale` pins the
-  model boundary. Real-artifact parity is still expected to remain red until
-  post-attention/post-FFN norms, per-layer embeddings, layer-output scale, PLE,
-  and RoPE frequency-factor behavior are aligned.
+  model boundary.
+- A follow-up Gemma4 post-branch/per-layer semantics slice maps
+  `blk.N.post_attention_norm.weight`, `blk.N.post_ffw_norm.weight`,
+  `per_layer_token_embd.weight`, `per_layer_model_proj.weight`,
+  `per_layer_proj_norm.weight`, per-layer PLE gate/projection/post-norm
+  tensors, `blk.N.layer_output_scale.weight`, and `rope_freqs.weight`.
+  `Gemma4TextModel::prefill` now applies weighted RMSNorm to the attention
+  output projection and dense FFN output before their residual adds, runs the
+  per-layer embedding tail, applies layer output scales, and routes global
+  attention through Gemma4 RoPE frequency factors while keeping SWA attention
+  on plain RoPE. Model tests pin each behavior. Real-artifact parity remains
+  red after this slice; the selected artifact has `attn_v.weight` tensors and
+  no detected `output.weight` or MoE names, so the remaining likely blocker is
+  no longer those optional branches.
+- A follow-up Gemma4 GGUF matrix-layout and tensor-summary diagnostics slice
+  keeps token and per-layer-token embeddings in GGUF row order for lookup,
+  transposes GGUF `{input, output}` matrices into Ocelotl row-major matmul
+  layout, and adds ignored llama.cpp tensor-summary harnesses for late tensors,
+  layer outputs, and layer-0 substeps. The current 2026-06-11 local
+  discriminator shows `inp_scaled` and `attn_norm-0` now match llama.cpp, then
+  `Qcur-0` diverges (`Ocelotl -30.809566`, llama.cpp `-14.434416`, diff
+  `16.37515`). A native K-quant discriminator then proves
+  `blk.0.attn_q.weight` is Q6_K in the selected artifact and that a ported
+  llama.cpp-style Q6_K x Q8_K dot matches `Qcur-0`. The active real-artifact
+  blocker is wiring native/repacked K-quant projection semantics into the
+  public text path instead of using eager F32 dequantized matmul.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

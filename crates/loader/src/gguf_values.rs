@@ -152,6 +152,7 @@ fn load_tensor_bytes(
                     tensor_name,
                     tensor.tensor_type,
                     &data,
+                    &tensor.shape,
                     element_count,
                 )?,
             )
@@ -250,6 +251,7 @@ fn dequantize_k_quant_payload_f32(
     tensor_name: &str,
     tensor_type: GgmlTensorType,
     data: &[u8],
+    shape: &[usize],
     element_count: usize,
 ) -> Result<Vec<f32>> {
     let layout = tensor_type.quant_layout().ok_or_else(|| {
@@ -269,6 +271,23 @@ fn dequantize_k_quant_payload_f32(
             format!("GGUF tensor `{tensor_name}` quant block byte length does not fit usize"),
         )
     })?;
+    let row_element_count = shape.first().copied().ok_or_else(|| {
+        invalid_gguf_values(
+            path,
+            Some(tensor_name),
+            format!("GGUF tensor `{tensor_name}` has no row dimension"),
+        )
+    })?;
+    if row_element_count % block_element_count != 0 {
+        return Err(invalid_gguf_values(
+            path,
+            Some(tensor_name),
+            format!(
+                "GGUF tensor `{tensor_name}` row element count {row_element_count} is not divisible by {:?} quant block size {block_element_count}",
+                tensor_type
+            ),
+        ));
+    }
     if element_count % block_element_count != 0 {
         return Err(invalid_gguf_values(
             path,
@@ -632,6 +651,20 @@ mod tests {
         expected
     }
 
+    fn q4_k_all_groups_block() -> Vec<u8> {
+        let mut block = vec![0; Q4_K_BLOCK_BYTES];
+        block[0..2].copy_from_slice(&one_f16());
+        block[2..4].copy_from_slice(&half_f16());
+        block[4..16].copy_from_slice(&[
+            0x41, 0x42, 0x83, 0xc4, 0x45, 0x46, 0x87, 0xc8, 0x31, 0x42, 0x21, 0xef,
+        ]);
+        block[16] = 0x21;
+        block[48] = 0x43;
+        block[80] = 0x65;
+        block[112] = 0xfe;
+        block
+    }
+
     fn q5_k_block() -> Vec<u8> {
         let mut block = vec![0; Q5_K_BLOCK_BYTES];
         block[0..2].copy_from_slice(&one_f16());
@@ -833,6 +866,62 @@ mod tests {
             }
             other => panic!("expected Unsupported for Q4K, got {other:?}"),
         }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_gguf_tensor_dequantized_f32_rejects_k_quant_row_not_block_multiple() {
+        let path = tmp_path("q4k_bad_row");
+        write_fixture(
+            &path,
+            &[FixtureTensor {
+                name: "quant.weight",
+                shape: &[128, 2],
+                raw_type: 12,
+                payload: q4_k_block(),
+            }],
+        );
+
+        let err = load_gguf_tensor_dequantized_f32(&path, "quant.weight")
+            .expect_err("K-quant row width must be block-aligned");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("quant.weight"));
+                assert!(invalid.message.contains("row element count 128"));
+                assert!(invalid.message.contains("256"));
+            }
+            other => panic!("expected InvalidModel for bad K-quant row width, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_gguf_tensor_dequantized_f32_loads_q4_k_all_scale_min_groups() {
+        let path = tmp_path("q4k_all_groups");
+        write_fixture(
+            &path,
+            &[FixtureTensor {
+                name: "quant.weight",
+                shape: &[256],
+                raw_type: 12,
+                payload: q4_k_all_groups_block(),
+            }],
+        );
+
+        let loaded = load_gguf_tensor_dequantized_f32(&path, "quant.weight")
+            .expect("load dequantized Q4_K tensor");
+
+        assert_eq!(loaded.values[0], -1.5);
+        assert_eq!(loaded.values[32], 1.0);
+        assert_eq!(loaded.values[64], 5.5);
+        assert_eq!(loaded.values[96], 12.0);
+        assert_eq!(loaded.values[128], 75.5);
+        assert_eq!(loaded.values[160], 98.0);
+        assert_eq!(loaded.values[192], 445.0);
+        assert_eq!(loaded.values[224], 914.0);
 
         let _ = std::fs::remove_file(path);
     }

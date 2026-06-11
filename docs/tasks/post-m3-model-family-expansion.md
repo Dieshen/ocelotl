@@ -203,9 +203,36 @@ and does not modify the closed M3.6 MLP task.
   all-ones weight before KV storage/reuse and runs FFN through tanh-approx
   GEGLU instead of SiLU. Kernel tests pin explicit-scale attention and ggml
   GEGLU values; `gemma4_text_prefill_normalizes_v_and_uses_explicit_attention_scale`
-  pins the model boundary. Remaining known parity blockers include
-  post-attention/post-FFN norms, per-layer embeddings, layer-output scale, PLE,
-  and RoPE frequency-factor behavior.
+  pins the model boundary.
+- `Follow-up`: Gemma4 post-branch/per-layer semantics landed 2026-06-10.
+  `Gemma4TextWeights::from_loaded_tensors` now maps
+  `blk.N.post_attention_norm.weight`, `blk.N.post_ffw_norm.weight`,
+  `per_layer_token_embd.weight`, `per_layer_model_proj.weight`,
+  `per_layer_proj_norm.weight`, per-layer PLE gate/projection/post-norm
+  tensors, `blk.N.layer_output_scale.weight`, and `rope_freqs.weight`.
+  `Gemma4TextModel::prefill` RMS-normalizes the attention output projection and
+  FFN output before their residual adds, runs the per-layer embedding tail,
+  applies layer output scales, and uses Gemma4 RoPE frequency factors for
+  global attention while keeping SWA attention on plain RoPE.
+  `gemma4_text_prefill_uses_post_attention_and_ffn_norm_weights`,
+  `gemma4_text_prefill_uses_per_layer_embedding_block`,
+  `gemma4_text_prefill_uses_layer_output_scale_weight`,
+  `gemma4_text_prefill_uses_rope_frequency_factors_for_global_attention`, and
+  `gemma4_text_prefill_ignores_rope_frequency_factors_for_swa_attention` pin
+  those semantics. Remaining known parity blockers are no longer those text
+  operations.
+- `Follow-up`: Gemma4 GGUF matrix-layout and tensor-summary diagnostics landed
+  2026-06-11. `Gemma4TextWeights::from_loaded_tensors` now treats GGUF
+  embedding tensors as row-major token lookup tables while transposing GGUF
+  `{input, output}` matrices into Ocelotl's row-major matmul layout. Hidden
+  diagnostic tracing and ignored llama.cpp tensor-summary harnesses isolate the
+  current real-artifact mismatch to `Qcur-0`: `inp_scaled` and `attn_norm-0`
+  match llama.cpp, then the first quantized Q projection differs (`Ocelotl
+  -30.809566`, llama.cpp `-14.434416`, diff `16.37515`). The active blocker is
+  now the K-quant projection/dequantized-matmul path, not late hidden-state
+  localization. A follow-up native projection discriminator proves
+  `blk.0.attn_q.weight` is Q6_K in the selected artifact and that a ported
+  llama.cpp-style Q6_K x Q8_K dot matches the `Qcur-0` summary.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 
@@ -224,12 +251,16 @@ and does not modify the closed M3.6 MLP task.
   text-only path by clearing `multimodal`, loads required tensors through
   `load_gemma4_dequantized_tensors_from_gguf`, and compares every
   final-position logit through `ocelotl_runtime::gemma::prefill`.
-- `Status`: latest local proof run after the attention-scale, V-RMSNorm, and
-  tanh-GEGLU fixes completed on 2026-06-10 against llama.cpp
-  `856c3adac1709be15e1ea2529a0e89f742d25fe0`, but parity is still red. The
-  run failed at output token 0 (`Ocelotl -14.446298`, llama.cpp `-18.2152`,
-  diff `3.7689028`). The harness is now useful as a drift detector; remaining
-  Gemma4 text semantics still need to be brought in before MF.8 can close.
+- `Status`: latest local tensor-summary proof on 2026-06-11 runs against
+  llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0` and is still red.
+  After the GGUF matrix-layout fix, `inp_scaled` and `attn_norm-0` match
+  llama.cpp, and the first mismatch is `Qcur-0` (`Ocelotl -30.809566`,
+  llama.cpp `-14.434416`, diff `16.37515`). The full-logit proof has not been
+  refreshed after this layout fix. The native K-quant diagnostic is green for
+  that same `Qcur-0` checkpoint using raw Q6_K weights and Q8_K-quantized
+  activations, so remaining work should wire native/repacked K-quant projection
+  semantics into the public Gemma4 text path before expecting the real Q4_K_M
+  logits vector to meet the fixture tolerance.
 
 ## Track Closure
 

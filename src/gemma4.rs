@@ -58,11 +58,13 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
+        io::{Read, Seek, SeekFrom},
         path::{Path, PathBuf},
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use ocelotl_loader::{GgmlTensorType, inspect_gguf};
     use ocelotl_models::gemma::{
         Gemma4TextModel, Gemma4TextWeights, load_gemma4_dequantized_tensors_from_gguf,
     };
@@ -74,6 +76,9 @@ mod tests {
 
     const GEMMA4_GGUF_REVISION: &str = "c04cb322fd63e347db759a08b6249b867488ccf8";
     const GEMMA4_LOGITS_FIXTURE_NAME: &str = "gemma4_q4_k_m_basic_prompt_logits_reference";
+    const QK_K: usize = 256;
+    const Q4_K_BLOCK_BYTES: usize = 144;
+    const Q6_K_BLOCK_BYTES: usize = 210;
 
     #[derive(Debug, Deserialize)]
     struct Gemma4TokenizerFixture {
@@ -126,6 +131,12 @@ mod tests {
     struct OcelotlLogitsReference {
         command: String,
         notes: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct LlamaDebugTensorSummary {
+        shape: Vec<usize>,
+        sum: f32,
     }
 
     fn tiny_metadata() -> GgufTokenizerMetadata {
@@ -402,6 +413,79 @@ mod tests {
     }
 
     #[test]
+    fn llama_debug_tensor_summary_parser_extracts_shape_and_sum() {
+        let raw = "\
+common_debug_cb_eval:              result_norm = (f32)    RMS_NORM(inp{4, 1, 1, 1}, }) = {4, 1, 1, 1}
+    [
+        [
+            [      0.2500,       0.5000,       0.7500,       1.0000  ],
+        ],
+    ]
+    sum = 2.500000
+common_debug_cb_eval:            result_output = (f32)    MUL_MAT(out{4, 8, 1, 1}, result_norm{4, 1, 1, 1}) = {8, 1, 1, 1}
+    [
+        [
+            [      1.0000,       2.0000,       3.0000,    ...,       8.0000  ],
+        ],
+    ]
+    sum = 36.000000
+";
+
+        let parsed = parse_llama_debug_tensor_summaries(raw, &["result_norm", "result_output"])
+            .expect("llama-debug tensor summaries must parse");
+
+        assert_eq!(
+            parsed.get("result_norm"),
+            Some(&LlamaDebugTensorSummary {
+                shape: vec![4, 1, 1, 1],
+                sum: 2.5,
+            })
+        );
+        assert_eq!(
+            parsed.get("result_output"),
+            Some(&LlamaDebugTensorSummary {
+                shape: vec![8, 1, 1, 1],
+                sum: 36.0,
+            })
+        );
+    }
+
+    #[test]
+    fn llama_debug_tensor_summary_parser_rejects_missing_tensor() {
+        let raw =
+            "common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}\n    sum = 1.0\n";
+
+        let err = parse_llama_debug_tensor_summaries(raw, &["result_norm", "result_output"])
+            .expect_err("missing tensor summary must reject");
+
+        assert!(
+            err.contains("missing llama-debug tensor summary for result_output"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    #[test]
+    fn llama_debug_tensor_summary_parser_keeps_last_duplicate_tensor() {
+        let raw = "\
+common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
+    sum = 1.0
+common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
+    sum = 2.0
+";
+
+        let parsed = parse_llama_debug_tensor_summaries(raw, &["result_norm"])
+            .expect("duplicate llama-debug tensor summaries should keep the last value");
+
+        assert_eq!(
+            parsed.get("result_norm"),
+            Some(&LlamaDebugTensorSummary {
+                shape: vec![1, 1, 1, 1],
+                sum: 2.0,
+            })
+        );
+    }
+
+    #[test]
     fn gemma4_gguf_tokenizer_spec_maps_loader_metadata_without_crate_cycle() {
         let spec = gemma4_gguf_tokenizer_spec_from_metadata(&tiny_metadata())
             .expect("tiny Gemma4 tokenizer metadata should map");
@@ -644,6 +728,358 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires Gemma4 GGUF plus OCELOTL_LLAMA_DEBUG_PATH or local-artifacts/llama_cpp/llama-debug.exe; see docs/artifact-preparation.md"]
+    fn local_gemma4_q4_k_m_late_tensor_summaries_match_llama_cpp_debug() {
+        let model_path = local_gemma4_gguf_path();
+        assert!(
+            model_path.exists(),
+            "missing Gemma4 GGUF at {}; see docs/artifact-preparation.md",
+            model_path.display()
+        );
+        let llama_debug = local_llama_debug_path();
+        assert!(
+            llama_debug.exists(),
+            "missing llama-debug at {}; set OCELOTL_LLAMA_DEBUG_PATH or see docs/artifact-preparation.md",
+            llama_debug.display()
+        );
+
+        let fixture = load_gemma4_logits_fixture();
+        let tokenizer = load_gemma4_gguf_tokenizer(&model_path)
+            .expect("local Gemma4 GGUF tokenizer must build");
+        let tokens = tokenizer
+            .encode_with_configured_bos(&fixture.input)
+            .expect("Gemma4 GGUF tokenizer must encode logits fixture prompt");
+        let token_ids: Vec<u32> = tokens.iter().map(|token| token.0).collect();
+        assert_eq!(
+            token_ids, fixture.token_ids,
+            "Ocelotl tokenization must match the logits fixture before comparing tensors"
+        );
+
+        let llama_tensors = run_llama_debug_tensor_summaries(
+            &llama_debug,
+            &model_path,
+            &fixture.input,
+            &["result_norm", "result_output"],
+        );
+
+        let (mut config, tensors) = load_gemma4_dequantized_tensors_from_gguf(&model_path)
+            .expect("local Gemma4 GGUF tensors must load through explicit F32 dequantization");
+        assert!(
+            config.multimodal,
+            "selected real Gemma4 artifact should still be recorded as multimodal"
+        );
+        config.multimodal = false;
+        let weights = Gemma4TextWeights::from_loaded_tensors(&config, tensors)
+            .expect("dequantized local Gemma4 tensors must map into text weights");
+        let model = Gemma4TextModel::new(config.clone(), weights)
+            .expect("text-projected dequantized Gemma4 model must build");
+        let trace = model
+            .prefill_with_trace(&tokens)
+            .expect("Gemma4 text prefill trace must run");
+
+        let llama_norm = llama_tensors
+            .get("result_norm")
+            .expect("llama-debug result_norm summary should exist");
+        let ocelotl_norm = ocelotl_slice_for_llama_shape(
+            "result_norm",
+            &llama_norm.shape,
+            &trace.result_norm,
+            config.embedding_length,
+        );
+        assert_sum_close(
+            "result_norm",
+            sum_f32(ocelotl_norm),
+            llama_norm.sum,
+            fixture.tolerance,
+        );
+
+        let llama_output = llama_tensors
+            .get("result_output")
+            .expect("llama-debug result_output summary should exist");
+        let output_element_count = shape_element_count(&llama_output.shape)
+            .expect("llama-debug result_output shape element count must fit usize");
+        assert_eq!(
+            output_element_count,
+            trace.result_output.len(),
+            "llama-debug result_output shape {:?} must match Ocelotl result_output length {}",
+            llama_output.shape,
+            trace.result_output.len()
+        );
+        assert_sum_close(
+            "result_output",
+            sum_f32(&trace.result_output),
+            llama_output.sum,
+            fixture.tolerance,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Gemma4 GGUF plus OCELOTL_LLAMA_DEBUG_PATH or local-artifacts/llama_cpp/llama-debug.exe; see docs/artifact-preparation.md"]
+    fn local_gemma4_q4_k_m_layer_output_summaries_match_llama_cpp_debug() {
+        let model_path = local_gemma4_gguf_path();
+        assert!(
+            model_path.exists(),
+            "missing Gemma4 GGUF at {}; see docs/artifact-preparation.md",
+            model_path.display()
+        );
+        let llama_debug = local_llama_debug_path();
+        assert!(
+            llama_debug.exists(),
+            "missing llama-debug at {}; set OCELOTL_LLAMA_DEBUG_PATH or see docs/artifact-preparation.md",
+            llama_debug.display()
+        );
+
+        let fixture = load_gemma4_logits_fixture();
+        let tokenizer = load_gemma4_gguf_tokenizer(&model_path)
+            .expect("local Gemma4 GGUF tokenizer must build");
+        let tokens = tokenizer
+            .encode_with_configured_bos(&fixture.input)
+            .expect("Gemma4 GGUF tokenizer must encode logits fixture prompt");
+        let token_ids: Vec<u32> = tokens.iter().map(|token| token.0).collect();
+        assert_eq!(
+            token_ids, fixture.token_ids,
+            "Ocelotl tokenization must match the logits fixture before comparing tensors"
+        );
+
+        let (mut config, tensors) = load_gemma4_dequantized_tensors_from_gguf(&model_path)
+            .expect("local Gemma4 GGUF tensors must load through explicit F32 dequantization");
+        assert!(
+            config.multimodal,
+            "selected real Gemma4 artifact should still be recorded as multimodal"
+        );
+        config.multimodal = false;
+
+        let layer_names: Vec<String> = (0..config.block_count)
+            .map(|layer_idx| format!("l_out-{layer_idx}"))
+            .collect();
+        let layer_name_refs: Vec<&str> = layer_names.iter().map(String::as_str).collect();
+        let llama_layers = run_llama_debug_tensor_summaries(
+            &llama_debug,
+            &model_path,
+            &fixture.input,
+            &layer_name_refs,
+        );
+
+        let weights = Gemma4TextWeights::from_loaded_tensors(&config, tensors)
+            .expect("dequantized local Gemma4 tensors must map into text weights");
+        let model = Gemma4TextModel::new(config.clone(), weights)
+            .expect("text-projected dequantized Gemma4 model must build");
+        let trace = model
+            .prefill_with_trace(&tokens)
+            .expect("Gemma4 text prefill trace must run");
+        assert_eq!(
+            trace.layer_outputs.len(),
+            config.block_count,
+            "Gemma4 trace must include one layer output per block"
+        );
+
+        for (layer_idx, layer_output) in trace.layer_outputs.iter().enumerate() {
+            let name = &layer_names[layer_idx];
+            let llama = llama_layers
+                .get(name)
+                .unwrap_or_else(|| panic!("llama-debug summary for {name} should exist"));
+            let ocelotl = ocelotl_slice_for_llama_shape(
+                name,
+                &llama.shape,
+                layer_output,
+                config.embedding_length,
+            );
+            let got = sum_f32(ocelotl);
+            let diff = (got - llama.sum).abs();
+            assert!(
+                diff <= fixture.tolerance,
+                "Gemma4 tensor {name} sum: got {got}, llama.cpp {}, diff {diff} exceeds tolerance {}; llama shape {:?}",
+                llama.sum,
+                fixture.tolerance,
+                llama.shape
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Gemma4 GGUF plus OCELOTL_LLAMA_DEBUG_PATH or local-artifacts/llama_cpp/llama-debug.exe; see docs/artifact-preparation.md"]
+    fn local_gemma4_q4_k_m_layer0_substep_summaries_match_llama_cpp_debug() {
+        let model_path = local_gemma4_gguf_path();
+        assert!(
+            model_path.exists(),
+            "missing Gemma4 GGUF at {}; see docs/artifact-preparation.md",
+            model_path.display()
+        );
+        let llama_debug = local_llama_debug_path();
+        assert!(
+            llama_debug.exists(),
+            "missing llama-debug at {}; set OCELOTL_LLAMA_DEBUG_PATH or see docs/artifact-preparation.md",
+            llama_debug.display()
+        );
+
+        let fixture = load_gemma4_logits_fixture();
+        let tokenizer = load_gemma4_gguf_tokenizer(&model_path)
+            .expect("local Gemma4 GGUF tokenizer must build");
+        let tokens = tokenizer
+            .encode_with_configured_bos(&fixture.input)
+            .expect("Gemma4 GGUF tokenizer must encode logits fixture prompt");
+        let token_ids: Vec<u32> = tokens.iter().map(|token| token.0).collect();
+        assert_eq!(
+            token_ids, fixture.token_ids,
+            "Ocelotl tokenization must match the logits fixture before comparing tensors"
+        );
+
+        let names = [
+            "inp_scaled",
+            "attn_norm-0",
+            "Qcur-0",
+            "Qcur_normed-0",
+            "Qcur_pos-0",
+            "Kcur-0",
+            "Vcur-0",
+            "Kcur_normed-0",
+            "Vcur_normed-0",
+            "Kcur_pos-0",
+            "attn_post_norm-0",
+            "attn_out-0",
+            "ffn_norm-0",
+            "ffn_out-0",
+            "ffn_post_norm-0",
+            "pe_in-0",
+            "per_layer_embd_out-0",
+            "l_out-0",
+        ];
+        let llama_tensors =
+            run_llama_debug_tensor_summaries(&llama_debug, &model_path, &fixture.input, &names);
+
+        let (mut config, tensors) = load_gemma4_dequantized_tensors_from_gguf(&model_path)
+            .expect("local Gemma4 GGUF tensors must load through explicit F32 dequantization");
+        assert!(
+            config.multimodal,
+            "selected real Gemma4 artifact should still be recorded as multimodal"
+        );
+        config.multimodal = false;
+        let weights = Gemma4TextWeights::from_loaded_tensors(&config, tensors)
+            .expect("dequantized local Gemma4 tensors must map into text weights");
+        let model = Gemma4TextModel::new(config, weights)
+            .expect("text-projected dequantized Gemma4 model must build");
+        let trace = model
+            .prefill_with_trace(&tokens)
+            .expect("Gemma4 text prefill trace must run");
+
+        for name in names {
+            let llama = llama_tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("llama-debug summary for {name} should exist"));
+            let ocelotl = trace
+                .named_tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("Ocelotl trace tensor {name} should exist"));
+            let element_count = shape_element_count(&llama.shape).unwrap_or_else(|| {
+                panic!(
+                    "llama-debug tensor {name} shape {:?} must fit usize",
+                    llama.shape
+                )
+            });
+            assert_eq!(
+                element_count,
+                ocelotl.len(),
+                "llama-debug tensor {name} shape {:?} must match Ocelotl tensor length {}",
+                llama.shape,
+                ocelotl.len()
+            );
+            let got = sum_f32(ocelotl);
+            let diff = (got - llama.sum).abs();
+            assert!(
+                diff <= fixture.tolerance,
+                "Gemma4 tensor {name} sum: got {got}, llama.cpp {}, diff {diff} exceeds tolerance {}; llama shape {:?}",
+                llama.sum,
+                fixture.tolerance,
+                llama.shape
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Gemma4 GGUF plus OCELOTL_LLAMA_DEBUG_PATH or local-artifacts/llama_cpp/llama-debug.exe; see docs/artifact-preparation.md"]
+    fn local_gemma4_q4_k_m_native_kquant_q8k_qcur_summary_matches_llama_cpp_debug() {
+        let model_path = local_gemma4_gguf_path();
+        assert!(
+            model_path.exists(),
+            "missing Gemma4 GGUF at {}; see docs/artifact-preparation.md",
+            model_path.display()
+        );
+        let llama_debug = local_llama_debug_path();
+        assert!(
+            llama_debug.exists(),
+            "missing llama-debug at {}; set OCELOTL_LLAMA_DEBUG_PATH or see docs/artifact-preparation.md",
+            llama_debug.display()
+        );
+
+        let fixture = load_gemma4_logits_fixture();
+        let tokenizer = load_gemma4_gguf_tokenizer(&model_path)
+            .expect("local Gemma4 GGUF tokenizer must build");
+        let tokens = tokenizer
+            .encode_with_configured_bos(&fixture.input)
+            .expect("Gemma4 GGUF tokenizer must encode logits fixture prompt");
+        let token_ids: Vec<u32> = tokens.iter().map(|token| token.0).collect();
+        assert_eq!(
+            token_ids, fixture.token_ids,
+            "Ocelotl tokenization must match the logits fixture before comparing tensors"
+        );
+
+        let llama_tensors = run_llama_debug_tensor_summaries(
+            &llama_debug,
+            &model_path,
+            &fixture.input,
+            &["Qcur-0"],
+        );
+        let llama_qcur = llama_tensors
+            .get("Qcur-0")
+            .expect("llama-debug Qcur-0 summary should exist");
+
+        let (mut config, tensors) = load_gemma4_dequantized_tensors_from_gguf(&model_path)
+            .expect("local Gemma4 GGUF tensors must load through explicit F32 dequantization");
+        assert!(
+            config.multimodal,
+            "selected real Gemma4 artifact should still be recorded as multimodal"
+        );
+        config.multimodal = false;
+        let weights = Gemma4TextWeights::from_loaded_tensors(&config, tensors)
+            .expect("dequantized local Gemma4 tensors must map into text weights");
+        let model = Gemma4TextModel::new(config.clone(), weights)
+            .expect("text-projected dequantized Gemma4 model must build");
+        let trace = model
+            .prefill_with_trace(&tokens)
+            .expect("Gemma4 text prefill trace must run");
+        let attn_norm = trace
+            .named_tensors
+            .get("attn_norm-0")
+            .expect("Ocelotl trace must include attn_norm-0");
+
+        let raw_attn_q = load_raw_gguf_tensor_bytes(&model_path, "blk.0.attn_q.weight");
+        assert_eq!(
+            raw_attn_q.tensor_type,
+            GgmlTensorType::Q6K,
+            "selected Gemma4 Q4_K_M artifact stores blk.0.attn_q.weight as Q6_K"
+        );
+        let native_sum = k_quant_q8_k_projection_sum(
+            &raw_attn_q.data,
+            raw_attn_q.tensor_type,
+            &raw_attn_q.shape,
+            attn_norm,
+            tokens.len(),
+            config.embedding_length,
+            *raw_attn_q
+                .shape
+                .get(1)
+                .expect("Gemma4 attn_q GGUF tensor must include output dimension"),
+        );
+
+        assert_sum_close(
+            "native K-quant x Q8_K Qcur-0",
+            native_sum,
+            llama_qcur.sum,
+            fixture.tolerance,
+        );
+    }
+
     fn local_gemma4_gguf_path() -> PathBuf {
         if let Ok(path) = std::env::var("OCELOTL_GEMMA4_GGUF_PATH") {
             return PathBuf::from(path);
@@ -812,6 +1248,365 @@ mod tests {
         })
     }
 
+    fn run_llama_debug_tensor_summaries(
+        llama_debug: &Path,
+        model_path: &Path,
+        input: &str,
+        tensor_names: &[&str],
+    ) -> BTreeMap<String, LlamaDebugTensorSummary> {
+        let mut command = Command::new(llama_debug);
+        command
+            .arg("--model")
+            .arg(model_path)
+            .arg("--prompt")
+            .arg(input)
+            .arg("--no-escape")
+            .arg("--no-warmup")
+            .arg("--verbose");
+        if !tensor_names.is_empty() {
+            command
+                .arg("--tensor-filter")
+                .arg(format!("({})$", tensor_names.join("|")));
+        }
+
+        let output = command.output().unwrap_or_else(|err| {
+            panic!(
+                "failed to run llama-debug at {}: {err}",
+                llama_debug.display()
+            )
+        });
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "llama-debug tensor run failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+
+        let raw = format!("{stdout}\n{stderr}");
+        parse_llama_debug_tensor_summaries(&raw, tensor_names).unwrap_or_else(|err| {
+            panic!(
+                "failed to parse llama-debug tensor summaries: {err}\nstdout:\n{}\nstderr:\n{}",
+                stdout, stderr
+            )
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    struct RawGgufTensorBytes {
+        tensor_type: GgmlTensorType,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    fn load_raw_gguf_tensor_bytes(path: &Path, tensor_name: &str) -> RawGgufTensorBytes {
+        let manifest = inspect_gguf(path).expect("local Gemma4 GGUF manifest must inspect");
+        let tensor = manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == tensor_name)
+            .unwrap_or_else(|| panic!("GGUF tensor {tensor_name} must exist"));
+        let byte_len = tensor
+            .byte_len
+            .unwrap_or_else(|| panic!("GGUF tensor {tensor_name} must have known byte length"));
+        let byte_len: usize = byte_len
+            .try_into()
+            .expect("GGUF tensor byte length must fit usize");
+        let mut file = fs::File::open(path).unwrap_or_else(|err| {
+            panic!(
+                "failed to open local Gemma4 GGUF at {}: {err}",
+                path.display()
+            )
+        });
+        file.seek(SeekFrom::Start(tensor.file_offset))
+            .unwrap_or_else(|err| panic!("failed to seek to tensor {tensor_name}: {err}"));
+        let mut data = vec![0_u8; byte_len];
+        file.read_exact(&mut data)
+            .unwrap_or_else(|err| panic!("failed to read tensor {tensor_name}: {err}"));
+        RawGgufTensorBytes {
+            tensor_type: tensor.tensor_type,
+            shape: tensor.shape.clone(),
+            data,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct Q8KBlock {
+        d: f32,
+        qs: [i8; QK_K],
+        bsums: [i16; QK_K / 16],
+    }
+
+    fn k_quant_q8_k_projection_sum(
+        raw_weight: &[u8],
+        tensor_type: GgmlTensorType,
+        weight_shape: &[usize],
+        input: &[f32],
+        seq: usize,
+        input_dim: usize,
+        output_dim: usize,
+    ) -> f32 {
+        assert_eq!(
+            weight_shape,
+            [input_dim, output_dim],
+            "Gemma4 GGUF K-quant projection shape must be [input_dim, output_dim]"
+        );
+        assert_eq!(
+            input.len(),
+            seq * input_dim,
+            "Gemma4 K-quant projection input length must match seq * input_dim"
+        );
+        assert_eq!(
+            input_dim % QK_K,
+            0,
+            "K-quant/Q8_K projection input dim must be block-aligned"
+        );
+        let blocks_per_row = input_dim / QK_K;
+        let block_bytes = match tensor_type {
+            GgmlTensorType::Q4K => Q4_K_BLOCK_BYTES,
+            GgmlTensorType::Q6K => Q6_K_BLOCK_BYTES,
+            other => panic!("unsupported native K-quant diagnostic type {other:?}"),
+        };
+        assert_eq!(
+            raw_weight.len(),
+            output_dim * blocks_per_row * block_bytes,
+            "Gemma4 raw K-quant projection byte length must match shape"
+        );
+
+        let mut total = 0.0_f32;
+        for token_idx in 0..seq {
+            let input_start = token_idx * input_dim;
+            let q8_blocks = quantize_row_q8_k(&input[input_start..input_start + input_dim]);
+            for output_idx in 0..output_dim {
+                let row_start = output_idx * blocks_per_row * block_bytes;
+                let row = &raw_weight[row_start..row_start + blocks_per_row * block_bytes];
+                total += match tensor_type {
+                    GgmlTensorType::Q4K => vec_dot_q4_k_q8_k(row, &q8_blocks),
+                    GgmlTensorType::Q6K => vec_dot_q6_k_q8_k(row, &q8_blocks),
+                    other => panic!("unsupported native K-quant diagnostic type {other:?}"),
+                };
+            }
+        }
+        total
+    }
+
+    fn quantize_row_q8_k(input: &[f32]) -> Vec<Q8KBlock> {
+        assert_eq!(
+            input.len() % QK_K,
+            0,
+            "Q8_K input length must be block-aligned"
+        );
+        let mut blocks = Vec::with_capacity(input.len() / QK_K);
+        for block_input in input.chunks_exact(QK_K) {
+            let mut max = 0.0_f32;
+            let mut amax = 0.0_f32;
+            for value in block_input {
+                let abs = value.abs();
+                if abs > amax {
+                    amax = abs;
+                    max = *value;
+                }
+            }
+
+            let mut block = Q8KBlock {
+                d: 0.0,
+                qs: [0; QK_K],
+                bsums: [0; QK_K / 16],
+            };
+            if amax == 0.0 {
+                blocks.push(block);
+                continue;
+            }
+
+            let iscale = -127.0 / max;
+            for (idx, value) in block_input.iter().enumerate() {
+                let quant = nearest_int(iscale * *value).min(127);
+                assert!(
+                    (-128..=127).contains(&quant),
+                    "Q8_K quantized value must fit i8"
+                );
+                block.qs[idx] = quant as i8;
+            }
+            for group in 0..QK_K / 16 {
+                let start = group * 16;
+                block.bsums[group] = block.qs[start..start + 16]
+                    .iter()
+                    .map(|value| i16::from(*value))
+                    .sum();
+            }
+            block.d = 1.0 / iscale;
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    fn vec_dot_q4_k_q8_k(raw_q4_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
+        assert_eq!(
+            raw_q4_k_row.len(),
+            q8_blocks.len() * Q4_K_BLOCK_BYTES,
+            "Q4_K row bytes must align with Q8_K block count"
+        );
+        let mut lane_sums = [0.0_f32; 8];
+        let mut sumf = 0.0_f32;
+
+        for (raw_block, q8) in raw_q4_k_row
+            .chunks_exact(Q4_K_BLOCK_BYTES)
+            .zip(q8_blocks.iter())
+        {
+            let q4 = &raw_block[16..144];
+            let mut aux8 = [0_i8; QK_K];
+            for group64 in 0..QK_K / 64 {
+                let q4_start = group64 * 32;
+                let value_start = group64 * 64;
+                for l in 0..32 {
+                    aux8[value_start + l] = (q4[q4_start + l] & 0x0f) as i8;
+                }
+                for l in 0..32 {
+                    aux8[value_start + 32 + l] = (q4[q4_start + l] >> 4) as i8;
+                }
+            }
+
+            let mut aux32 = [0_i32; 8];
+            for group32 in 0..QK_K / 32 {
+                let (scale, _) = get_scale_min_k4(group32, &raw_block[4..16]);
+                let value_start = group32 * 32;
+                for l in 0..32 {
+                    let lane = l % 8;
+                    aux32[lane] += i32::from(scale)
+                        * i32::from(q8.qs[value_start + l])
+                        * i32::from(aux8[value_start + l]);
+                }
+            }
+
+            let mut min_sum = 0_i32;
+            for group16 in 0..QK_K / 16 {
+                let (_, min) = get_scale_min_k4(group16 / 2, &raw_block[4..16]);
+                min_sum += i32::from(q8.bsums[group16]) * i32::from(min);
+            }
+
+            let d = f16_le_at(raw_block, 0) * q8.d;
+            for (lane, aux) in aux32.iter().enumerate() {
+                lane_sums[lane] += d * *aux as f32;
+            }
+            let dmin = f16_le_at(raw_block, 2) * q8.d;
+            sumf -= dmin * min_sum as f32;
+        }
+
+        sumf + lane_sums.iter().copied().sum::<f32>()
+    }
+
+    fn vec_dot_q6_k_q8_k(raw_q6_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
+        assert_eq!(
+            raw_q6_k_row.len(),
+            q8_blocks.len() * Q6_K_BLOCK_BYTES,
+            "Q6_K row bytes must align with Q8_K block count"
+        );
+        let mut lane_sums = [0.0_f32; 8];
+
+        for (raw_block, q8) in raw_q6_k_row
+            .chunks_exact(Q6_K_BLOCK_BYTES)
+            .zip(q8_blocks.iter())
+        {
+            let ql = &raw_block[0..128];
+            let qh = &raw_block[128..192];
+            let scales = &raw_block[192..208];
+            let mut aux8 = [0_i8; QK_K];
+
+            for super_group in 0..2 {
+                let ql_base = super_group * 64;
+                let qh_base = super_group * 32;
+                let value_base = super_group * 128;
+                for l in 0..32 {
+                    let high = qh[qh_base + l];
+                    aux8[value_base + l] =
+                        (((ql[ql_base + l] & 0x0f) | ((high & 0x03) << 4)) as i8) - 32;
+                    aux8[value_base + l + 32] =
+                        (((ql[ql_base + l + 32] & 0x0f) | (((high >> 2) & 0x03) << 4)) as i8) - 32;
+                    aux8[value_base + l + 64] =
+                        (((ql[ql_base + l] >> 4) | (((high >> 4) & 0x03) << 4)) as i8) - 32;
+                    aux8[value_base + l + 96] =
+                        (((ql[ql_base + l + 32] >> 4) | (((high >> 6) & 0x03) << 4)) as i8) - 32;
+                }
+            }
+
+            let mut aux32 = [0_i32; 8];
+            for (group16, scale_byte) in scales.iter().enumerate().take(QK_K / 16) {
+                let scale = i8::from_ne_bytes([*scale_byte]);
+                let value_start = group16 * 16;
+                for l in 0..16 {
+                    let lane = l % 8;
+                    aux32[lane] += i32::from(scale)
+                        * i32::from(q8.qs[value_start + l])
+                        * i32::from(aux8[value_start + l]);
+                }
+            }
+
+            let d = f16_le_at(raw_block, 208) * q8.d;
+            for (lane, aux) in aux32.iter().enumerate() {
+                lane_sums[lane] += d * *aux as f32;
+            }
+        }
+
+        lane_sums.iter().copied().sum()
+    }
+
+    fn get_scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
+        assert_eq!(scales.len(), 12);
+        assert!(index < 8);
+        if index < 4 {
+            (scales[index] & 0x3f, scales[index + 4] & 0x3f)
+        } else {
+            (
+                (scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4),
+                (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4),
+            )
+        }
+    }
+
+    fn nearest_int(value: f32) -> i32 {
+        assert!(value.abs() <= 4_194_303.0);
+        let bits = (value + 12_582_912.0).to_bits();
+        ((bits & 0x007f_ffff) as i32) - 0x0040_0000
+    }
+
+    fn f16_le_at(data: &[u8], offset: usize) -> f32 {
+        let bits = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        f16_bits_to_f32(bits)
+    }
+
+    fn f16_bits_to_f32(bits: u16) -> f32 {
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exp = (bits >> 10) & 0x1f;
+        let frac = (bits & 0x03ff) as u32;
+
+        let f32_bits = match exp {
+            0 => {
+                if frac == 0 {
+                    sign
+                } else {
+                    let mut frac_norm = frac;
+                    let mut exp_unbiased = -14_i32;
+                    while (frac_norm & 0x0400) == 0 {
+                        frac_norm <<= 1;
+                        exp_unbiased -= 1;
+                    }
+                    frac_norm &= 0x03ff;
+                    let exp32 = (exp_unbiased + 127) as u32;
+                    sign | (exp32 << 23) | (frac_norm << 13)
+                }
+            }
+            0x1f => sign | 0x7f80_0000 | (frac << 13),
+            _ => {
+                let exp32 = u32::from(exp) + (127 - 15);
+                sign | (exp32 << 23) | (frac << 13)
+            }
+        };
+
+        f32::from_bits(f32_bits)
+    }
+
     fn llama_debug_logits_text_path(output_dir: &Path) -> PathBuf {
         let mut candidates = Vec::new();
         for entry in fs::read_dir(output_dir).unwrap_or_else(|err| {
@@ -934,5 +1729,144 @@ mod tests {
             return Err("llama-debug logits text did not contain any `id: value` rows".to_string());
         }
         Ok(logits)
+    }
+
+    fn parse_llama_debug_tensor_summaries(
+        raw: &str,
+        tensor_names: &[&str],
+    ) -> std::result::Result<BTreeMap<String, LlamaDebugTensorSummary>, String> {
+        let expected: BTreeSet<&str> = tensor_names.iter().copied().collect();
+        if expected.len() != tensor_names.len() {
+            return Err("duplicate llama-debug tensor names requested".to_string());
+        }
+
+        let mut summaries = BTreeMap::new();
+        let mut pending: Option<(String, Vec<usize>)> = None;
+
+        for line in raw.lines() {
+            if let Some((name, shape)) = parse_llama_debug_tensor_header(line, &expected)? {
+                if pending.is_some() {
+                    let pending_name = pending.as_ref().map(|(name, _)| name.as_str()).unwrap();
+                    return Err(format!(
+                        "missing sum line for llama-debug tensor {pending_name}"
+                    ));
+                }
+                pending = Some((name, shape));
+                continue;
+            }
+
+            let trimmed = line.trim();
+            if let Some(sum_text) = trimmed.strip_prefix("sum =") {
+                let Some((name, shape)) = pending.take() else {
+                    continue;
+                };
+                let sum = sum_text.trim().parse::<f32>().map_err(|err| {
+                    format!(
+                        "invalid llama-debug tensor sum {:?} for {name}: {err}",
+                        sum_text.trim()
+                    )
+                })?;
+                if !sum.is_finite() {
+                    return Err(format!(
+                        "non-finite llama-debug tensor sum {sum} for {name}"
+                    ));
+                }
+                summaries.insert(name, LlamaDebugTensorSummary { shape, sum });
+            }
+        }
+
+        if let Some((name, _)) = pending {
+            return Err(format!("missing sum line for llama-debug tensor {name}"));
+        }
+
+        for tensor_name in tensor_names {
+            if !summaries.contains_key(*tensor_name) {
+                return Err(format!(
+                    "missing llama-debug tensor summary for {tensor_name}"
+                ));
+            }
+        }
+
+        Ok(summaries)
+    }
+
+    fn parse_llama_debug_tensor_header(
+        line: &str,
+        expected: &BTreeSet<&str>,
+    ) -> std::result::Result<Option<(String, Vec<usize>)>, String> {
+        let Some((_, right)) = line.split_once("common_debug_cb_eval:") else {
+            return Ok(None);
+        };
+        let Some(name) = right.split_whitespace().next() else {
+            return Ok(None);
+        };
+        if !expected.contains(name) {
+            return Ok(None);
+        }
+        let Some(shape_start) = line.rfind("= {") else {
+            return Err(format!(
+                "missing trailing shape for llama-debug tensor {name}: {line:?}"
+            ));
+        };
+        let shape_text = &line[shape_start + 3..];
+        let Some(shape_end) = shape_text.find('}') else {
+            return Err(format!(
+                "unterminated trailing shape for llama-debug tensor {name}: {line:?}"
+            ));
+        };
+        let dims = shape_text[..shape_end]
+            .split(',')
+            .map(|part| {
+                let trimmed = part.trim();
+                trimmed.parse::<usize>().map_err(|err| {
+                    format!("invalid llama-debug tensor dimension {trimmed:?} for {name}: {err}")
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if dims.is_empty() {
+            return Err(format!("empty llama-debug tensor shape for {name}"));
+        }
+
+        Ok(Some((name.to_string(), dims)))
+    }
+
+    fn shape_element_count(shape: &[usize]) -> Option<usize> {
+        shape
+            .iter()
+            .try_fold(1_usize, |acc, dim| acc.checked_mul(*dim))
+    }
+
+    fn ocelotl_slice_for_llama_shape<'a>(
+        name: &str,
+        llama_shape: &[usize],
+        values: &'a [f32],
+        final_token_width: usize,
+    ) -> &'a [f32] {
+        let element_count = shape_element_count(llama_shape).unwrap_or_else(|| {
+            panic!("llama-debug tensor {name} shape {llama_shape:?} element count must fit usize")
+        });
+        if element_count == values.len() {
+            return values;
+        }
+        if element_count == final_token_width {
+            let start = values.len() - final_token_width;
+            return &values[start..start + final_token_width];
+        }
+        panic!(
+            "llama-debug tensor {name} shape {llama_shape:?} has {element_count} elements, expected either Ocelotl full length {} or final-token length {final_token_width}",
+            values.len()
+        );
+    }
+
+    fn sum_f32(values: &[f32]) -> f32 {
+        values.iter().copied().sum()
+    }
+
+    fn assert_sum_close(name: &str, got: f32, want: f32, tolerance: f32) {
+        let diff = (got - want).abs();
+        assert!(
+            diff <= tolerance,
+            "Gemma4 tensor {name} sum: got {got}, llama.cpp {want}, diff {diff} exceeds tolerance {tolerance}"
+        );
     }
 }
