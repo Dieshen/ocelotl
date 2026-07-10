@@ -2387,7 +2387,7 @@ fn validate_native_projection(
     {
         return Err(invalid_at(
             path,
-            &field,
+            field,
             &format!(
                 "expected native projection shape [{expected_input}, {expected_output}], got [{}, {}]",
                 projection.input_features, projection.output_features
@@ -2397,7 +2397,7 @@ fn validate_native_projection(
     if projection.input_features % GGML_K_QUANT_BLOCK_ELEMENTS != 0 {
         return Err(invalid_at(
             path,
-            &field,
+            field,
             &format!(
                 "input_features {} is not divisible by K-quant block size {GGML_K_QUANT_BLOCK_ELEMENTS}",
                 projection.input_features
@@ -2414,17 +2414,11 @@ fn validate_native_projection(
         .output_features
         .checked_mul(blocks_per_output)
         .and_then(|blocks| blocks.checked_mul(block_bytes))
-        .ok_or_else(|| {
-            invalid_at(
-                path,
-                &field,
-                "native projection byte length overflows usize",
-            )
-        })?;
+        .ok_or_else(|| invalid_at(path, field, "native projection byte length overflows usize"))?;
     if projection.data.len() != expected_len {
         return Err(invalid_at(
             path,
-            &field,
+            field,
             &format!(
                 "expected {expected_len} raw native projection bytes, got {}",
                 projection.data.len()
