@@ -6,37 +6,41 @@ This guide is the contributor entry point for Ocelotl.
 
 Read these first:
 
-1. `docs/overview.md`
-2. `docs/architecture.md`
-3. `docs/crate-boundaries.md`
-4. `docs/roadmap.md`
-5. `docs/tasks/README.md`
-6. `docs/model-target.md`
-7. `docs/validation/tdd.md`
-8. `docs/ci.md`
-9. `docs/artifact-preparation.md` (only when a task needs real local model files; default tests are offline)
+1. `docs/status.md`
+2. `docs/overview.md`
+3. `docs/architecture.md`
+4. `docs/crate-boundaries.md`
+5. `docs/roadmap.md`
+6. `docs/tasks/README.md`
+7. `docs/model-target.md`
+8. `docs/validation/tdd.md`
+9. `docs/ci.md`
+10. `docs/artifact-preparation.md` (only when a task needs real local model files; default tests are offline)
 
 The short version: Ocelotl is a Rust-first LLM inference runtime. The project is
 correctness-first and test-driven. CPU/reference behavior comes before GPU;
 contiguous KV comes before paged KV; one request comes before scheduling.
+The active release track is local alpha hardening for Whisper and Gemma4 text;
+M8 network-server work has not started.
 
 ## 2. Validate The Workspace
 
 From the repository root:
 
 ```powershell
-cargo fmt --all
-cargo check --workspace
-cargo test --workspace
+pwsh -NoProfile -File tools/verify.ps1 -Mode Fast
+pwsh -NoProfile -File tools/verify.ps1 -Mode Full
 ```
 
-Default tests should not require network access. CI runs the same baseline
-commands; see `docs/ci.md`.
+Use `Fast` while editing and `Full` before merge. Both use the committed
+lockfile; default tests do not require model downloads or network access. CI
+runs `Full` plus separate MSRV and dependency-audit jobs; see `docs/ci.md`.
 
 ## 3. Pick Work From A Milestone
 
-Start with the current milestone spec under `docs/milestones/`, then use the
-matching execution backlog under `docs/tasks/`. Each milestone spec has:
+Read `docs/status.md` first to distinguish closed, active, and blocked work.
+Then start with the relevant milestone/track spec under `docs/milestones/` and
+use the matching execution backlog under `docs/tasks/`. Each milestone spec has:
 
 - Goal.
 - Non-goals.
@@ -83,25 +87,28 @@ artifacts, and unsupported kernel layouts.
 
 ```powershell
 # Workspace health
-cargo fmt --all
-cargo check --workspace
-cargo test --workspace
+pwsh -NoProfile -File tools/verify.ps1 -Mode Fast
+pwsh -NoProfile -File tools/verify.ps1 -Mode Full
 
 # Focused crates
-cargo test -p ocelotl-core
-cargo test -p ocelotl-loader
-cargo test -p ocelotl-tokenizer
-cargo test -p ocelotl-kernels
-cargo test -p ocelotl-models
-cargo test -p ocelotl-runtime
-cargo test -p ocelotl-server
+cargo test -p ocelotl-core --locked
+cargo test -p ocelotl-loader --locked
+cargo test -p ocelotl-tokenizer --locked
+cargo test -p ocelotl-kernels --locked
+cargo test -p ocelotl-models --locked
+cargo test -p ocelotl-runtime --locked
+cargo test -p ocelotl-server --locked
 ```
 
 ## First Good Contribution
 
-For early work, a good contribution is usually one of:
+For the current alpha-hardening track, a good contribution is usually one of:
 
-- A fixture and failing test for M1 or M2.
-- A typed error improvement with tests.
-- A small interface refinement that makes crate boundaries clearer.
-- A doc update that removes ambiguity before implementation.
+- A failing boundary or malformed-input fixture tied to an alpha release gate.
+- A focused Whisper or Gemma4 parity discriminator with a pinned reference.
+- A typed error or resource-budget improvement with regression tests.
+- A build/benchmark reproducibility improvement that keeps default tests
+  offline.
+
+M8 server tasks are a separate milestone. Do not add an ad hoc transport layer
+while alpha work still targets the trusted-local runtime/CLI surface.

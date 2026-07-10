@@ -25,17 +25,15 @@ before merging.
 Focused examples:
 
 ```powershell
-cargo test -p ocelotl-loader
-cargo test -p ocelotl-tokenizer
-cargo test -p ocelotl-runtime
+cargo test -p ocelotl-loader --locked
+cargo test -p ocelotl-tokenizer --locked
+cargo test -p ocelotl-runtime --locked
 ```
 
 Workspace gate:
 
 ```powershell
-cargo fmt --all
-cargo test --workspace
-cargo check --workspace
+pwsh -NoProfile -File tools/verify.ps1 -Mode Full
 ```
 
 ## Offline Rule
@@ -127,22 +125,28 @@ remains offline by construction.
 
 ## M4 GPU Kernel Path Acceptance Traceability
 
-M4 is open. This table captures the first CubeCL spike without claiming the full
-milestone is closed.
+M4 closed on 2026-05-13 at its intentionally narrow first-backend scope. It
+proves explicit backend selection and CPU/GPU parity for the first CubeCL/WGPU
+kernel path; it does not claim full-model GPU residency. Current release posture
+is summarized in `docs/status.md`.
 
 | # | Acceptance criterion | Test(s) proving it | Status |
 | - | -------------------- | ------------------ | ------ |
-| 1 | At least one hot operation has a GPU implementation and CPU parity test. | `ocelotl_kernels::cubecl_backend::tests::wgpu_rope_matches_cpu_reference_for_position_one` is feature-gated behind `cubecl-wgpu`, ignored by default, and compares CubeCL WGPU RoPE against CPU `rope_apply_inplace` at `1e-5`. | green (local opt-in) |
-| 2 | Runtime can select CPU or GPU backend explicitly. | Kernel-level groundwork only: `ocelotl_kernels::tests::cpu_backend_rejects_gpu_requirement_with_typed_unsupported_error` and `ocelotl_kernels::cubecl_backend::tests::cubecl_backend_advertises_gpu_device`. Runtime selection remains pending. | partial |
-| 3 | GPU path fails clearly when unavailable or invalid before launch. | `ocelotl_kernels::cubecl_backend::tests::wgpu_rope_rejects_invalid_shape_before_launch` proves invalid RoPE shape returns a typed CubeCL `KernelError` before WGPU runtime launch. Feature absence is handled by optional Cargo features; runtime unavailability handling still needs a public runtime path. | partial |
-| 4 | GPU prefill/decode parity exists for the M3 fixture path. | Not implemented yet. The first spike intentionally stops at the RoPE kernel boundary. | pending |
-| 5 | CPU reference remains available and tested. | Default `cargo test --workspace` does not enable CubeCL, so CPU tests remain the default validation surface. The CubeCL parity test computes expected output from CPU RoPE, not from a previous GPU run. | green for first kernel |
+| 1 | At least one hot operation has a GPU implementation and CPU parity test. | `ocelotl_kernels::cubecl_backend::tests::wgpu_rope_matches_cpu_reference_for_position_one` is feature-gated behind `cubecl-wgpu`, ignored by default, and compares CubeCL/WGPU RoPE against CPU `rope_apply_inplace` at `1e-5`. | green (local opt-in execution) |
+| 2 | Runtime can select CPU or GPU backend explicitly. | `ocelotl_models::qwen::qwen2_5_model::tests::model_accepts_non_cpu_kernel_backend_without_naming_concrete_backend` and `ocelotl_runtime::tests::cubecl_wgpu_runtime_builds_qwen_model_with_gpu_execution_backend_without_launch` prove model/runtime selection without leaking the concrete backend into model-family APIs. | green |
+| 3 | GPU path fails clearly when unavailable or invalid before launch. | `ocelotl_kernels::tests::cpu_backend_rejects_gpu_requirement_with_typed_unsupported_error` covers feature/backend mismatch. `ocelotl_kernels::cubecl_backend::tests::{wgpu_rope_rejects_invalid_shape_before_launch,wgpu_rope_rejects_non_f32_dtype_before_launch,wgpu_rope_rejects_non_contiguous_stride_before_launch}` cover invalid launch contracts. | green |
+| 4 | GPU prefill/decode parity exists for the M3 fixture path. | Ignored local proofs `crates/models/tests/qwen2_5_tiny_synthetic_prefill.rs::cubecl_wgpu_prefill_matches_cpu_reference_within_tolerance` and `crates/runtime/tests/qwen2_5_tiny_synthetic_decode.rs::cubecl_wgpu_decode_one_token_matches_cpu_reference` compare the public Qwen path against CPU/reference output. | green (local opt-in execution) |
+| 5 | CPU reference remains available and tested. | Default `cargo test --workspace --locked` does not enable CubeCL, so CPU tests remain the default authority. GPU parity tests compute expected values from CPU/reference behavior rather than captured GPU output. | green |
 
 Local M4 spike proof command that passed on 2026-05-13:
 
 ```powershell
 cargo test -p ocelotl-kernels --features cubecl-wgpu wgpu_rope_matches_cpu_reference_for_position_one -- --ignored --nocapture
 ```
+
+Non-RoPE operations retained CPU fallback at M4 closure. Later GPU work may
+broaden execution, but it must add its own hardware parity evidence rather than
+retroactively widening the M4 claim.
 
 ## M5-M7 Runtime State Acceptance Traceability
 

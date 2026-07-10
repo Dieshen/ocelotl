@@ -1,11 +1,11 @@
 # Ocelotl
 
-Rust-first LLM inference runtime.
+Rust-first local LLM and speech inference runtime.
 
-Ocelotl is an early-stage workspace for a local LLM runtime with explicit model,
-loader, tokenizer, kernel, runtime, and serving boundaries. The first milestone
-is a narrow, correct single-process runtime before adding broad model coverage or
-high-scale serving features.
+Ocelotl is a correctness-first runtime with explicit model, loader, tokenizer,
+kernel, runtime, and serving boundaries. The active target is an honest local
+alpha with Whisper batch transcription and Gemma4 text inference as the minimum
+model-family scope. It is not yet an internet-facing production server.
 
 ## Start Here
 
@@ -13,6 +13,7 @@ New contributors should start with [docs/start-here.md](docs/start-here.md).
 
 Core orientation docs:
 
+- [Current Status And Alpha Gates](docs/status.md)
 - [Overview](docs/overview.md)
 - [Architecture](docs/architecture.md)
 - [Crate Boundaries](docs/crate-boundaries.md)
@@ -38,12 +39,22 @@ Core orientation docs:
 ## Validation
 
 ```powershell
-cargo fmt --all
-cargo check --workspace
-cargo test --workspace
+# Short edit loop.
+pwsh -NoProfile -File tools/verify.ps1 -Mode Fast
+
+# Required pre-merge gate.
+pwsh -NoProfile -File tools/verify.ps1 -Mode Full
 ```
+
+The workspace commits `Cargo.lock`, pins its development toolchain, and validates
+Rust 1.85 separately as the minimum supported Rust version. See
+[docs/ci.md](docs/ci.md) for the exact commands and opt-in hardware/artifact
+policy.
 
 ## Current Status
 
-This is a project skeleton. Public APIs are intentionally small while the runtime
-shape is established.
+M0 through M7 are closed at their documented correctness scopes. Alpha
+hardening is active, M8 server work has not started, Whisper local exact-token
+parity is opt-in, and Gemma4 real-artifact text parity remains blocked at the
+first divergent Q5_K attention-output projection. The canonical implemented /
+validated / blocked split is maintained in [docs/status.md](docs/status.md).

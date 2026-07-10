@@ -1,152 +1,188 @@
 # CI Policy
 
-CI enforces Ocelotl's offline-by-default validation rule. It should start small
-and become stricter as milestones add behavior.
+CI enforces Ocelotl's deterministic, offline-by-default validation contract.
+The current release posture is tracked in `docs/status.md`.
 
-## Required PR Checks
+## Local Verification Entry Point
 
-Every pull request should run:
+Use the repository-owned PowerShell entry point instead of maintaining a
+personal copy of the gate commands:
 
 ```powershell
-cargo fmt --all --check
-cargo check --workspace
-cargo test --workspace
+# Short edit loop: format, default all-target check, offline policy.
+pwsh -NoProfile -File tools/verify.ps1 -Mode Fast
+
+# Pre-merge gate: Fast plus default tests, all-feature no-launch check, clippy.
+pwsh -NoProfile -File tools/verify.ps1 -Mode Full
 ```
 
-These checks must not require network access, model downloads, GPU hardware, or
-large local artifacts.
+`Full` is the required pull-request gate. It runs:
+
+```powershell
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+pwsh -NoProfile -File ci/check-offline.ps1
+cargo test --workspace --locked
+cargo check --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
+The all-feature commands compile the CubeCL/WGPU surface without launching a
+real GPU proof. Hardware and local-artifact tests remain explicit opt-in work.
+
+## Reproducible Toolchain And Dependencies
+
+- `rust-toolchain.toml` pins the development toolchain, rustfmt, and clippy.
+- `Cargo.toml` declares Rust 1.85 as the minimum supported Rust version (MSRV).
+- `Cargo.lock` is committed because the workspace ships the `ocelotl` binary.
+- Build, test, clippy, benchmark, and release commands use `--locked`.
+
+Update the development toolchain and lockfile intentionally. A toolchain update
+must run `Full`; a dependency update must run `Full`, the Rust 1.85 checks, and
+`cargo audit`. Do not make a benchmark comparison across different lockfiles or
+toolchains without labeling it as a separate environment.
+
+## Required GitHub Checks
+
+The workflow separates failures by contract and runs independent jobs in
+parallel:
+
+| Job | Contract |
+| --- | --- |
+| Full validation | Runs `tools/verify.ps1 -Mode Full` on Windows with the pinned development toolchain. |
+| MSRV | Runs default all-target check and workspace tests with Rust 1.85.0. `RUSTUP_TOOLCHAIN` overrides the repository development pin for this job only. |
+| Dependency audit | Audits the committed lockfile against RustSec advisories. Vulnerability findings fail the job; informational warnings must still be reviewed. |
+
+Top-level workflow permissions are `contents: read`. The audit job alone adds
+`checks: write` so its result can be reported as a GitHub check. Checkout does
+not persist credentials.
+
+The workflow cancels superseded runs for the same branch or pull request. Rust
+build outputs are restored through separate development/MSRV cache keys. A
+cache hit is only an acceleration: no correctness or benchmark claim may depend
+on a warm cache.
+
+All third-party actions are pinned to exact upstream commits with the verified
+release/version in an adjacent comment. When updating an action, resolve the
+official upstream tag to a commit and change the SHA and comment together.
 
 ## Test Classes
 
-Default CI:
+Default CI includes:
 
 - formatting,
-- workspace check,
-- unit tests,
-- fixture tests,
-- unsupported-config tests,
-- CPU/reference tests that use committed small fixtures.
+- default-feature all-target compilation,
+- unit, integration, fixture, and doctests,
+- unsupported-configuration and malformed-artifact tests,
+- CPU/reference tests using committed small fixtures,
+- all-feature/all-target no-launch compilation,
+- clippy with warnings denied,
+- the offline policy gate,
+- MSRV and dependency-audit jobs.
 
-Ignored or separate CI:
+Separate or ignored validation includes:
 
-- GPU tests,
-- benchmark tests,
-- network-dependent model download tests,
-- tests requiring large local artifacts.
+- real GPU launch and CPU/GPU execution parity,
+- performance benchmarks,
+- network-dependent acquisition,
+- tests requiring large or license-bearing local artifacts,
+- tests requiring external reference binaries such as llama.cpp or
+  whisper.cpp.
 
-## GPU CI
-
-GPU CI should be added only after M4 introduces the first GPU kernel path. GPU
-jobs should report hardware, driver, backend, and feature flags. GPU failures
-should block GPU-default changes but should not be required for M1-M3 CPU-only
-work.
-
-## Offline Rule
-
-If a test needs network access, mark it ignored by default and document the exact
-command to run it. Do not let default `cargo test --workspace` fetch model files
-or hit external APIs.
+An ignored test must name its prerequisites and exact local command. Default
+`cargo test --workspace --locked` must never download artifacts or call an
+external API.
 
 ## Offline By Default Across Milestones
 
-The offline rule is enforced differently at different milestones. The principle
-is: **the milestone that introduces network access owns the enforcement**.
+The offline rule is enforced differently at different milestones. The
+principle is: the milestone that introduces network access owns its enforcement.
 
-- **M1 (CPU reference)**: offline by construction. No M1 task introduces
-  network access — fixtures are committed under `fixtures/`, no model
-  downloads happen, no HTTP clients are called. `cargo test --workspace`
-  therefore proves the offline contract automatically. M1 does not add
-  `--offline` flags to CI because there is nothing for them to enforce.
-- **M2 (loader and tokenizer)**: first milestone that *can* reach the
-  network. The `tokenizers` crate supports loading from HuggingFace Hub;
-  loader tests must use committed fixtures. M2.8 enforces the offline
-  contract via the **offline gate** (`ci/check-offline.ps1`, run as a
-  step in the CI workflow before `cargo test --workspace`). The gate
-  scans `crates/**/*.rs` and `crates/**/Cargo.toml` for known network-
-  fetching APIs (`reqwest::`, `ureq::`, `hf_hub::`, `HfApi`,
-  `.from_pretrained`, literal `huggingface.co` / `hf.co` URLs, and a
-  list of forbidden network-client deps). Matches in production code
-  fail the gate; matches inside `#[test]` functions fail unless the
-  enclosing test is `#[ignore]`'d. See § Offline Gate below.
-- **Later milestones (M3+)**: should not regress the M2 offline
-  enforcement. If a milestone needs network access (e.g. for an
-  integration test against a real artifact), the test must be
-  `#[ignore]` by default and runnable on demand with a documented
-  command, per the Offline Rule above.
+- **M1 (CPU reference):** offline by construction. Fixtures are committed and
+  no model download or HTTP client is part of the runtime.
+- **M2 (loader and tokenizer):** introduced APIs whose upstream libraries can
+  fetch artifacts. M2.8 added `ci/check-offline.ps1` to reject accidental
+  network clients or model-host calls in the default surface.
+- **Later milestones:** real artifacts and reference binaries remain local and
+  opt-in. Network-dependent tests are ignored by default and document how the
+  contributor acquires a pinned artifact separately.
 
-This split avoids two failure modes: enforcing `--offline` before any test
-needs it (a hypothetical solution), and discovering after-the-fact that a
-milestone silently introduced a network dependency (no enforcement).
+`--locked` and the offline policy solve different problems. `--locked` prevents
+dependency resolution drift. The offline gate prevents Ocelotl code and default
+tests from initiating model/network fetches. Cargo may still need registry
+access on a clean machine to obtain the exact packages named by the committed
+lockfile.
 
 ## Offline Gate
 
-The offline gate is a static check that scans the workspace for code paths
-that would let `cargo test --workspace` (without `--ignored`) reach the
-network. It runs as a CI step *before* `cargo test --workspace` so a
-violation is reported before tests execute.
+`ci/check-offline.ps1` is a static check that runs before default tests.
 
-**Where it lives:** `ci/check-offline.ps1` (a PowerShell 7+ script,
-chosen because the CI runner is `windows-latest`).
+It scans:
 
-**What it scans for:**
+- the root `Cargo.toml` and every manifest under `crates/`,
+- root `src/`, `tests/`, `benches/`, `examples/`, and `build.rs` when present,
+- every Rust source under `crates/`, including crate tests, examples, benches,
+  and build scripts.
 
-- HTTP-client crates: `reqwest::`, `ureq::`, `isahc::`, `surf::`,
-  `attohttpc::`, `hyper::Client` (in `crates/**/*.rs`).
-- HuggingFace Hub fetchers: `hf_hub::`, `HfApi`, and the
-  `.from_pretrained` helper that the `tokenizers` crate exposes.
-- Literal URLs that point at the model host: `https://huggingface.co/...`,
-  `https://hf.co/...`.
-- The same set of crate names as `[dependencies]` entries in any
-  `crates/**/Cargo.toml`.
+The root package is a workspace member, so it receives the same policy as the
+named crates. Adding a forbidden dependency or call to the root CLI/tests must
+fail the gate.
 
-**What it permits:**
+The gate rejects:
 
-- Any of the above patterns inside a function annotated with `#[test]`
-  AND `#[ignore = "..."]`. The `#[ignore]` attribute may sit either
-  immediately above `#[test]` or immediately below it; the gate accepts
-  both idiomatic positions.
-- Doc comments (`///` and `//!` lines) — they describe behavior, they
-  don't invoke it.
+- HTTP clients: `reqwest`, `ureq`, `isahc`, `surf`, `attohttpc`, and
+  `hyper::Client`,
+- Hugging Face clients: `hf_hub`, `huggingface_hub`, `HfApi`, and
+  `.from_pretrained`,
+- literal `huggingface.co` and `hf.co` URLs in executable code,
+- the matching network-client dependencies in workspace manifests.
 
-**How to add a legitimate exception** (the only supported way): mark the
-test `#[ignore = "<remediation message>"]` per
-`docs/artifact-preparation.md` § 5. Default `cargo test --workspace`
-will skip it; a contributor who has fetched the artifacts can opt in
-with `cargo test --workspace -- --ignored`. The canonical example is
-`crates/tokenizer/tests/qwen2_5_basic_prompt.rs`
-(`json_tokenizer_round_trips_qwen2_5_basic_prompt`, M2.3).
+It permits those source patterns only inside a `#[test]` with an adjacent
+`#[ignore = "..."]` attribute. Doc comments are permitted because they do not
+execute.
 
-**Honest limitations:**
-
-- The gate is greppable. A determined contributor could rename a network
-  call or use a transitive dep to bypass it. The gate's job is catching
-  *accidents*, not adversaries — paired with `#[ignore]` discipline and
-  reviewer attention, that's enough for now.
-- A future tightening would add a sandbox CI step that runs `cargo test
-  --workspace` inside a network-disabled container (e.g.
-  `--network none`); that is the authoritative check. The gate here
-  gives fast local feedback (runs in milliseconds) while the sandbox
-  step would be the slower belt to its suspenders.
-
-**Running the gate locally:**
+Run it directly with:
 
 ```powershell
-./ci/check-offline.ps1
+pwsh -NoProfile -File ci/check-offline.ps1
 ```
 
-Exit 0 = clean; exit 1 = violations printed to stderr with file/line
-references and a remediation hint.
+Exit 0 means no known network-fetching pattern was found in the default
+surface. Exit 1 prints file/line violations. Exit 2 means repository discovery
+or script invocation failed.
 
-## Initial GitHub Actions Shape
+The gate is intentionally greppable and catches accidents, not adversarial
+evasion. A future stronger layer may run tests inside a network-disabled
+container. Until then, reviewers must still inspect new dependencies, build
+scripts, proc-macro dependencies, and indirect process launches.
 
-The initial workflow is intentionally minimal:
+## GPU And Local-Artifact Validation
 
-- checkout,
-- install stable Rust,
-- run fmt check,
-- run workspace check,
-- run the offline gate (M2.8),
-- run workspace tests.
+Default/all-feature CI proves feature compilation without requiring a GPU.
+Ignored GPU execution tests remain local until controlled hardware runners are
+available. A future GPU job must record runner identity, adapter, driver,
+backend, feature flags, and parity tolerance before it can block a release.
 
-As fixtures and crates grow, add focused jobs only when they reduce feedback time
-or isolate hardware requirements.
+Whisper and Gemma4 local-artifact proofs remain ignored because the repository
+does not commit model weights or external reference executables. An alpha
+release record must capture their exact artifact and reference revisions, but
+the normal public-runner CI workflow does not claim to rerun them.
+
+## Benchmark Jobs
+
+Performance is not a normal GitHub-hosted-runner gate. Hosted-runner variance,
+unknown CPU placement, absent GPU identity, and cold/warm cache differences make
+those results unsuitable for regression thresholds.
+
+When controlled benchmark jobs are added, they must:
+
+- run on named, stable hardware,
+- use the committed lockfile and pinned toolchain,
+- preserve raw warmup and measured samples,
+- record effective threads/backend/model/artifact hashes,
+- validate output equivalence before comparing speed,
+- report robust summary statistics and the commit's dirty state,
+- keep external-baseline comparisons separate from internal regression gates.
+
+Today the repository documents benchmark commands and local records, but it
+does not claim that a controlled benchmark CI gate exists.

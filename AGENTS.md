@@ -22,8 +22,9 @@ Start from the local repo, not prior chat summaries:
 Task checkboxes can drift. Milestone closure is proven by the validation matrix,
 parity docs, and current test results.
 
-As of 2026-05-07, M3 is closed and M4 has not started in this repo. Verify that
-against the current tree before acting.
+Current milestone and model-family state is canonical in `docs/status.md`.
+Read it and verify its claims against the current tree before acting; do not
+infer release readiness from historical task checkboxes alone.
 
 ## Team Workspace
 
@@ -116,12 +117,13 @@ Use focused tests while developing. Before merge or commit handoff, run the
 broad gate unless the change is docs-only and clearly does not need it:
 
 ```powershell
-cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-pwsh -NoProfile -File ci/check-offline.ps1
+pwsh -NoProfile -File tools/verify.ps1 -Mode Full
 ```
+
+The full entry point uses the committed lockfile and includes default tests,
+all-target/all-feature no-launch compilation, clippy with warnings denied, and
+the offline gate. CI additionally runs the Rust 1.85 MSRV and dependency-audit
+jobs documented in `docs/ci.md`.
 
 Run `cargo audit` when dependency changes or security posture is being checked.
 If it reports an advisory, state whether it is a vulnerability, an allowed
