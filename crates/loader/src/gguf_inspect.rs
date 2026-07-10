@@ -12,19 +12,15 @@ use std::{
     path::Path,
 };
 
-use ocelotl_core::{InvalidModelError, IoError, OcelotlError, Result, UnsupportedError};
+use ocelotl_core::{
+    ArtifactLimits, InvalidModelError, IoError, OcelotlError, Result, UnsupportedError,
+};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const SUPPORTED_GGUF_VERSION: u32 = 3;
 const DEFAULT_ALIGNMENT: u64 = 32;
-const MAX_METADATA_ENTRIES: u64 = 200_000;
-const MAX_TENSORS: u64 = 2_000_000;
-const MAX_METADATA_STRING_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_KEY_BYTES: u64 = 65_535;
-const MAX_TENSOR_NAME_BYTES: u64 = 65_535;
-const MAX_ARRAY_ELEMENTS: u64 = 2_000_000;
-const MAX_ARRAY_DEPTH: usize = 4;
-const MAX_TENSOR_DIMS: u32 = 8;
+const MIN_METADATA_ENTRY_BYTES: u64 = 8 + 4 + 1;
+const MIN_TENSOR_DESCRIPTOR_BYTES: u64 = 8 + 4 + 8 + 4 + 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GgufManifest {
@@ -337,15 +333,24 @@ impl GgmlTensorType {
 /// Inspect a GGUF file and return metadata plus tensor descriptors. Does not
 /// read tensor payload bytes.
 pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
+    inspect_gguf_with_limits(path, ArtifactLimits::default())
+}
+
+/// Inspect a GGUF file under explicit artifact resource ceilings.
+pub fn inspect_gguf_with_limits(path: &Path, limits: ArtifactLimits) -> Result<GgufManifest> {
+    limits.validate()?;
     let file = File::open(path).map_err(|source| io_error(path, source))?;
     let file_len = file
         .metadata()
         .map_err(|source| io_error(path, source))?
         .len();
+    limits.validate_file_bytes(Some(path), file_len)?;
     let mut reader = GgufReader {
         file,
         path,
         file_len,
+        position: 0,
+        limits,
     };
 
     let mut magic = [0u8; 4];
@@ -369,24 +374,14 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
 
     let tensor_count = reader.read_u64()?;
     let metadata_count = reader.read_u64()?;
-    if tensor_count > MAX_TENSORS {
-        return Err(invalid_gguf(
-            path,
-            Some("tensor_count"),
-            format!("GGUF tensor_count {tensor_count} exceeds max {MAX_TENSORS}"),
-        ));
-    }
-    if metadata_count > MAX_METADATA_ENTRIES {
-        return Err(invalid_gguf(
-            path,
-            Some("metadata_kv_count"),
-            format!("GGUF metadata_kv_count {metadata_count} exceeds max {MAX_METADATA_ENTRIES}"),
-        ));
-    }
+    limits.validate_gguf_counts(Some(path), tensor_count, metadata_count)?;
+    validate_declared_counts_fit_remaining(&reader, tensor_count, metadata_count)?;
 
-    let mut metadata = Vec::with_capacity(metadata_count as usize);
+    let metadata_count = count_to_usize(path, "metadata_kv_count", metadata_count)?;
+    let mut metadata = Vec::new();
+    try_reserve_exact(path, "metadata_kv_count", &mut metadata, metadata_count)?;
     for _ in 0..metadata_count {
-        let key = reader.read_string("metadata key", MAX_KEY_BYTES)?;
+        let key = reader.read_string("metadata key", limits.max_key_bytes)?;
         let raw_type = reader.read_u32()?;
         let value_type = GgufMetadataType::from_raw(raw_type, path, &key)?;
         let value = reader.read_metadata_value(value_type, 0)?;
@@ -394,11 +389,13 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
     }
 
     let alignment = alignment_from_metadata(path, &metadata)?;
-    let mut tensors = Vec::with_capacity(tensor_count as usize);
+    let tensor_count = count_to_usize(path, "tensor_count", tensor_count)?;
+    let mut tensors = Vec::new();
+    try_reserve_exact(path, "tensor_count", &mut tensors, tensor_count)?;
     for _ in 0..tensor_count {
-        let name = reader.read_string("tensor name", MAX_TENSOR_NAME_BYTES)?;
+        let name = reader.read_string("tensor name", limits.max_tensor_name_bytes)?;
         let n_dims = reader.read_u32()?;
-        if n_dims == 0 || n_dims > MAX_TENSOR_DIMS {
+        if n_dims == 0 || n_dims > limits.max_tensor_dimensions {
             return Err(invalid_gguf(
                 path,
                 Some(&name),
@@ -406,7 +403,15 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
             ));
         }
 
-        let mut shape = Vec::with_capacity(n_dims as usize);
+        let n_dims = usize::try_from(n_dims).map_err(|_| {
+            invalid_gguf(
+                path,
+                Some(&name),
+                "GGUF tensor dimension count does not fit in usize".to_string(),
+            )
+        })?;
+        let mut shape = Vec::new();
+        try_reserve_exact(path, &name, &mut shape, n_dims)?;
         let mut element_count = 1_u64;
         for _ in 0..n_dims {
             let dim = reader.read_u64()?;
@@ -457,6 +462,16 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
 
     let tensor_info_end = reader.position()?;
     let data_start = align_offset(path, tensor_info_end, alignment)?;
+    if data_start > limits.max_header_bytes {
+        return Err(invalid_gguf(
+            path,
+            Some("header"),
+            format!(
+                "GGUF tensor data section starts at {data_start}, beyond configured header limit {}",
+                limits.max_header_bytes
+            ),
+        ));
+    }
     if data_start > file_len {
         return Err(invalid_gguf(
             path,
@@ -524,15 +539,27 @@ pub fn inspect_gguf(path: &Path) -> Result<GgufManifest> {
 /// descriptors or tensor payload ranges. Use `inspect_gguf` when the model
 /// tensor contract must also be proven.
 pub fn inspect_gguf_tokenizer(path: &Path) -> Result<GgufTokenizerMetadata> {
+    inspect_gguf_tokenizer_with_limits(path, ArtifactLimits::default())
+}
+
+/// Extract embedded tokenizer metadata under explicit artifact ceilings.
+pub fn inspect_gguf_tokenizer_with_limits(
+    path: &Path,
+    limits: ArtifactLimits,
+) -> Result<GgufTokenizerMetadata> {
+    limits.validate()?;
     let file = File::open(path).map_err(|source| io_error(path, source))?;
     let file_len = file
         .metadata()
         .map_err(|source| io_error(path, source))?
         .len();
+    limits.validate_file_bytes(Some(path), file_len)?;
     let mut reader = GgufReader {
         file,
         path,
         file_len,
+        position: 0,
+        limits,
     };
 
     let mut magic = [0u8; 4];
@@ -556,20 +583,9 @@ pub fn inspect_gguf_tokenizer(path: &Path) -> Result<GgufTokenizerMetadata> {
 
     let tensor_count = reader.read_u64()?;
     let metadata_count = reader.read_u64()?;
-    if tensor_count > MAX_TENSORS {
-        return Err(invalid_gguf(
-            path,
-            Some("tensor_count"),
-            format!("GGUF tensor_count {tensor_count} exceeds max {MAX_TENSORS}"),
-        ));
-    }
-    if metadata_count > MAX_METADATA_ENTRIES {
-        return Err(invalid_gguf(
-            path,
-            Some("metadata_kv_count"),
-            format!("GGUF metadata_kv_count {metadata_count} exceeds max {MAX_METADATA_ENTRIES}"),
-        ));
-    }
+    limits.validate_gguf_counts(Some(path), tensor_count, metadata_count)?;
+    validate_declared_metadata_count_fits_remaining(&reader, metadata_count)?;
+    let metadata_count = count_to_usize(path, "metadata_kv_count", metadata_count)?;
 
     let mut metadata = GgufTokenizerMetadata {
         model: None,
@@ -588,7 +604,7 @@ pub fn inspect_gguf_tokenizer(path: &Path) -> Result<GgufTokenizerMetadata> {
     };
 
     for _ in 0..metadata_count {
-        let key = reader.read_string("metadata key", MAX_KEY_BYTES)?;
+        let key = reader.read_string("metadata key", limits.max_key_bytes)?;
         let raw_type = reader.read_u32()?;
         let value_type = GgufMetadataType::from_raw(raw_type, path, &key)?;
 
@@ -677,14 +693,130 @@ pub fn inspect_gguf_tokenizer(path: &Path) -> Result<GgufTokenizerMetadata> {
     Ok(metadata)
 }
 
+fn validate_declared_counts_fit_remaining(
+    reader: &GgufReader<'_>,
+    tensor_count: u64,
+    metadata_count: u64,
+) -> Result<()> {
+    let metadata_bytes = metadata_count
+        .checked_mul(MIN_METADATA_ENTRY_BYTES)
+        .ok_or_else(|| {
+            invalid_gguf(
+                reader.path,
+                Some("header_counts"),
+                "GGUF minimum metadata descriptor bytes overflow u64".to_string(),
+            )
+        })?;
+    let tensor_bytes = tensor_count
+        .checked_mul(MIN_TENSOR_DESCRIPTOR_BYTES)
+        .ok_or_else(|| {
+            invalid_gguf(
+                reader.path,
+                Some("header_counts"),
+                "GGUF minimum tensor descriptor bytes overflow u64".to_string(),
+            )
+        })?;
+    let minimum_bytes = metadata_bytes.checked_add(tensor_bytes).ok_or_else(|| {
+        invalid_gguf(
+            reader.path,
+            Some("header_counts"),
+            "GGUF minimum descriptor bytes overflow u64".to_string(),
+        )
+    })?;
+    let remaining = reader.remaining_bounded_header_bytes();
+    if minimum_bytes > remaining {
+        return Err(invalid_gguf(
+            reader.path,
+            Some("header_counts"),
+            format!(
+                "GGUF declared counts require at least {minimum_bytes} minimum descriptor bytes; remaining bounded header bytes: {remaining}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_declared_metadata_count_fits_remaining(
+    reader: &GgufReader<'_>,
+    metadata_count: u64,
+) -> Result<()> {
+    let minimum_bytes = metadata_count
+        .checked_mul(MIN_METADATA_ENTRY_BYTES)
+        .ok_or_else(|| {
+            invalid_gguf(
+                reader.path,
+                Some("header_counts"),
+                "GGUF minimum metadata descriptor bytes overflow u64".to_string(),
+            )
+        })?;
+    let remaining = reader.remaining_bounded_header_bytes();
+    if minimum_bytes > remaining {
+        return Err(invalid_gguf(
+            reader.path,
+            Some("header_counts"),
+            format!(
+                "GGUF metadata count requires at least {minimum_bytes} minimum entry bytes; remaining bounded header bytes: {remaining}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn count_to_usize(path: &Path, field: &str, count: u64) -> Result<usize> {
+    count.try_into().map_err(|_| {
+        invalid_gguf(
+            path,
+            Some(field),
+            format!("GGUF {field} {count} does not fit in usize"),
+        )
+    })
+}
+
+fn try_reserve_exact<T>(path: &Path, field: &str, values: &mut Vec<T>, count: usize) -> Result<()> {
+    values.try_reserve_exact(count).map_err(|source| {
+        invalid_gguf(
+            path,
+            Some(field),
+            format!("failed to reserve {count} GGUF entries: {source}"),
+        )
+    })
+}
+
 struct GgufReader<'a> {
     file: File,
     path: &'a Path,
     file_len: u64,
+    position: u64,
+    limits: ArtifactLimits,
 }
 
 impl GgufReader<'_> {
     fn read_exact_header_part(&mut self, buf: &mut [u8]) -> Result<()> {
+        let read_len = u64::try_from(buf.len()).map_err(|_| {
+            invalid_gguf(
+                self.path,
+                Some("header"),
+                "GGUF header read length does not fit in u64".to_string(),
+            )
+        })?;
+        let end = self.position.checked_add(read_len).ok_or_else(|| {
+            invalid_gguf(
+                self.path,
+                Some("header"),
+                "GGUF header position overflows u64".to_string(),
+            )
+        })?;
+        if end > self.limits.max_header_bytes {
+            return Err(invalid_gguf(
+                self.path,
+                Some("header"),
+                format!(
+                    "GGUF metadata/tensor-info region exceeds configured header limit {}",
+                    self.limits.max_header_bytes
+                ),
+            ));
+        }
+
         self.file.read_exact(buf).map_err(|source| {
             if source.kind() == ErrorKind::UnexpectedEof {
                 invalid_gguf(
@@ -695,7 +827,9 @@ impl GgufReader<'_> {
             } else {
                 io_error(self.path, source)
             }
-        })
+        })?;
+        self.position = end;
+        Ok(())
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -766,7 +900,7 @@ impl GgufReader<'_> {
 
     fn read_string(&mut self, field: &str, max_len: u64) -> Result<String> {
         let len = self.read_u64()?;
-        if len > max_len || len > MAX_METADATA_STRING_BYTES {
+        if len > max_len || len > self.limits.max_metadata_string_bytes {
             return Err(invalid_gguf(
                 self.path,
                 Some(field),
@@ -780,7 +914,9 @@ impl GgufReader<'_> {
                 format!("GGUF {field} length {len} does not fit in usize"),
             )
         })?;
-        let mut bytes = vec![0u8; len_usize];
+        let mut bytes = Vec::new();
+        try_reserve_exact(self.path, field, &mut bytes, len_usize)?;
+        bytes.resize(len_usize, 0);
         self.read_exact_header_part(&mut bytes)?;
         String::from_utf8(bytes).map_err(|source| {
             invalid_gguf(
@@ -793,7 +929,7 @@ impl GgufReader<'_> {
 
     fn skip_string(&mut self, field: &str, max_len: u64) -> Result<()> {
         let len = self.read_u64()?;
-        if len > max_len || len > MAX_METADATA_STRING_BYTES {
+        if len > max_len || len > self.limits.max_metadata_string_bytes {
             return Err(invalid_gguf(
                 self.path,
                 Some(field),
@@ -818,13 +954,14 @@ impl GgufReader<'_> {
             GgufMetadataType::F32 => GgufMetadataValue::F32(self.read_f32()?),
             GgufMetadataType::Bool => GgufMetadataValue::Bool(self.read_bool()?),
             GgufMetadataType::String => GgufMetadataValue::String(
-                self.read_string("metadata string", MAX_METADATA_STRING_BYTES)?,
+                self.read_string("metadata string", self.limits.max_metadata_string_bytes)?,
             ),
             GgufMetadataType::Array => {
                 let (element_type, len) = self.read_array_header(depth)?;
                 if element_type == GgufMetadataType::Bool {
                     let len_usize = array_len_to_usize(self.path, "metadata bool array", len)?;
-                    let mut values = Vec::with_capacity(len_usize);
+                    let mut values = Vec::new();
+                    try_reserve_exact(self.path, "metadata bool array", &mut values, len_usize)?;
                     for _ in 0..len {
                         values.push(self.read_bool()?);
                     }
@@ -855,7 +992,7 @@ impl GgufReader<'_> {
                 self.skip_bytes(8)
             }
             GgufMetadataType::String => {
-                self.skip_string("metadata string", MAX_METADATA_STRING_BYTES)
+                self.skip_string("metadata string", self.limits.max_metadata_string_bytes)
             }
             GgufMetadataType::Array => {
                 let (element_type, len) = self.read_array_header(depth)?;
@@ -874,9 +1011,10 @@ impl GgufReader<'_> {
     ) -> Result<Vec<String>> {
         let len = self.expect_array_element_type(value_type, key, GgufMetadataType::String)?;
         let len_usize = array_len_to_usize(self.path, key, len)?;
-        let mut values = Vec::with_capacity(len_usize);
+        let mut values = Vec::new();
+        try_reserve_exact(self.path, key, &mut values, len_usize)?;
         for _ in 0..len {
-            values.push(self.read_string(key, MAX_METADATA_STRING_BYTES)?);
+            values.push(self.read_string(key, self.limits.max_metadata_string_bytes)?);
         }
         Ok(values)
     }
@@ -888,7 +1026,8 @@ impl GgufReader<'_> {
     ) -> Result<Vec<f32>> {
         let len = self.expect_array_element_type(value_type, key, GgufMetadataType::F32)?;
         let len_usize = array_len_to_usize(self.path, key, len)?;
-        let mut values = Vec::with_capacity(len_usize);
+        let mut values = Vec::new();
+        try_reserve_exact(self.path, key, &mut values, len_usize)?;
         for _ in 0..len {
             values.push(self.read_f32()?);
         }
@@ -902,7 +1041,8 @@ impl GgufReader<'_> {
     ) -> Result<Vec<i32>> {
         let len = self.expect_array_element_type(value_type, key, GgufMetadataType::I32)?;
         let len_usize = array_len_to_usize(self.path, key, len)?;
-        let mut values = Vec::with_capacity(len_usize);
+        let mut values = Vec::new();
+        try_reserve_exact(self.path, key, &mut values, len_usize)?;
         for _ in 0..len {
             values.push(self.read_i32()?);
         }
@@ -936,35 +1076,50 @@ impl GgufReader<'_> {
     }
 
     fn read_array_header(&mut self, depth: usize) -> Result<(GgufMetadataType, u64)> {
-        if depth >= MAX_ARRAY_DEPTH {
+        if depth >= self.limits.max_array_depth {
             return Err(invalid_gguf(
                 self.path,
                 Some("metadata array"),
-                format!("GGUF metadata array nesting exceeds max depth {MAX_ARRAY_DEPTH}"),
+                format!(
+                    "GGUF metadata array nesting exceeds max depth {}",
+                    self.limits.max_array_depth
+                ),
             ));
         }
         let element_type =
             GgufMetadataType::from_raw(self.read_u32()?, self.path, "metadata array")?;
         let len = self.read_u64()?;
-        if len > MAX_ARRAY_ELEMENTS {
+        if len > self.limits.max_array_elements {
             return Err(invalid_gguf(
                 self.path,
                 Some("metadata array"),
-                format!("GGUF metadata array length {len} exceeds max {MAX_ARRAY_ELEMENTS}"),
+                format!(
+                    "GGUF metadata array length {len} exceeds max {}",
+                    self.limits.max_array_elements
+                ),
             ));
         }
         Ok((element_type, len))
     }
 
     fn skip_bytes(&mut self, len: u64) -> Result<()> {
-        let pos = self.position()?;
-        let end = pos.checked_add(len).ok_or_else(|| {
+        let end = self.position.checked_add(len).ok_or_else(|| {
             invalid_gguf(
                 self.path,
                 Some("header"),
                 format!("GGUF skip length {len} overflows file offset"),
             )
         })?;
+        if end > self.limits.max_header_bytes {
+            return Err(invalid_gguf(
+                self.path,
+                Some("header"),
+                format!(
+                    "GGUF metadata/tensor-info region exceeds configured header limit {}",
+                    self.limits.max_header_bytes
+                ),
+            ));
+        }
         if end > self.file_len {
             return Err(invalid_gguf(
                 self.path,
@@ -978,13 +1133,18 @@ impl GgufReader<'_> {
         self.file
             .seek(SeekFrom::Start(end))
             .map_err(|source| io_error(self.path, source))?;
+        self.position = end;
         Ok(())
     }
 
     fn position(&mut self) -> Result<u64> {
-        self.file
-            .stream_position()
-            .map_err(|source| io_error(self.path, source))
+        Ok(self.position)
+    }
+
+    fn remaining_bounded_header_bytes(&self) -> u64 {
+        self.file_len
+            .min(self.limits.max_header_bytes)
+            .saturating_sub(self.position)
     }
 }
 
@@ -1521,6 +1681,54 @@ mod tests {
     }
 
     #[test]
+    fn inspect_gguf_rejects_descriptor_counts_that_cannot_fit_remaining_header() {
+        let path = tmp_path("impossible_descriptor_counts");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        write_u32(&mut bytes, SUPPORTED_GGUF_VERSION);
+        write_u64(&mut bytes, 100);
+        write_u64(&mut bytes, 0);
+        std::fs::write(&path, bytes).expect("write impossible-count fixture");
+
+        let err = inspect_gguf_with_limits(&path, ocelotl_core::ArtifactLimits::default())
+            .expect_err("descriptor counts must fit remaining header bytes before reserve");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("header_counts"));
+                assert!(invalid.message.contains("minimum"));
+                assert!(invalid.message.contains("remaining"));
+            }
+            other => panic!("expected InvalidModel, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inspect_gguf_with_limits_honors_lower_deployment_count_policy() {
+        let path = tmp_path("deployment_count_limit");
+        write_minimal_fixture(&path, 0, 16);
+        let limits = ocelotl_core::ArtifactLimits {
+            max_metadata_entries: 3,
+            ..ocelotl_core::ArtifactLimits::default()
+        };
+
+        let err = inspect_gguf_with_limits(&path, limits)
+            .expect_err("custom metadata count ceiling must be enforced");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.field.as_deref(), Some("metadata_kv_count"));
+                assert!(invalid.message.contains("configured limit 3"));
+            }
+            other => panic!("expected InvalidModel, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn inspect_gguf_rejects_unsupported_version_with_typed_unsupported() {
         let path = tmp_path("unsupported_version");
         let mut bytes = Vec::new();
@@ -1578,7 +1786,10 @@ mod tests {
         write_u64(&mut bytes, 1);
         write_string(&mut bytes, "general.name");
         write_u32(&mut bytes, 8);
-        write_u64(&mut bytes, MAX_METADATA_STRING_BYTES + 1);
+        write_u64(
+            &mut bytes,
+            ArtifactLimits::default().max_metadata_string_bytes + 1,
+        );
         std::fs::write(&path, bytes).expect("write oversized-string fixture");
 
         let err = inspect_gguf(&path).expect_err("oversized metadata string must fail");
