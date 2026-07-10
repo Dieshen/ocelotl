@@ -44,6 +44,8 @@ pub use cubecl_backend::{
 };
 #[cfg(feature = "cubecl")]
 pub use cubecl_backend::{CubeClKernelBackend, linear_out_by_in_cubecl, rope_apply_inplace_cubecl};
+pub mod k_quant;
+pub use k_quant::{GgmlKQuantKind, GgmlKQuantMatrixRef, linear_q8_k_k_quant};
 pub mod mlp;
 pub mod rmsnorm;
 pub mod tensor;
@@ -114,6 +116,16 @@ pub trait KernelBackend: Debug + Send + Sync {
         bias: Option<&[f32]>,
         out: &mut [f32],
     ) -> Result<()>;
+
+    fn linear_q8_k_k_quant(
+        &self,
+        x: &[f32],
+        rows: usize,
+        matrix: GgmlKQuantMatrixRef<'_>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        k_quant::linear_q8_k_k_quant(x, rows, matrix, out)
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn scaled_dot_product_attention(

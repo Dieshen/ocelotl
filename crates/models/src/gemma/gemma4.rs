@@ -8,11 +8,11 @@
 use ocelotl_core::{
     InvalidModelError, InvalidRequestError, OcelotlError, Result, TokenId, UnsupportedError,
 };
-use ocelotl_kernels::{KernelBackend, default_kernel_backend};
+use ocelotl_kernels::{GgmlKQuantKind, GgmlKQuantMatrixRef, KernelBackend, default_kernel_backend};
 use ocelotl_loader::{
     GgmlTensorType, GgufManifest, GgufMetadataType, GgufMetadataValue, GgufTensorEntry,
-    LoadedTensor, SupportedDtype, inspect_gguf, load_gguf_tensors_dequantized_f32,
-    load_gguf_tensors_f32,
+    LoadedGgufKQuantTensorBytes, LoadedTensor, SupportedDtype, inspect_gguf,
+    load_gguf_k_quant_tensors_bytes, load_gguf_tensors_dequantized_f32, load_gguf_tensors_f32,
 };
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -23,6 +23,9 @@ use std::{
 const GEMMA4_ARCHITECTURE: &str = "gemma4";
 const GEMMA4_TEXT_ATTENTION_SCALE: f32 = 1.0;
 const GGUF_FILE_TYPE_Q4_K_M: u32 = 15;
+const GGML_K_QUANT_BLOCK_ELEMENTS: usize = 256;
+const GGML_Q5_K_BLOCK_BYTES: usize = 176;
+const GGML_Q6_K_BLOCK_BYTES: usize = 210;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gemma4Quantization {
@@ -364,6 +367,103 @@ pub fn load_gemma4_dequantized_tensors_from_gguf(
     Ok((config, tensors))
 }
 
+pub fn load_gemma4_native_attn_q_projections_from_gguf(
+    path: impl AsRef<Path>,
+    config: &Gemma4Config,
+) -> Result<Vec<Option<Gemma4NativeProjection>>> {
+    let path = path.as_ref();
+    validate_gemma4_text_weight_config(config)?;
+    let names: Vec<String> = (0..config.block_count)
+        .map(|layer| format!("blk.{layer}.attn_q.weight"))
+        .collect();
+    load_gguf_k_quant_tensors_bytes(path, &names)?
+        .into_iter()
+        .enumerate()
+        .map(|(layer, tensor)| {
+            let attention = gemma4_layer_attention_dims(config, layer, Some(path))?;
+            native_attention_projection_from_raw(
+                path,
+                layer,
+                "attn_q.weight",
+                config.embedding_length,
+                attention.q_width,
+                tensor,
+            )
+        })
+        .collect()
+}
+
+pub fn load_gemma4_native_attention_projections_from_gguf(
+    path: impl AsRef<Path>,
+    config: &Gemma4Config,
+) -> Result<Gemma4NativeAttentionProjections> {
+    let path = path.as_ref();
+    validate_gemma4_text_weight_config(config)?;
+    let mut names = Vec::with_capacity(config.block_count * 4);
+    for layer in 0..config.block_count {
+        names.push(format!("blk.{layer}.attn_q.weight"));
+        names.push(format!("blk.{layer}.attn_k.weight"));
+        names.push(format!("blk.{layer}.attn_v.weight"));
+        names.push(format!("blk.{layer}.attn_output.weight"));
+    }
+    let mut raw_tensors = load_gguf_k_quant_tensors_bytes(path, &names)?.into_iter();
+    let mut attn_q = Vec::with_capacity(config.block_count);
+    let mut attn_k = Vec::with_capacity(config.block_count);
+    let mut attn_v = Vec::with_capacity(config.block_count);
+    let mut attn_o = Vec::with_capacity(config.block_count);
+    for layer in 0..config.block_count {
+        let attention = gemma4_layer_attention_dims(config, layer, Some(path))?;
+        attn_q.push(native_attention_projection_from_raw(
+            path,
+            layer,
+            "attn_q.weight",
+            config.embedding_length,
+            attention.q_width,
+            raw_tensors
+                .next()
+                .expect("raw attn_q tensor count must match requested names"),
+        )?);
+        attn_k.push(native_attention_projection_from_raw(
+            path,
+            layer,
+            "attn_k.weight",
+            config.embedding_length,
+            attention.k_width,
+            raw_tensors
+                .next()
+                .expect("raw attn_k tensor count must match requested names"),
+        )?);
+        attn_v.push(native_attention_projection_from_raw(
+            path,
+            layer,
+            "attn_v.weight",
+            config.embedding_length,
+            attention.v_width,
+            raw_tensors
+                .next()
+                .expect("raw attn_v tensor count must match requested names"),
+        )?);
+        attn_o.push(native_attention_projection_from_raw(
+            path,
+            layer,
+            "attn_output.weight",
+            attention.q_width,
+            config.embedding_length,
+            raw_tensors
+                .next()
+                .expect("raw attn_output tensor count must match requested names"),
+        )?);
+    }
+    let native_attention = Gemma4NativeAttentionProjections {
+        attn_q,
+        attn_k,
+        attn_v,
+        attn_o,
+    };
+    validate_gemma4_native_attention(config, &native_attention)?;
+    Ok(native_attention)
+}
+
 /// Validate the selected Gemma4 GGUF header's required tensor inventory without
 /// claiming those tensors can execute yet.
 pub fn validate_gemma4_tensor_inventory(
@@ -530,6 +630,62 @@ pub struct Gemma4TextWeights {
     /// `token_embd.weight`; no separate Gemma4 output projection is claimed.
     pub lm_head_w: Vec<f32>,
     pub tie_word_embeddings: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gemma4NativeProjectionKind {
+    Q5K,
+    Q6K,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4NativeProjection {
+    pub kind: Gemma4NativeProjectionKind,
+    /// GGUF logical input width.
+    pub input_features: usize,
+    /// GGUF logical output width.
+    pub output_features: usize,
+    /// Raw GGUF K-quant bytes in output-row order.
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4NativeAttentionProjections {
+    pub attn_q: Vec<Option<Gemma4NativeProjection>>,
+    pub attn_k: Vec<Option<Gemma4NativeProjection>>,
+    pub attn_v: Vec<Option<Gemma4NativeProjection>>,
+    pub attn_o: Vec<Option<Gemma4NativeProjection>>,
+}
+
+impl Gemma4NativeAttentionProjections {
+    fn none(block_count: usize) -> Self {
+        Self {
+            attn_q: vec![None; block_count],
+            attn_k: vec![None; block_count],
+            attn_v: vec![None; block_count],
+            attn_o: vec![None; block_count],
+        }
+    }
+}
+
+impl Gemma4NativeProjection {
+    fn kernel_matrix(&self) -> GgmlKQuantMatrixRef<'_> {
+        GgmlKQuantMatrixRef {
+            input_features: self.input_features,
+            output_features: self.output_features,
+            kind: match self.kind {
+                Gemma4NativeProjectionKind::Q5K => GgmlKQuantKind::Q5K,
+                Gemma4NativeProjectionKind::Q6K => GgmlKQuantKind::Q6K,
+            },
+            data: &self.data,
+        }
+    }
+}
+
+struct Gemma4AttentionProjection<'a> {
+    native: Option<&'a Gemma4NativeProjection>,
+    output_width: usize,
+    dense_w: &'a [f32],
 }
 
 impl Gemma4TextWeights {
@@ -784,6 +940,7 @@ pub struct Gemma4TextModel {
     config: Gemma4Config,
     weights: Gemma4TextWeights,
     kernels: Arc<dyn KernelBackend>,
+    native_attention: Gemma4NativeAttentionProjections,
 }
 
 #[doc(hidden)]
@@ -806,12 +963,35 @@ impl Gemma4TextModel {
         weights: Gemma4TextWeights,
         kernels: Arc<dyn KernelBackend>,
     ) -> Result<Self> {
+        let native_attention = Gemma4NativeAttentionProjections::none(config.block_count);
+        Self::with_kernel_backend_and_native_attention(config, weights, kernels, native_attention)
+    }
+
+    pub fn with_kernel_backend_and_native_attn_q(
+        config: Gemma4Config,
+        weights: Gemma4TextWeights,
+        kernels: Arc<dyn KernelBackend>,
+        native_attn_q: Vec<Option<Gemma4NativeProjection>>,
+    ) -> Result<Self> {
+        let mut native_attention = Gemma4NativeAttentionProjections::none(config.block_count);
+        native_attention.attn_q = native_attn_q;
+        Self::with_kernel_backend_and_native_attention(config, weights, kernels, native_attention)
+    }
+
+    pub fn with_kernel_backend_and_native_attention(
+        config: Gemma4Config,
+        weights: Gemma4TextWeights,
+        kernels: Arc<dyn KernelBackend>,
+        native_attention: Gemma4NativeAttentionProjections,
+    ) -> Result<Self> {
         validate_gemma4_text_config_for_model(&config)?;
         validate_gemma4_text_weight_lengths(&config, &weights)?;
+        validate_gemma4_native_attention(&config, &native_attention)?;
         Ok(Self {
             config,
             weights,
             kernels,
+            native_attention,
         })
     }
 
@@ -881,6 +1061,28 @@ impl Gemma4TextModel {
         }
 
         Ok(token_inputs)
+    }
+
+    fn project_attention(
+        &self,
+        projection: Gemma4AttentionProjection<'_>,
+        x: &[f32],
+        seq: usize,
+        input_width: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        if let Some(native) = projection.native {
+            self.kernels
+                .linear_q8_k_k_quant(x, seq, native.kernel_matrix(), out)
+        } else {
+            self.kernels.matmul(
+                x,
+                (seq, input_width),
+                projection.dense_w,
+                (input_width, projection.output_width),
+                out,
+            )
+        }
     }
 
     pub fn prefill(&self, tokens: &[TokenId]) -> Result<Vec<f32>> {
@@ -999,8 +1201,21 @@ impl Gemma4TextModel {
             if layer_idx == 0 {
                 trace_named_tensor(&mut named_tensors, "attn_norm-0", &norm_buf);
             }
-            self.kernels
-                .matmul(&norm_buf, (seq, h), &layer.attn_q_w, (h, q_out), &mut q_buf)?;
+            self.project_attention(
+                Gemma4AttentionProjection {
+                    native: self
+                        .native_attention
+                        .attn_q
+                        .get(layer_idx)
+                        .and_then(Option::as_ref),
+                    output_width: q_out,
+                    dense_w: &layer.attn_q_w,
+                },
+                &norm_buf,
+                seq,
+                h,
+                &mut q_buf,
+            )?;
             if layer_idx == 0 {
                 trace_named_tensor(&mut named_tensors, "Qcur-0", &q_buf);
             }
@@ -1072,21 +1287,37 @@ impl Gemma4TextModel {
                 let mut k_norm_buf = vec![0.0_f32; seq * k_out];
                 let mut v_buf = vec![0.0_f32; seq * v_out];
                 let mut v_norm_buf = vec![0.0_f32; seq * v_out];
-                self.kernels.matmul(
+                self.project_attention(
+                    Gemma4AttentionProjection {
+                        native: self
+                            .native_attention
+                            .attn_k
+                            .get(layer_idx)
+                            .and_then(Option::as_ref),
+                        output_width: k_out,
+                        dense_w: &layer.attn_k_w,
+                    },
                     &norm_buf,
-                    (seq, h),
-                    &layer.attn_k_w,
-                    (h, k_out),
+                    seq,
+                    h,
                     &mut k_buf,
                 )?;
                 if layer_idx == 0 {
                     trace_named_tensor(&mut named_tensors, "Kcur-0", &k_buf);
                 }
-                self.kernels.matmul(
+                self.project_attention(
+                    Gemma4AttentionProjection {
+                        native: self
+                            .native_attention
+                            .attn_v
+                            .get(layer_idx)
+                            .and_then(Option::as_ref),
+                        output_width: v_out,
+                        dense_w: &layer.attn_v_w,
+                    },
                     &norm_buf,
-                    (seq, h),
-                    &layer.attn_v_w,
-                    (h, v_out),
+                    seq,
+                    h,
                     &mut v_buf,
                 )?;
                 if layer_idx == 0 {
@@ -1181,14 +1412,28 @@ impl Gemma4TextModel {
             if shared_kv_source_layer.is_none() {
                 layer_kv_activations[layer_idx] = produced_kv;
             }
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "kqv_out-0", &attn_out);
+            }
 
-            self.kernels.matmul(
+            self.project_attention(
+                Gemma4AttentionProjection {
+                    native: self
+                        .native_attention
+                        .attn_o
+                        .get(layer_idx)
+                        .and_then(Option::as_ref),
+                    output_width: h,
+                    dense_w: &layer.attn_o_w,
+                },
                 &attn_out,
-                (seq, q_out),
-                &layer.attn_o_w,
-                (q_out, h),
+                seq,
+                q_out,
                 &mut o_buf,
             )?;
+            if layer_idx == 0 {
+                trace_named_tensor(&mut named_tensors, "attn_output_proj-0", &o_buf);
+            }
             self.kernels.rmsnorm(
                 &o_buf,
                 seq,
@@ -1614,6 +1859,198 @@ fn validate_gemma4_text_weight_lengths(
         }
     }
 
+    Ok(())
+}
+
+fn validate_gemma4_native_attention(
+    config: &Gemma4Config,
+    native_attention: &Gemma4NativeAttentionProjections,
+) -> Result<()> {
+    validate_native_projection_vec_len("native_attn_q", config, &native_attention.attn_q)?;
+    validate_native_projection_vec_len("native_attn_k", config, &native_attention.attn_k)?;
+    validate_native_projection_vec_len("native_attn_v", config, &native_attention.attn_v)?;
+    validate_native_projection_vec_len("native_attn_o", config, &native_attention.attn_o)?;
+    for layer in 0..config.block_count {
+        let attention = gemma4_layer_attention_dims(config, layer, None)?;
+        if let Some(projection) = &native_attention.attn_q[layer] {
+            validate_native_attention_projection(
+                None,
+                layer,
+                "attn_q.weight",
+                projection,
+                config.embedding_length,
+                attention.q_width,
+            )?;
+        }
+        if let Some(projection) = &native_attention.attn_k[layer] {
+            validate_native_attention_projection(
+                None,
+                layer,
+                "attn_k.weight",
+                projection,
+                config.embedding_length,
+                attention.k_width,
+            )?;
+        }
+        if let Some(projection) = &native_attention.attn_v[layer] {
+            validate_native_attention_projection(
+                None,
+                layer,
+                "attn_v.weight",
+                projection,
+                config.embedding_length,
+                attention.v_width,
+            )?;
+        }
+        if let Some(projection) = &native_attention.attn_o[layer] {
+            validate_native_attention_projection(
+                None,
+                layer,
+                "attn_output.weight",
+                projection,
+                attention.q_width,
+                config.embedding_length,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_projection_vec_len(
+    field: &str,
+    config: &Gemma4Config,
+    projections: &[Option<Gemma4NativeProjection>],
+) -> Result<()> {
+    if projections.len() != config.block_count {
+        return Err(invalid(
+            field,
+            &format!(
+                "expected {} native projection entries, got {}",
+                config.block_count,
+                projections.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn native_attention_projection_from_raw(
+    path: &Path,
+    layer: usize,
+    suffix: &str,
+    input_features: usize,
+    output_features: usize,
+    tensor: LoadedGgufKQuantTensorBytes,
+) -> Result<Option<Gemma4NativeProjection>> {
+    let field = format!("blk.{layer}.{suffix}");
+    if tensor.name != field {
+        return Err(invalid_at(
+            Some(path),
+            &field,
+            &format!("expected raw tensor `{field}`, got `{}`", tensor.name),
+        ));
+    }
+    if tensor.shape != [input_features, output_features] {
+        return Err(invalid_at(
+            Some(path),
+            &field,
+            &format!(
+                "expected shape [{}, {}], got {:?}",
+                input_features, output_features, tensor.shape
+            ),
+        ));
+    }
+
+    let projection = match tensor.tensor_type {
+        GgmlTensorType::Q5K | GgmlTensorType::Q6K => Some(Gemma4NativeProjection {
+            kind: match tensor.tensor_type {
+                GgmlTensorType::Q5K => Gemma4NativeProjectionKind::Q5K,
+                GgmlTensorType::Q6K => Gemma4NativeProjectionKind::Q6K,
+                _ => unreachable!("only Q5_K and Q6_K are matched here"),
+            },
+            input_features,
+            output_features,
+            data: tensor.data,
+        }),
+        GgmlTensorType::Q4K => None,
+        other => {
+            return Err(OcelotlError::from(UnsupportedError {
+                feature: "gemma4.native_attention_tensor_type".to_string(),
+                requested: Some(format!("{other:?} (tensor `{field}`)")),
+                supported: vec!["Q4K".to_string(), "Q5K".to_string(), "Q6K".to_string()],
+            }));
+        }
+    };
+
+    if let Some(projection) = &projection {
+        validate_native_attention_projection(
+            Some(path),
+            layer,
+            suffix,
+            projection,
+            input_features,
+            output_features,
+        )?;
+    }
+    Ok(projection)
+}
+
+fn validate_native_attention_projection(
+    path: Option<&Path>,
+    layer: usize,
+    suffix: &str,
+    projection: &Gemma4NativeProjection,
+    expected_input: usize,
+    expected_output: usize,
+) -> Result<()> {
+    let field = format!("blk.{layer}.{suffix}");
+    if projection.input_features != expected_input || projection.output_features != expected_output
+    {
+        return Err(invalid_at(
+            path,
+            &field,
+            &format!(
+                "expected native projection shape [{expected_input}, {expected_output}], got [{}, {}]",
+                projection.input_features, projection.output_features
+            ),
+        ));
+    }
+    if projection.input_features % GGML_K_QUANT_BLOCK_ELEMENTS != 0 {
+        return Err(invalid_at(
+            path,
+            &field,
+            &format!(
+                "input_features {} is not divisible by K-quant block size {GGML_K_QUANT_BLOCK_ELEMENTS}",
+                projection.input_features
+            ),
+        ));
+    }
+    let block_bytes = match projection.kind {
+        Gemma4NativeProjectionKind::Q5K => GGML_Q5_K_BLOCK_BYTES,
+        Gemma4NativeProjectionKind::Q6K => GGML_Q6_K_BLOCK_BYTES,
+    };
+    let blocks_per_output = projection.input_features / GGML_K_QUANT_BLOCK_ELEMENTS;
+    let expected_len = projection
+        .output_features
+        .checked_mul(blocks_per_output)
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or_else(|| {
+            invalid_at(
+                path,
+                &field,
+                "native projection byte length overflows usize",
+            )
+        })?;
+    if projection.data.len() != expected_len {
+        return Err(invalid_at(
+            path,
+            &field,
+            &format!(
+                "expected {expected_len} raw native projection bytes, got {}",
+                projection.data.len()
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -3289,26 +3726,105 @@ mod tests {
         len.next_multiple_of(32)
     }
 
-    fn dense_payload(spec: &Gemma4TensorSpec) -> Vec<u8> {
+    fn k_quant_block_bytes(raw_type: u32) -> usize {
+        match raw_type {
+            12 => 144,
+            13 => 176,
+            14 => 210,
+            other => panic!("unsupported K-quant fixture raw type {other}"),
+        }
+    }
+
+    fn q6_single_weight_block() -> Vec<u8> {
+        let mut block = vec![0_u8; 210];
+        block[0] = 0x01;
+        block[128] = 0x02;
+        block[192] = 1;
+        block[208..210].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block
+    }
+
+    fn q5_single_weight_block() -> Vec<u8> {
+        let mut block = vec![0_u8; 176];
+        block[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[4] = 1;
+        block[48] = 0x01;
+        block
+    }
+
+    fn dense_payload_with_raw_type(spec: &Gemma4TensorSpec, raw_type: u32) -> Vec<u8> {
         let len = checked_shape_len(&spec.name, &spec.shape, None).unwrap();
         match spec.kind {
             Gemma4TensorKind::F32 => (0..len).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
             Gemma4TensorKind::BF16 => (0..len).flat_map(|_| 0x3f80u16.to_le_bytes()).collect(),
             Gemma4TensorKind::KQuantized => {
+                if raw_type == 0 {
+                    return vec![0; len * std::mem::size_of::<f32>()];
+                }
                 assert_eq!(
                     len % 256,
                     0,
-                    "tiny Gemma4 GGUF fixture K-quant tensor `{}` must use whole Q4_K blocks",
+                    "tiny Gemma4 GGUF fixture K-quant tensor `{}` must use whole K-quant blocks",
                     spec.name
                 );
-                vec![0; (len / 256) * 144]
+                vec![0; (len / 256) * k_quant_block_bytes(raw_type)]
             }
         }
     }
 
     fn write_tiny_gemma4_gguf(path: &Path, config: &Gemma4Config) {
+        write_tiny_gemma4_gguf_with_attention_raw_type(path, config, 12)
+    }
+
+    fn write_tiny_gemma4_gguf_with_attention_raw_type(
+        path: &Path,
+        config: &Gemma4Config,
+        attention_raw_type: u32,
+    ) {
+        write_tiny_gemma4_gguf_with_attention_raw_types(
+            path,
+            config,
+            attention_raw_type,
+            attention_raw_type,
+            attention_raw_type,
+            attention_raw_type,
+        )
+    }
+
+    fn write_tiny_gemma4_gguf_with_attention_raw_types(
+        path: &Path,
+        config: &Gemma4Config,
+        attn_q_raw_type: u32,
+        attn_k_raw_type: u32,
+        attn_v_raw_type: u32,
+        attn_o_raw_type: u32,
+    ) {
         let specs = required_gemma4_tensor_specs(config);
-        let payloads: Vec<Vec<u8>> = specs.iter().map(dense_payload).collect();
+        let raw_types: Vec<u32> = specs
+            .iter()
+            .map(|spec| match spec.kind {
+                Gemma4TensorKind::F32 => 0,
+                Gemma4TensorKind::BF16 => 30,
+                Gemma4TensorKind::KQuantized if spec.name.ends_with(".attn_q.weight") => {
+                    attn_q_raw_type
+                }
+                Gemma4TensorKind::KQuantized if spec.name.ends_with(".attn_k.weight") => {
+                    attn_k_raw_type
+                }
+                Gemma4TensorKind::KQuantized if spec.name.ends_with(".attn_v.weight") => {
+                    attn_v_raw_type
+                }
+                Gemma4TensorKind::KQuantized if spec.name.ends_with(".attn_output.weight") => {
+                    attn_o_raw_type
+                }
+                Gemma4TensorKind::KQuantized => 12,
+            })
+            .collect();
+        let payloads: Vec<Vec<u8>> = specs
+            .iter()
+            .zip(raw_types.iter())
+            .map(|(spec, raw_type)| dense_payload_with_raw_type(spec, *raw_type))
+            .collect();
         let mut offsets = Vec::with_capacity(payloads.len());
         let mut next_offset = 0usize;
         for payload in &payloads {
@@ -3424,20 +3940,13 @@ mod tests {
             config.tokenizer_token_count,
         );
 
-        for (spec, offset) in specs.iter().zip(offsets.iter()) {
+        for ((spec, offset), raw_type) in specs.iter().zip(offsets.iter()).zip(raw_types.iter()) {
             write_string(&mut bytes, &spec.name);
             write_u32(&mut bytes, spec.shape.len() as u32);
             for dim in &spec.shape {
                 write_u64(&mut bytes, *dim as u64);
             }
-            write_u32(
-                &mut bytes,
-                match spec.kind {
-                    Gemma4TensorKind::F32 => 0,
-                    Gemma4TensorKind::BF16 => 30,
-                    Gemma4TensorKind::KQuantized => 12,
-                },
-            );
+            write_u32(&mut bytes, *raw_type);
             write_u64(&mut bytes, *offset as u64);
         }
 
@@ -4090,6 +4599,165 @@ mod tests {
 
         assert_eq!(logits.len(), loaded_cfg.tokenizer_token_count);
         assert!(logits.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn load_gemma4_native_attention_projections_from_gguf_attaches_q5_q6_sidecars() {
+        let cfg = row_valid_tiny_real_shaped_gguf_config();
+        let path = tmp_path("native_q5_q6_attention");
+        write_tiny_gemma4_gguf_with_attention_raw_types(&path, &cfg, 14, 13, 14, 13);
+
+        let (loaded_cfg, _tensors) = load_gemma4_dequantized_tensors_from_gguf(&path)
+            .expect("tiny Q5/Q6-attention Gemma4 GGUF tensors must load");
+        let native = load_gemma4_native_attention_projections_from_gguf(&path, &loaded_cfg)
+            .expect("native attention sidecars must load");
+
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(native.attn_q.len(), loaded_cfg.block_count);
+        assert_eq!(native.attn_k.len(), loaded_cfg.block_count);
+        assert_eq!(native.attn_v.len(), loaded_cfg.block_count);
+        let projection = native.attn_q[0]
+            .as_ref()
+            .expect("Q6_K attn_q tensor must attach a native sidecar");
+        assert_eq!(projection.kind, Gemma4NativeProjectionKind::Q6K);
+        assert_eq!(projection.input_features, loaded_cfg.embedding_length);
+        assert_eq!(
+            projection.output_features,
+            loaded_cfg.attention_head_count * loaded_cfg.attention_key_length_swa
+        );
+        assert_eq!(
+            projection.data.len(),
+            projection.output_features * (projection.input_features / 256) * 210
+        );
+        let projection = native.attn_k[0]
+            .as_ref()
+            .expect("Q5_K attn_k tensor must attach a native sidecar");
+        assert_eq!(projection.kind, Gemma4NativeProjectionKind::Q5K);
+        assert_eq!(
+            projection.data.len(),
+            projection.output_features * (projection.input_features / 256) * 176
+        );
+        assert!(
+            native.attn_v[0].is_some(),
+            "Q6_K attn_v tensor must attach a native sidecar"
+        );
+        let projection = native.attn_o[0]
+            .as_ref()
+            .expect("Q5_K attn_output tensor must attach a native sidecar");
+        assert_eq!(projection.kind, Gemma4NativeProjectionKind::Q5K);
+        assert_eq!(
+            projection.data.len(),
+            projection.output_features * (projection.input_features / 256) * 176
+        );
+    }
+
+    #[test]
+    fn load_gemma4_native_attn_q_projections_reads_only_q_tensors() {
+        let cfg = row_valid_tiny_real_shaped_gguf_config();
+        let path = tmp_path("native_q_only");
+        write_tiny_gemma4_gguf_with_attention_raw_types(&path, &cfg, 14, 0, 0, 0);
+
+        let native_q = load_gemma4_native_attn_q_projections_from_gguf(&path, &cfg)
+            .expect("Q-only native loader must not require K/V/O K-quant payloads");
+
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(native_q.len(), cfg.block_count);
+        assert!(
+            native_q
+                .iter()
+                .all(|projection| projection.as_ref().is_some_and(|p| {
+                    p.kind == Gemma4NativeProjectionKind::Q6K
+                        && p.input_features == cfg.embedding_length
+                })),
+            "every Q6_K attention-Q tensor must attach without loading dense K/V/O tensors"
+        );
+    }
+
+    #[test]
+    fn gemma4_text_prefill_uses_native_attention_projections_when_present() {
+        let mut cfg = row_valid_tiny_gguf_config();
+        cfg.multimodal = false;
+        cfg.attention_shared_kv_layers = None;
+        let tensors = complete_dequantized_loaded_tensors(&cfg);
+        let mut weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("row-valid Gemma4 text tensors must map into weights");
+        weights.layers[0].attn_q_w.fill(f32::NAN);
+        weights.layers[0].attn_k_w.fill(f32::NAN);
+        weights.layers[0].attn_v_w.fill(f32::NAN);
+        weights.layers[0].attn_o_w.fill(f32::NAN);
+
+        let attention = gemma4_layer_attention_dims(&cfg, 0, None)
+            .expect("row-valid attention dims must compute");
+        let raw_q6_projection = |output_features: usize| {
+            let mut raw_q6 = Vec::with_capacity(output_features * 210);
+            let block = q6_single_weight_block();
+            for _ in 0..output_features {
+                raw_q6.extend_from_slice(&block);
+            }
+            raw_q6
+        };
+        let raw_q5_projection = |output_features: usize| {
+            let mut raw_q5 = Vec::with_capacity(output_features * 176);
+            let block = q5_single_weight_block();
+            for _ in 0..output_features {
+                raw_q5.extend_from_slice(&block);
+            }
+            raw_q5
+        };
+        let mut native_attention = Gemma4NativeAttentionProjections {
+            attn_q: vec![None; cfg.block_count],
+            attn_k: vec![None; cfg.block_count],
+            attn_v: vec![None; cfg.block_count],
+            attn_o: vec![None; cfg.block_count],
+        };
+        native_attention.attn_q[0] = Some(Gemma4NativeProjection {
+            kind: Gemma4NativeProjectionKind::Q6K,
+            input_features: cfg.embedding_length,
+            output_features: attention.q_width,
+            data: raw_q6_projection(attention.q_width),
+        });
+        native_attention.attn_k[0] = Some(Gemma4NativeProjection {
+            kind: Gemma4NativeProjectionKind::Q5K,
+            input_features: cfg.embedding_length,
+            output_features: attention.k_width,
+            data: raw_q5_projection(attention.k_width),
+        });
+        native_attention.attn_v[0] = Some(Gemma4NativeProjection {
+            kind: Gemma4NativeProjectionKind::Q6K,
+            input_features: cfg.embedding_length,
+            output_features: attention.v_width,
+            data: raw_q6_projection(attention.v_width),
+        });
+        native_attention.attn_o[0] = Some(Gemma4NativeProjection {
+            kind: Gemma4NativeProjectionKind::Q5K,
+            input_features: attention.q_width,
+            output_features: cfg.embedding_length,
+            data: raw_q5_projection(cfg.embedding_length),
+        });
+
+        let model = Gemma4TextModel::with_kernel_backend_and_native_attention(
+            cfg,
+            weights,
+            default_kernel_backend(),
+            native_attention,
+        )
+        .expect("Gemma4 text model with native Q6 attention sidecars must construct");
+        let trace = model
+            .prefill_with_trace(&[TokenId(1), TokenId(2)])
+            .expect("native-attn_q Gemma4 text prefill must execute");
+
+        for name in ["Qcur-0", "Kcur-0", "Vcur-0", "attn_post_norm-0"] {
+            let tensor = trace
+                .named_tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("trace must include {name}"));
+            assert!(
+                tensor.iter().all(|value| value.is_finite()),
+                "native K-quant {name} projection must bypass poisoned dense attention matrices"
+            );
+        }
     }
 
     #[test]

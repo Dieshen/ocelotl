@@ -335,10 +335,12 @@ llama-debug --model <model.gguf> --prompt "Hello" --no-escape --save-logits --lo
 `llamacpp-<model-stem>.txt` in the temporary output directory. Ocelotl parses
 that file, tokenizes `Hello` with the GGUF configured-BOS path, loads the GGUF
 through `load_gemma4_dequantized_tensors_from_gguf`, clears
-`Gemma4Config.multimodal` only for this text-only harness, runs
-`Gemma4TextModel` through `ocelotl_runtime::gemma::prefill`, and compares every
-final-position logit within the fixture tolerance. This is an eager-dequant F32
-text-decoder parity proof, not an audio/image/video multimodal proof.
+`Gemma4Config.multimodal` only for this text-only harness, attaches validated
+Q5_K/Q6_K native Q/K/V/O attention sidecars, runs `Gemma4TextModel` through
+`ocelotl_runtime::gemma::prefill`, and compares every final-position logit
+within the fixture tolerance. This is a mixed native-attention and
+eager-dequantized text-decoder parity proof, not an audio/image/video multimodal
+proof.
 
 For intermediate tensor triage, use the same paths with one of the ignored
 tensor-summary proofs:
@@ -346,25 +348,23 @@ tensor-summary proofs:
 ```powershell
 cargo test -p ocelotl local_gemma4_q4_k_m_layer0_substep_summaries_match_llama_cpp_debug -- --ignored --nocapture
 cargo test -p ocelotl local_gemma4_q4_k_m_native_kquant_q8k_qcur_summary_matches_llama_cpp_debug -- --ignored --nocapture
+cargo test -p ocelotl local_gemma4_q4_k_m_native_attention_sidecar_inventory -- --ignored --nocapture
 ```
 
 These tensor-summary tests invoke `llama-debug --verbose --tensor-filter ...
 --no-warmup` without `--save-logits`, because local llama.cpp uses separate
 paths for final-logit files and tensor callback output.
 
-As of the 2026-06-11 local tensor-summary run, the full-logit proof has not
-been refreshed after the GGUF matrix-layout fix. The active red proof is inside
-the first layer: `inp_scaled` and `attn_norm-0` match llama.cpp, but `Qcur-0`
-differs (`Ocelotl -30.809566`, llama.cpp `-14.434416`, diff `16.37515`). Treat
-remaining drift here as the active MF.8 parity worklist, not as an artifact
-setup failure, once both local paths are valid. The selected artifact scan found
-`attn_v.weight` tensors and no `output.weight` or MoE router/expert names, so
-the next discriminator is the K-quant projection/dequantized-matmul path rather
-than those optional tensor branches. The native K-quant discriminator passed
-locally on 2026-06-11: `blk.0.attn_q.weight` is Q6_K in this Q4_K_M artifact,
-and a ported Q6_K x Q8_K projection matches llama.cpp's `Qcur-0` summary. The
-remaining production gap is wiring that native/repacked projection behavior into
-the public Gemma4 text path.
+As of the 2026-06-11 local tensor-summary run, the full-logit proof has not been
+refreshed after the GGUF matrix-layout and native-attention changes. The layer-0
+sidecar inventory is Q6_K/Q5_K/Q6_K/Q5_K for Q/K/V/O, and the public text
+parity path now matches llama.cpp through `kqv_out-0`. The active red checkpoint
+is the Q5_K output projection: Ocelotl `attn_output_proj-0 = -3.062695`,
+llama.cpp `node_33 = -3.404522`, diff `0.34182692` at tolerance `0.05`. Treat
+this as the active MF.8 numeric worklist, not an artifact setup failure. The
+next useful discriminator is a selected-row or selected-element Q5_K output
+comparison against llama.cpp; aggregate sums are no longer enough to identify
+the remaining arithmetic difference.
 
 ## 6. Keeping Artifacts Out Of Git
 

@@ -177,8 +177,9 @@ tag/commit and record that build identity in the tokenizer fixture.
 ## Post-M3 Gemma4 GGUF Logits
 
 Gemma4 real-artifact logits parity is opt-in because it requires the selected
-5 GB GGUF artifact, a local llama.cpp `llama-debug` build, and eager F32
-materialization of the required Q4_K_M-origin text tensors.
+5 GB GGUF artifact, a local llama.cpp `llama-debug` build, and F32
+materialization of the required text tensors alongside native attention
+sidecars.
 
 - **Gemma4 Q4_K_M logits fixture, default-on**:
   `fixtures/logits/gemma4_q4_k_m_basic_prompt_logits_reference.json` pins the
@@ -195,7 +196,8 @@ materialization of the required Q4_K_M-origin text tensors.
   tokenizes the same prompt with Ocelotl's GGUF tokenizer configured-BOS path,
   clears `Gemma4Config.multimodal` for this explicitly text-only harness, loads
   the selected GGUF tensors through
-  `load_gemma4_dequantized_tensors_from_gguf`, builds `Gemma4TextModel`, runs
+  `load_gemma4_dequantized_tensors_from_gguf`, attaches validated Q5_K/Q6_K
+  native Q/K/V/O attention sidecars, builds `Gemma4TextModel`, runs
   `ocelotl_runtime::gemma::prefill`, and compares every final-position logit
   against llama.cpp.
 - **llama.cpp tensor-summary reference, opt-in local execution**:
@@ -206,22 +208,26 @@ materialization of the required Q4_K_M-origin text tensors.
   `--save-logits`. The default suite pins the tensor-summary parser shape and
   duplicate-callback behavior; the ignored tests compare Ocelotl trace sums
   against llama.cpp tensor sums without requiring full tensor dumps.
-- **Native K-quant projection discriminator, opt-in local execution**:
+- **Native K-quant projection discriminators, opt-in local execution**:
   `local_gemma4_q4_k_m_native_kquant_q8k_qcur_summary_matches_llama_cpp_debug`
-  reads raw `blk.0.attn_q.weight` bytes by GGUF manifest offset, quantizes the
-  matching Ocelotl `attn_norm-0` activation to GGML-style Q8_K, and ports the
-  relevant llama.cpp K-quant/Q8_K dot path. This is a proof harness, not the
-  production execution path.
+  exercises the production Q6_K x Q8_K sidecar for `blk.0.attn_q.weight` while
+  leaving other attention projections on the dense fallback.
+  `local_gemma4_q4_k_m_native_attention_sidecar_inventory` pins the selected
+  layer-0 Q/K/V/O types as Q6_K/Q5_K/Q6_K/Q5_K. Default loader, kernel, and
+  model tests pin bounded raw-byte loading, Q5_K/Q6_K x Q8_K projection, sidecar
+  validation, and native dispatch without making local artifacts a CI
+  dependency.
 
 Current status: the full-logit proof was last run before the GGUF matrix-layout
-fix and failed at token 0 with `Ocelotl -2.544672`, llama.cpp `-18.2152`, diff
-`15.670528`. The current discriminator is the 2026-06-11 tensor-summary proof
-against llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0`: after fixing
-Gemma4's GGUF adapter so token embeddings stay in GGUF row order and matrix
-weights transpose into Ocelotl row-major matmul layout, `inp_scaled` and
-`attn_norm-0` match llama.cpp within tolerance. The first remaining mismatch is
-the first layer's quantized Q projection: `Qcur-0` sum `Ocelotl -30.809566`,
-llama.cpp `-14.434416`, diff `16.37515`. The closed semantic gaps so far are
+and native-attention changes and failed at token 0 with `Ocelotl -2.544672`,
+llama.cpp `-18.2152`, diff `15.670528`. The current discriminator is the
+2026-06-11 tensor-summary proof against llama.cpp
+`856c3adac1709be15e1ea2529a0e89f742d25fe0`. Native Q5_K/Q6_K attention
+sidecars close the earlier `Qcur-0`, K/V, and attention mismatches: the layer-0
+proof now matches through `kqv_out-0`. The first remaining mismatch is the
+Q5_K `blk.0.attn_output.weight` projection: Ocelotl
+`attn_output_proj-0 = -3.062695`, llama.cpp `node_33 = -3.404522`, diff
+`0.34182692`. The closed semantic gaps so far are
 llama.cpp-style `sqrt(hidden)` token embedding scaling, Gemma4 score scale
 `1.0`, unweighted V RMSNorm before KV storage/reuse, tanh-approx GEGLU FFN,
 weighted post-attention/post-FFN RMSNorm before residual adds, per-layer input
@@ -229,17 +235,17 @@ embeddings, layer output scales, Gemma4 global-attention RoPE frequency factors,
 and GGUF matrix layout at the Gemma4 weight adapter. A local tensor-name scan of
 the selected GGUF found `attn_v.weight` tensors and did not find
 `output.weight` or MoE router/expert tensors, so those optional llama.cpp
-branches are not the current selected-artifact explanation. A follow-up native
-K-quant discriminator passed locally on 2026-06-11: the selected artifact stores
-`blk.0.attn_q.weight` as Q6_K, and the ported Q6_K x Q8_K projection sum matches
-llama.cpp's `Qcur-0` summary. The active implementation gap is therefore the
-public text path's eager F32 dequantized matmul, not scalar K-quant unpacking or
-GGUF matrix layout.
+branches are not the current selected-artifact explanation. Q5_K scalar layout,
+min-term, high-bit, orientation, and AVX2 accumulation-order audits have not
+explained the remaining output-projection delta. The next discriminator must
+compare Q5_K output rows or selected elements against llama.cpp rather than
+relying only on the aggregate tensor sum.
 
 The `0.05` tolerance is deliberately wider than the synthetic `1e-4` fixture
-because this compares Ocelotl's eagerly dequantized F32 path against llama.cpp's
-GGML Q4_K_M execution path on a 42-layer real artifact. Tighten it only after a
-local reference run reports the observed worst-case difference. Exact
+because this compares Ocelotl's mixed native-attention/eager-dequantized path
+against llama.cpp's GGML Q4_K_M execution path on a 42-layer real artifact.
+Tighten it only after a local reference run reports the observed worst-case
+difference. Exact
 configured-BOS token equality is checked before logits so a BOS-policy mismatch
 cannot masquerade as numeric drift.
 

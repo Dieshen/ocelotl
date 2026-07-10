@@ -15,6 +15,7 @@ pub use gguf_inspect::{
 };
 pub mod gguf_values;
 pub use gguf_values::{
+    LoadedGgufKQuantTensorBytes, load_gguf_k_quant_tensor_bytes, load_gguf_k_quant_tensors_bytes,
     load_gguf_tensor_dequantized_f32, load_gguf_tensor_f32, load_gguf_tensors_dequantized_f32,
     load_gguf_tensors_f32,
 };

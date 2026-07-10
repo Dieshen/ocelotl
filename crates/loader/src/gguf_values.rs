@@ -22,6 +22,14 @@ const Q4_K_BLOCK_BYTES: usize = 144;
 const Q5_K_BLOCK_BYTES: usize = 176;
 const Q6_K_BLOCK_BYTES: usize = 210;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedGgufKQuantTensorBytes {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub tensor_type: GgmlTensorType,
+    pub data: Vec<u8>,
+}
+
 pub fn load_gguf_tensor_f32(path: &Path, tensor_name: &str) -> Result<LoadedTensor> {
     let manifest = inspect_gguf(path)?;
     let mut file = File::open(path).map_err(|source| io_error(path, source))?;
@@ -86,6 +94,27 @@ pub fn load_gguf_tensors_dequantized_f32<S: AsRef<str>>(
         .collect()
 }
 
+pub fn load_gguf_k_quant_tensor_bytes(
+    path: &Path,
+    tensor_name: &str,
+) -> Result<LoadedGgufKQuantTensorBytes> {
+    let manifest = inspect_gguf(path)?;
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    load_k_quant_tensor_from_manifest(path, &manifest, &mut file, tensor_name)
+}
+
+pub fn load_gguf_k_quant_tensors_bytes<S: AsRef<str>>(
+    path: &Path,
+    tensor_names: &[S],
+) -> Result<Vec<LoadedGgufKQuantTensorBytes>> {
+    let manifest = inspect_gguf(path)?;
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    tensor_names
+        .iter()
+        .map(|name| load_k_quant_tensor_from_manifest(path, &manifest, &mut file, name.as_ref()))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GgufValueMode {
     DenseOnly,
@@ -113,6 +142,41 @@ fn load_tensor_from_manifest(
     load_tensor_bytes(path, file, tensor, mode)
 }
 
+fn load_k_quant_tensor_from_manifest(
+    path: &Path,
+    manifest: &GgufManifest,
+    file: &mut File,
+    tensor_name: &str,
+) -> Result<LoadedGgufKQuantTensorBytes> {
+    let tensor = manifest
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == tensor_name)
+        .ok_or_else(|| {
+            OcelotlError::from(InvalidModelError {
+                path: Some(path.to_path_buf()),
+                field: Some(tensor_name.to_string()),
+                message: format!("required tensor `{tensor_name}` not found in GGUF file"),
+            })
+        })?;
+    if !matches!(
+        tensor.tensor_type,
+        GgmlTensorType::Q4K | GgmlTensorType::Q5K | GgmlTensorType::Q6K
+    ) {
+        return Err(unsupported_gguf_k_quant_tensor_type(
+            tensor.tensor_type,
+            tensor_name,
+        ));
+    }
+    let data = read_tensor_data(path, file, tensor)?;
+    Ok(LoadedGgufKQuantTensorBytes {
+        name: tensor.name.clone(),
+        shape: tensor.shape.clone(),
+        tensor_type: tensor.tensor_type,
+        data,
+    })
+}
+
 fn load_tensor_bytes(
     path: &Path,
     file: &mut File,
@@ -120,22 +184,12 @@ fn load_tensor_bytes(
     mode: GgufValueMode,
 ) -> Result<LoadedTensor> {
     let tensor_name = tensor.name.as_str();
-    let byte_len = tensor
-        .byte_len
-        .ok_or_else(|| unsupported_gguf_tensor_type(tensor.tensor_type, tensor_name, mode))?;
-    let byte_len: usize = byte_len.try_into().map_err(|_| {
-        invalid_gguf_values(
-            path,
-            Some(tensor_name),
-            format!("tensor `{tensor_name}` byte length {byte_len} does not fit in usize"),
-        )
+    let data = read_tensor_data(path, file, tensor).map_err(|err| match err {
+        OcelotlError::Unsupported(_) => {
+            unsupported_gguf_tensor_type(tensor.tensor_type, tensor_name, mode)
+        }
+        other => other,
     })?;
-
-    file.seek(SeekFrom::Start(tensor.file_offset))
-        .map_err(|source| io_error(path, source))?;
-    let mut data = vec![0_u8; byte_len];
-    file.read_exact(&mut data)
-        .map_err(|source| io_error(path, source))?;
 
     let (dtype, values) = match tensor.tensor_type {
         GgmlTensorType::F32 => (SupportedDtype::F32, decode_f32(&data, path, tensor_name)?),
@@ -168,6 +222,27 @@ fn load_tensor_bytes(
     })
 }
 
+fn read_tensor_data(path: &Path, file: &mut File, tensor: &GgufTensorEntry) -> Result<Vec<u8>> {
+    let tensor_name = tensor.name.as_str();
+    let byte_len = tensor
+        .byte_len
+        .ok_or_else(|| unsupported_gguf_raw_tensor_type(tensor.tensor_type, tensor_name))?;
+    let byte_len: usize = byte_len.try_into().map_err(|_| {
+        invalid_gguf_values(
+            path,
+            Some(tensor_name),
+            format!("tensor `{tensor_name}` byte length {byte_len} does not fit in usize"),
+        )
+    })?;
+
+    file.seek(SeekFrom::Start(tensor.file_offset))
+        .map_err(|source| io_error(path, source))?;
+    let mut data = vec![0_u8; byte_len];
+    file.read_exact(&mut data)
+        .map_err(|source| io_error(path, source))?;
+    Ok(data)
+}
+
 fn unsupported_gguf_tensor_type(
     tensor_type: GgmlTensorType,
     tensor_name: &str,
@@ -181,6 +256,28 @@ fn unsupported_gguf_tensor_type(
         feature: "gguf_tensor_type".to_string(),
         requested: Some(format!("{tensor_type:?} (tensor `{tensor_name}`)")),
         supported,
+    })
+}
+
+fn unsupported_gguf_raw_tensor_type(
+    tensor_type: GgmlTensorType,
+    tensor_name: &str,
+) -> OcelotlError {
+    OcelotlError::from(UnsupportedError {
+        feature: "gguf_tensor_type".to_string(),
+        requested: Some(format!("{tensor_type:?} (tensor `{tensor_name}`)")),
+        supported: vec!["recognized GGUF tensor types with inspected byte_len".to_string()],
+    })
+}
+
+fn unsupported_gguf_k_quant_tensor_type(
+    tensor_type: GgmlTensorType,
+    tensor_name: &str,
+) -> OcelotlError {
+    OcelotlError::from(UnsupportedError {
+        feature: "gguf_k_quant_tensor_type".to_string(),
+        requested: Some(format!("{tensor_type:?} (tensor `{tensor_name}`)")),
+        supported: vec!["Q4K".to_string(), "Q5K".to_string(), "Q6K".to_string()],
     })
 }
 
@@ -816,6 +913,68 @@ mod tests {
     }
 
     #[test]
+    fn load_gguf_k_quant_tensor_bytes_returns_exact_payload_and_metadata() {
+        let path = tmp_path("raw_q6k");
+        let payload = q6_k_block();
+        write_fixture(
+            &path,
+            &[FixtureTensor {
+                name: "blk.0.attn_q.weight",
+                shape: &[256],
+                raw_type: 14,
+                payload: payload.clone(),
+            }],
+        );
+
+        let loaded = load_gguf_k_quant_tensor_bytes(&path, "blk.0.attn_q.weight")
+            .expect("load GGUF K-quant tensor bytes");
+
+        assert_eq!(loaded.name, "blk.0.attn_q.weight");
+        assert_eq!(loaded.shape, vec![256]);
+        assert_eq!(loaded.tensor_type, GgmlTensorType::Q6K);
+        assert_eq!(loaded.data, payload);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_gguf_k_quant_tensors_bytes_preserves_requested_order() {
+        let path = tmp_path("many_raw_k_quant");
+        let first = q5_k_block();
+        let second = q4_k_block();
+        write_fixture(
+            &path,
+            &[
+                FixtureTensor {
+                    name: "first",
+                    shape: &[256],
+                    raw_type: 13,
+                    payload: first.clone(),
+                },
+                FixtureTensor {
+                    name: "second",
+                    shape: &[256],
+                    raw_type: 12,
+                    payload: second.clone(),
+                },
+            ],
+        );
+
+        let loaded = load_gguf_k_quant_tensors_bytes(&path, &["second", "first"])
+            .expect("load raw K-quant tensors");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "second");
+        assert_eq!(loaded[0].tensor_type, GgmlTensorType::Q4K);
+        assert_eq!(loaded[0].data, second);
+        assert_eq!(loaded[1].name, "first");
+        assert_eq!(loaded[1].tensor_type, GgmlTensorType::Q5K);
+        assert_eq!(loaded[1].data, first);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn load_gguf_tensor_f32_returns_invalid_model_for_missing_tensor() {
         let path = tmp_path("missing_tensor");
         write_fixture(
@@ -837,6 +996,65 @@ mod tests {
                 assert!(invalid.message.contains("absent"));
             }
             other => panic!("expected InvalidModel for missing tensor, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_gguf_k_quant_tensor_bytes_returns_invalid_model_for_missing_tensor() {
+        let path = tmp_path("raw_missing_tensor");
+        write_fixture(
+            &path,
+            &[FixtureTensor {
+                name: "present",
+                shape: &[1],
+                raw_type: 0,
+                payload: f32_bytes(&[1.0]),
+            }],
+        );
+
+        let err =
+            load_gguf_k_quant_tensor_bytes(&path, "absent").expect_err("missing tensor must fail");
+
+        match err {
+            OcelotlError::InvalidModel(invalid) => {
+                assert_eq!(invalid.path.as_deref(), Some(path.as_path()));
+                assert_eq!(invalid.field.as_deref(), Some("absent"));
+                assert!(invalid.message.contains("absent"));
+            }
+            other => panic!("expected InvalidModel for missing raw tensor, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_gguf_k_quant_tensor_bytes_rejects_dense_tensor() {
+        let path = tmp_path("raw_dense_rejected");
+        write_fixture(
+            &path,
+            &[FixtureTensor {
+                name: "dense.weight",
+                shape: &[1],
+                raw_type: 0,
+                payload: f32_bytes(&[1.0]),
+            }],
+        );
+
+        let err = load_gguf_k_quant_tensor_bytes(&path, "dense.weight")
+            .expect_err("dense tensor bytes must not load through K-quant API");
+
+        match err {
+            OcelotlError::Unsupported(unsupported) => {
+                assert_eq!(unsupported.feature, "gguf_k_quant_tensor_type");
+                assert_eq!(
+                    unsupported.requested.as_deref(),
+                    Some("F32 (tensor `dense.weight`)")
+                );
+                assert_eq!(unsupported.supported, vec!["Q4K", "Q5K", "Q6K"]);
+            }
+            other => panic!("expected Unsupported for dense raw tensor, got {other:?}"),
         }
 
         let _ = std::fs::remove_file(path);

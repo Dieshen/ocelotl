@@ -183,14 +183,18 @@ Gemma4:
   keeps token and per-layer-token embeddings in GGUF row order for lookup,
   transposes GGUF `{input, output}` matrices into Ocelotl row-major matmul
   layout, and adds ignored llama.cpp tensor-summary harnesses for late tensors,
-  layer outputs, and layer-0 substeps. The current 2026-06-11 local
-  discriminator shows `inp_scaled` and `attn_norm-0` now match llama.cpp, then
-  `Qcur-0` diverges (`Ocelotl -30.809566`, llama.cpp `-14.434416`, diff
-  `16.37515`). A native K-quant discriminator then proves
-  `blk.0.attn_q.weight` is Q6_K in the selected artifact and that a ported
-  llama.cpp-style Q6_K x Q8_K dot matches `Qcur-0`. The active real-artifact
-  blocker is wiring native/repacked K-quant projection semantics into the
-  public text path instead of using eager F32 dequantized matmul.
+  layer outputs, and layer-0 substeps. The initial 2026-06-11 local
+  discriminator showed `inp_scaled` and `attn_norm-0` matching llama.cpp before
+  `Qcur-0` diverged.
+- A follow-up native attention K-quant slice adds bounded Q4_K/Q5_K/Q6_K raw
+  payload loading, Q5_K/Q6_K x Q8_K kernels, and validated Gemma4 Q/K/V/O
+  sidecars. The selected layer-0 inventory is Q6_K/Q5_K/Q6_K/Q5_K, and the
+  public text parity path now matches llama.cpp through `kqv_out-0`. The active
+  real-artifact blocker is the Q5_K output projection: Ocelotl
+  `attn_output_proj-0 = -3.062695` versus llama.cpp
+  `node_33 = -3.404522`, diff `0.34182692` at tolerance `0.05`. Q4_K native
+  projection remains explicitly unsupported and uses the dequantized dense
+  fallback.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8

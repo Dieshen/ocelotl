@@ -225,14 +225,18 @@ and does not modify the closed M3.6 MLP task.
   2026-06-11. `Gemma4TextWeights::from_loaded_tensors` now treats GGUF
   embedding tensors as row-major token lookup tables while transposing GGUF
   `{input, output}` matrices into Ocelotl's row-major matmul layout. Hidden
-  diagnostic tracing and ignored llama.cpp tensor-summary harnesses isolate the
-  current real-artifact mismatch to `Qcur-0`: `inp_scaled` and `attn_norm-0`
-  match llama.cpp, then the first quantized Q projection differs (`Ocelotl
-  -30.809566`, llama.cpp `-14.434416`, diff `16.37515`). The active blocker is
-  now the K-quant projection/dequantized-matmul path, not late hidden-state
-  localization. A follow-up native projection discriminator proves
-  `blk.0.attn_q.weight` is Q6_K in the selected artifact and that a ported
-  llama.cpp-style Q6_K x Q8_K dot matches the `Qcur-0` summary.
+  diagnostic tracing and ignored llama.cpp tensor-summary harnesses first
+  isolated the real-artifact mismatch to `Qcur-0` after `inp_scaled` and
+  `attn_norm-0` matched llama.cpp.
+- `Follow-up`: native Gemma4 attention K-quant sidecars landed after that
+  discriminator. `ocelotl-loader` exposes a bounded Q4_K/Q5_K/Q6_K raw-byte
+  API, `ocelotl-kernels` executes Q5_K/Q6_K x Q8_K projections, and
+  `Gemma4TextModel` can attach validated native Q/K/V/O sidecars while retaining
+  dense fallback behavior for Q4_K. The selected layer-0 inventory is
+  Q6_K/Q5_K/Q6_K/Q5_K. The local proof now matches llama.cpp through
+  `kqv_out-0`; the first remaining mismatch is the Q5_K output projection
+  (`attn_output_proj-0 = -3.062695` versus llama.cpp `node_33 = -3.404522`,
+  diff `0.34182692`).
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 
@@ -253,14 +257,14 @@ and does not modify the closed M3.6 MLP task.
   final-position logit through `ocelotl_runtime::gemma::prefill`.
 - `Status`: latest local tensor-summary proof on 2026-06-11 runs against
   llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0` and is still red.
-  After the GGUF matrix-layout fix, `inp_scaled` and `attn_norm-0` match
-  llama.cpp, and the first mismatch is `Qcur-0` (`Ocelotl -30.809566`,
-  llama.cpp `-14.434416`, diff `16.37515`). The full-logit proof has not been
-  refreshed after this layout fix. The native K-quant diagnostic is green for
-  that same `Qcur-0` checkpoint using raw Q6_K weights and Q8_K-quantized
-  activations, so remaining work should wire native/repacked K-quant projection
-  semantics into the public Gemma4 text path before expecting the real Q4_K_M
-  logits vector to meet the fixture tolerance.
+  After the GGUF matrix-layout and native-attention changes, the layer-0 proof
+  matches through `kqv_out-0`. The first mismatch is now the native Q5_K
+  `attn_output.weight` projection (`attn_output_proj-0 = -3.062695` versus
+  llama.cpp `node_33 = -3.404522`, diff `0.34182692`). The full-logit proof has
+  not been refreshed after these changes. Remaining work should add a
+  selected-row or selected-element Q5_K output discriminator, fix that numeric
+  delta, then rerun layer outputs and the complete logits vector before claiming
+  MF.8 parity.
 
 ## Track Closure
 
