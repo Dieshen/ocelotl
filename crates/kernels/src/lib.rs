@@ -1923,17 +1923,28 @@ impl Default for CpuKernelBackend {
 
 impl CpuKernelBackend {
     pub fn scalar() -> Self {
-        Self::with_mode(CpuKernelMode::Scalar)
+        Self::new_supported_mode(CpuKernelMode::Scalar)
     }
 
     pub fn optimized() -> Self {
-        Self::with_mode(CpuKernelMode::Optimized)
+        Self::new_supported_mode(CpuKernelMode::Optimized)
     }
 
-    pub fn with_mode(mode: CpuKernelMode) -> Self {
-        // Infallible variant used by tests and defaults. For modes that
-        // require runtime feature detection (Avx2), prefer
-        // `with_mode_checked`.
+    /// Construct a serial CPU backend after validating runtime CPU features.
+    ///
+    /// `CpuKernelMode::Avx2` is accepted only when the current x86_64 host
+    /// advertises both AVX2 and FMA. Keeping this public constructor fallible
+    /// prevents safe callers from creating a backend that could later execute
+    /// unsupported `#[target_feature]` code.
+    pub fn with_mode(mode: CpuKernelMode) -> Result<Self> {
+        validate_mode_supported(mode)?;
+        Ok(Self::new_supported_mode(mode))
+    }
+
+    /// Build a backend after its mode invariant has already been established.
+    /// Scalar and Optimized have no runtime feature requirements; every AVX2
+    /// caller must pass through `validate_mode_supported` first.
+    fn new_supported_mode(mode: CpuKernelMode) -> Self {
         Self {
             context: KernelContext {
                 device: Device::Cpu,
@@ -1943,11 +1954,9 @@ impl CpuKernelBackend {
         }
     }
 
-    /// Fallible counterpart to `with_mode` that validates host-CPU support
-    /// for the requested mode. Currently only `Avx2` requires this check.
+    /// Compatibility alias for the now-checked `with_mode` constructor.
     pub fn with_mode_checked(mode: CpuKernelMode) -> Result<Self> {
-        validate_mode_supported(mode)?;
-        Ok(Self::with_mode(mode))
+        Self::with_mode(mode)
     }
 
     /// Construct a backend that runs hot kernels (currently `linear_out_by_in`
@@ -1957,7 +1966,7 @@ impl CpuKernelBackend {
     pub fn with_mode_and_threads(mode: CpuKernelMode, threads: usize) -> Result<Self> {
         validate_mode_supported(mode)?;
         if threads <= 1 {
-            return Ok(Self::with_mode(mode));
+            return Ok(Self::new_supported_mode(mode));
         }
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -4200,6 +4209,37 @@ mod tests {
 
         assert_eq!(backend.mode(), CpuKernelMode::Optimized);
         assert_eq!(CpuKernelMode::Optimized.as_str(), "optimized");
+    }
+
+    #[test]
+    fn public_cpu_mode_constructor_validates_before_storing_mode() {
+        let scalar = CpuKernelBackend::with_mode(CpuKernelMode::Scalar)
+            .expect("scalar mode must always be supported");
+        assert_eq!(scalar.mode(), CpuKernelMode::Scalar);
+
+        let optimized = CpuKernelBackend::with_mode(CpuKernelMode::Optimized)
+            .expect("optimized mode must always be supported");
+        assert_eq!(optimized.mode(), CpuKernelMode::Optimized);
+
+        let avx2 = CpuKernelBackend::with_mode(CpuKernelMode::Avx2);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            assert_eq!(
+                avx2.expect("advertised AVX2 + FMA must be accepted").mode(),
+                CpuKernelMode::Avx2
+            );
+        } else {
+            assert!(
+                avx2.is_err(),
+                "safe construction must reject AVX2 without both AVX2 and FMA"
+            );
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(
+            avx2.is_err(),
+            "safe construction must reject AVX2 outside x86_64"
+        );
     }
 
     #[test]
