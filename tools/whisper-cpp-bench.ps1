@@ -409,7 +409,8 @@ function Normalize-Transcript {
     if ([string]::IsNullOrWhiteSpace($Text)) {
         return $null
     }
-    return (($Text.Normalize([Text.NormalizationForm]::FormKC).ToLowerInvariant() -replace '\s+', ' ').Trim())
+    $normalized = $Text.Normalize([Text.NormalizationForm]::FormKC).ToLowerInvariant()
+    return (($normalized -replace '[^\p{L}\p{Nd}]+', ' ' -replace '\s+', ' ').Trim())
 }
 
 function New-ComparisonRecord {

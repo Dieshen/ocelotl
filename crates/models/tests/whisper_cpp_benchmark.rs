@@ -479,7 +479,7 @@ fn runner_executes_alternating_samples_and_preserves_ocelotl_timing_json() {
         r#"[ordered]@{
     status = "completed"
     token_count = 2
-    text = "stable transcript"
+    text = "Stable, transcript!"
     matches_expected = $true
     backend = "cpu"
     cpu_kernel_mode = "scalar"
