@@ -92,13 +92,49 @@ impl ChatModel {
         }
 
         let rendered = self.chat_template.apply(&self.messages, true)?;
-        let mut prompt_tokens = self.tokenizer.encode(&rendered)?;
-        let mut generated = Vec::with_capacity(options.max_new_tokens);
+        let prompt_tokens = self.tokenizer.encode(&rendered)?;
+        let requested_context = prompt_tokens
+            .len()
+            .checked_add(options.max_new_tokens)
+            .ok_or_else(|| {
+                OcelotlError::InvalidRequest(InvalidRequestError {
+                    field: "max_new_tokens".to_string(),
+                    message: "prompt length plus max_new_tokens overflows usize".to_string(),
+                })
+            })?;
+        if requested_context > self.model.config().context_length {
+            return Err(OcelotlError::InvalidRequest(InvalidRequestError {
+                field: "max_new_tokens".to_string(),
+                message: format!(
+                    "prompt length {} plus max_new_tokens {} exceeds model context length {}",
+                    prompt_tokens.len(),
+                    options.max_new_tokens,
+                    self.model.config().context_length
+                ),
+            }));
+        }
+
+        let mut generated = Vec::new();
+        generated
+            .try_reserve_exact(options.max_new_tokens)
+            .map_err(|err| {
+                OcelotlError::InvalidRequest(InvalidRequestError {
+                    field: "max_new_tokens".to_string(),
+                    message: format!(
+                        "cannot reserve output capacity for {} tokens: {err}",
+                        options.max_new_tokens
+                    ),
+                })
+            })?;
+        let mut state =
+            ocelotl_runtime::qwen::prepare_qwen2_5_contiguous_cache(&self.model, &prompt_tokens)?;
 
         for _ in 0..options.max_new_tokens {
-            let next = ocelotl_runtime::qwen::decode_one_token(&self.model, &prompt_tokens)?;
+            let next = ocelotl_runtime::qwen::decode_one_token_with_contiguous_cache(
+                &self.model,
+                &mut state,
+            )?;
             generated.push(next);
-            prompt_tokens.push(next);
         }
 
         Ok(generated)
@@ -223,6 +259,34 @@ mod tests {
                 assert_eq!(unsupported.feature, "sampling_mode");
             }
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_model_rejects_generation_beyond_context_before_decode() {
+        let model = tiny_chat_model();
+        let tokenizer =
+            JsonTokenizer::from_json_path(tokenizer_fixture_path("tiny_wordlevel.json")).unwrap();
+        let chat_template = ChatTemplate::from_jinja(
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+        )
+        .unwrap();
+        let mut chat = ChatModel::from_qwen2_5_parts(model, tokenizer, chat_template);
+        chat.add_message("user", "hello");
+
+        let err = chat
+            .generate_text(GenerationOptions {
+                max_new_tokens: 16,
+                temperature: None,
+            })
+            .expect_err("prompt plus generation beyond context must fail before decode");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "max_new_tokens");
+                assert!(invalid.message.contains("context length"));
+            }
+            other => panic!("expected InvalidRequest(max_new_tokens), got {other:?}"),
         }
     }
 
