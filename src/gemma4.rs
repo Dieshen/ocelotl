@@ -69,6 +69,7 @@ mod tests {
         load_gemma4_dequantized_tensors_from_gguf,
         load_gemma4_native_attention_projections_from_gguf,
         load_gemma4_native_attn_q_projections_from_gguf,
+        load_gemma4_native_text_projections_from_gguf,
     };
     use ocelotl_runtime::gemma::prefill;
     use ocelotl_tokenizer::Tokenizer;
@@ -1159,16 +1160,15 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
         config.multimodal = false;
         let weights = Gemma4TextWeights::from_loaded_tensors(&config, tensors)
             .expect("dequantized local Gemma4 tensors must map into text weights");
-        let native_attention =
-            load_gemma4_native_attention_projections_from_gguf(model_path, &config)
-                .expect("local Gemma4 native attention sidecars must load");
-        let model = Gemma4TextModel::with_kernel_backend_and_native_attention(
+        let native_text = load_gemma4_native_text_projections_from_gguf(model_path, &config)
+            .expect("local Gemma4 native text sidecars must load");
+        let model = Gemma4TextModel::with_kernel_backend_and_native_text_projections(
             config.clone(),
             weights,
             ocelotl_kernels::default_kernel_backend(),
-            native_attention,
+            native_text,
         )
-        .expect("text-projected Gemma4 model with native attention projections must build");
+        .expect("text-projected Gemma4 model with native text projections must build");
         (config, model)
     }
 
