@@ -8,7 +8,7 @@ use std::path::Path;
 
 use ocelotl_core::{
     GenerationOptions, InvalidModelError, InvalidRequestError, IoError, OcelotlError, Result,
-    TokenId, TokenizerError, UnsupportedError,
+    RequestLimits, TokenId, TokenizerError, UnsupportedError,
 };
 use ocelotl_models::qwen::Qwen2_5Model;
 use ocelotl_tokenizer::{ChatMessage, ChatTemplate, JsonTokenizer, Tokenizer};
@@ -77,12 +77,25 @@ impl ChatModel {
     }
 
     pub fn generate_text(&self, options: GenerationOptions) -> Result<ChatResponse> {
-        let tokens = self.generate_tokens(options)?;
+        self.generate_text_with_limits(options, RequestLimits::default())
+    }
+
+    /// Generate under deployment-specific prompt, output, and context limits.
+    pub fn generate_text_with_limits(
+        &self,
+        options: GenerationOptions,
+        limits: RequestLimits,
+    ) -> Result<ChatResponse> {
+        let tokens = self.generate_tokens(options, limits)?;
         let text = self.tokenizer.decode(&tokens)?;
         Ok(ChatResponse { text, tokens })
     }
 
-    fn generate_tokens(&self, options: GenerationOptions) -> Result<Vec<TokenId>> {
+    fn generate_tokens(
+        &self,
+        options: GenerationOptions,
+        limits: RequestLimits,
+    ) -> Result<Vec<TokenId>> {
         validate_chat_options(&options)?;
         if self.messages.is_empty() {
             return Err(OcelotlError::InvalidRequest(InvalidRequestError {
@@ -93,15 +106,8 @@ impl ChatModel {
 
         let rendered = self.chat_template.apply(&self.messages, true)?;
         let prompt_tokens = self.tokenizer.encode(&rendered)?;
-        let requested_context = prompt_tokens
-            .len()
-            .checked_add(options.max_new_tokens)
-            .ok_or_else(|| {
-                OcelotlError::InvalidRequest(InvalidRequestError {
-                    field: "max_new_tokens".to_string(),
-                    message: "prompt length plus max_new_tokens overflows usize".to_string(),
-                })
-            })?;
+        let requested_context =
+            limits.validate_generation(prompt_tokens.len(), options.max_new_tokens)?;
         if requested_context > self.model.config().context_length {
             return Err(OcelotlError::InvalidRequest(InvalidRequestError {
                 field: "max_new_tokens".to_string(),
@@ -287,6 +293,42 @@ mod tests {
                 assert!(invalid.message.contains("context length"));
             }
             other => panic!("expected InvalidRequest(max_new_tokens), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_model_applies_explicit_request_limits_before_decode() {
+        let model = tiny_chat_model();
+        let tokenizer =
+            JsonTokenizer::from_json_path(tokenizer_fixture_path("tiny_wordlevel.json")).unwrap();
+        let chat_template = ChatTemplate::from_jinja(
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+        )
+        .unwrap();
+        let mut chat = ChatModel::from_qwen2_5_parts(model, tokenizer, chat_template);
+        chat.add_message("user", "hello");
+        let limits = ocelotl_core::RequestLimits {
+            max_prompt_tokens: 8,
+            max_new_tokens: 1,
+            max_context_tokens: 8,
+            max_audio_samples: 16_000,
+        };
+
+        let err = chat
+            .generate_text_with_limits(
+                GenerationOptions {
+                    max_new_tokens: 2,
+                    temperature: None,
+                },
+                limits,
+            )
+            .expect_err("deployment generation limit must fail before decode");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "max_new_tokens");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
         }
     }
 
