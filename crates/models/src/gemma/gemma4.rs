@@ -1086,13 +1086,13 @@ impl Gemma4TextModel {
     }
 
     pub fn prefill(&self, tokens: &[TokenId]) -> Result<Vec<f32>> {
-        let (logits, _) = self.prefill_inner(tokens, false)?;
+        let (logits, _) = self.prefill_inner(tokens, false, None)?;
         Ok(logits)
     }
 
     #[doc(hidden)]
     pub fn prefill_with_trace(&self, tokens: &[TokenId]) -> Result<Gemma4TextPrefillTrace> {
-        let (logits, trace) = self.prefill_inner(tokens, true)?;
+        let (logits, trace) = self.prefill_inner(tokens, true, None)?;
         let Some(mut trace) = trace else {
             unreachable!("trace collection was requested");
         };
@@ -1100,10 +1100,36 @@ impl Gemma4TextModel {
         Ok(trace)
     }
 
+    /// Collect trace tensors through the requested layer prefix without
+    /// computing later layers or final logits. This is intended for bounded
+    /// local parity diagnostics against external reference implementations.
+    #[doc(hidden)]
+    pub fn prefill_prefix_with_trace(
+        &self,
+        tokens: &[TokenId],
+        layer_count: usize,
+    ) -> Result<Gemma4TextPrefillTrace> {
+        if layer_count == 0 || layer_count > self.config.block_count {
+            return Err(OcelotlError::InvalidRequest(InvalidRequestError {
+                field: "layer_count".to_string(),
+                message: format!(
+                    "must be between 1 and block_count {} (got {layer_count})",
+                    self.config.block_count
+                ),
+            }));
+        }
+        let (_, trace) = self.prefill_inner(tokens, true, Some(layer_count))?;
+        let Some(trace) = trace else {
+            unreachable!("prefix trace collection was requested");
+        };
+        Ok(trace)
+    }
+
     fn prefill_inner(
         &self,
         tokens: &[TokenId],
         collect_trace: bool,
+        layer_limit: Option<usize>,
     ) -> Result<(Vec<f32>, Option<Gemma4TextPrefillTrace>)> {
         if tokens.is_empty() {
             return Err(OcelotlError::InvalidRequest(InvalidRequestError {
@@ -1534,6 +1560,20 @@ impl Gemma4TextModel {
             }
             if let Some(outputs) = &mut layer_outputs {
                 outputs.push(hidden.clone());
+            }
+            if layer_limit == Some(layer_idx + 1) {
+                let trace = Gemma4TextPrefillTrace {
+                    logits: Vec::new(),
+                    named_tensors: named_tensors
+                        .take()
+                        .expect("layer-limited prefill always collects named tensors"),
+                    layer_outputs: layer_outputs
+                        .take()
+                        .expect("layer-limited prefill always collects layer outputs"),
+                    result_norm: Vec::new(),
+                    result_output: Vec::new(),
+                };
+                return Ok((Vec::new(), Some(trace)));
             }
         }
 
@@ -5109,6 +5149,26 @@ mod tests {
         assert_eq!(trace.result_output.len(), cfg.tokenizer_token_count);
         assert!(trace.result_norm.iter().all(|value| value.is_finite()));
         assert!(trace.result_output.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn gemma4_text_prefix_trace_stops_after_requested_layer() {
+        let cfg = tiny_mixed_attention_text_config();
+        let tensors = complete_text_loaded_tensors(&cfg);
+        let weights = Gemma4TextWeights::from_loaded_tensors(&cfg, tensors)
+            .expect("tiny mixed Gemma4 text tensors must map into weights");
+        let model = Gemma4TextModel::new(cfg, weights)
+            .expect("tiny mixed Gemma4 text model must construct");
+
+        let trace = model
+            .prefill_prefix_with_trace(&[TokenId(1), TokenId(2)], 1)
+            .expect("one-layer Gemma4 prefix trace must run");
+
+        assert_eq!(trace.layer_outputs.len(), 1);
+        assert!(trace.named_tensors.contains_key("l_out-0"));
+        assert!(trace.logits.is_empty());
+        assert!(trace.result_norm.is_empty());
+        assert!(trace.result_output.is_empty());
     }
 
     #[test]

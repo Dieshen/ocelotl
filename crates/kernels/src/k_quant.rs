@@ -226,15 +226,15 @@ fn quantize_row_q8_k(input: &[f32]) -> Result<Vec<Q8KBlock>> {
 
 fn vec_dot_q5_k_q8_k(raw_q5_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
     debug_assert_eq!(raw_q5_k_row.len(), q8_blocks.len() * Q5_K_BLOCK_BYTES);
-    let mut sums = [0.0_f32; 8];
-    let mut sumf = 0.0_f32;
+    let mut accumulator = [0.0_f32; 8];
+    let mut min_sum = 0.0_f32;
 
     for (raw_block, q8) in raw_q5_k_row
         .chunks_exact(Q5_K_BLOCK_BYTES)
         .zip(q8_blocks.iter())
     {
-        let d = f16_le_at(raw_block, 0) * q8.d;
-        let dmin = f16_le_at(raw_block, 2) * q8.d;
+        let d = q8.d * f16_le_at(raw_block, 0);
+        let dmin = -q8.d * f16_le_at(raw_block, 2);
         let scales = &raw_block[4..16];
         let qh = &raw_block[16..48];
         let qs = &raw_block[48..176];
@@ -262,33 +262,41 @@ fn vec_dot_q5_k_q8_k(raw_q5_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
             let (_, min) = get_scale_min_k4(group16 / 2, scales);
             sumi += q8.sums16[group16] * i32::from(min);
         }
-        sumf -= dmin * sumi as f32;
+        min_sum = dmin.mul_add(sumi as f32, min_sum);
 
         for group32 in 0..QK_K / 32 {
             let (scale, _) = get_scale_min_k4(group32, scales);
             let value_start = group32 * 32;
-            for lane in 0..32 {
-                aux32[lane % 8] += i32::from(scale)
-                    * i32::from(q8.qs[value_start + lane])
-                    * quants[value_start + lane];
+            for lane in 0..8 {
+                let chunk_start = value_start + lane * 4;
+                let chunk_sum = (0..4)
+                    .map(|offset| {
+                        i32::from(q8.qs[chunk_start + offset]) * quants[chunk_start + offset]
+                    })
+                    .sum::<i32>();
+                aux32[lane] += i32::from(scale) * chunk_sum;
             }
         }
 
         for (lane, aux) in aux32.iter().enumerate() {
-            sums[lane] += d * *aux as f32;
+            accumulator[lane] = d.mul_add(*aux as f32, accumulator[lane]);
         }
     }
 
-    for lane_sum in sums {
-        sumf += lane_sum;
-    }
-    sumf
+    hsum_float_8_avx(accumulator) + min_sum
+}
+
+fn hsum_float_8_avx(values: [f32; 8]) -> f32 {
+    let pair0 = values[4] + values[0];
+    let pair1 = values[5] + values[1];
+    let pair2 = values[6] + values[2];
+    let pair3 = values[7] + values[3];
+    (pair0 + pair2) + (pair1 + pair3)
 }
 
 fn vec_dot_q6_k_q8_k(raw_q6_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
     debug_assert_eq!(raw_q6_k_row.len(), q8_blocks.len() * Q6_K_BLOCK_BYTES);
-    let mut sums = [0.0_f32; 8];
-    let mut sumf = 0.0_f32;
+    let mut accumulator = [0.0_f32; 8];
 
     for (raw_block, q8) in raw_q6_k_row
         .chunks_exact(Q6_K_BLOCK_BYTES)
@@ -297,7 +305,7 @@ fn vec_dot_q6_k_q8_k(raw_q6_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
         let ql = &raw_block[0..128];
         let qh = &raw_block[128..192];
         let scales = &raw_block[192..208];
-        let mut aux8 = [0_i8; QK_K];
+        let mut quants = [0_i32; QK_K];
 
         for super_group in 0..2 {
             let ql_base = super_group * 64;
@@ -305,39 +313,47 @@ fn vec_dot_q6_k_q8_k(raw_q6_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
             let value_base = super_group * 128;
             for l in 0..32 {
                 let high = qh[qh_base + l];
-                aux8[value_base + l] =
-                    (((ql[ql_base + l] & 0x0f) | ((high & 0x03) << 4)) as i8) - 32;
-                aux8[value_base + l + 32] =
-                    (((ql[ql_base + l + 32] & 0x0f) | (((high >> 2) & 0x03) << 4)) as i8) - 32;
-                aux8[value_base + l + 64] =
-                    (((ql[ql_base + l] >> 4) | (((high >> 4) & 0x03) << 4)) as i8) - 32;
-                aux8[value_base + l + 96] =
-                    (((ql[ql_base + l + 32] >> 4) | (((high >> 6) & 0x03) << 4)) as i8) - 32;
+                quants[value_base + l] = i32::from((ql[ql_base + l] & 0x0f) | ((high & 0x03) << 4));
+                quants[value_base + l + 32] =
+                    i32::from((ql[ql_base + l + 32] & 0x0f) | (((high >> 2) & 0x03) << 4));
+                quants[value_base + l + 64] =
+                    i32::from((ql[ql_base + l] >> 4) | (((high >> 4) & 0x03) << 4));
+                quants[value_base + l + 96] =
+                    i32::from((ql[ql_base + l + 32] >> 4) | (((high >> 6) & 0x03) << 4));
             }
         }
 
         let mut aux32 = [0_i32; 8];
-        for (group16, scale_byte) in scales.iter().enumerate().take(QK_K / 16) {
-            let scale = i8::from_ne_bytes([*scale_byte]);
-            let value_start = group16 * 16;
-            for l in 0..16 {
-                let lane = l % 8;
-                aux32[lane] += i32::from(scale)
-                    * i32::from(q8.qs[value_start + l])
-                    * i32::from(aux8[value_start + l]);
+        for group32 in 0..QK_K / 32 {
+            let value_start = group32 * 32;
+            let low_scale = i32::from(i8::from_ne_bytes([scales[group32 * 2]]));
+            let high_scale = i32::from(i8::from_ne_bytes([scales[group32 * 2 + 1]]));
+            for lane in 0..8 {
+                let chunk_start = value_start + lane * 4;
+                let chunk_sum = (0..4)
+                    .map(|offset| {
+                        i32::from(q8.qs[chunk_start + offset]) * quants[chunk_start + offset]
+                    })
+                    .sum::<i32>();
+                let scale = if lane < 4 { low_scale } else { high_scale };
+                aux32[lane] += scale * chunk_sum;
             }
         }
 
-        let d = f16_le_at(raw_block, 208) * q8.d;
+        for lane in 0..8 {
+            let scale0 = i32::from(i8::from_ne_bytes([scales[lane * 2]]));
+            let scale1 = i32::from(i8::from_ne_bytes([scales[lane * 2 + 1]]));
+            let zero_point = (q8.sums16[lane * 2] * scale0 + q8.sums16[lane * 2 + 1] * scale1) * 32;
+            aux32[lane] -= zero_point;
+        }
+
+        let d = q8.d * f16_le_at(raw_block, 208);
         for (lane, aux) in aux32.iter().enumerate() {
-            sums[lane] += d * *aux as f32;
+            accumulator[lane] = d.mul_add(*aux as f32, accumulator[lane]);
         }
     }
 
-    for lane_sum in sums {
-        sumf += lane_sum;
-    }
-    sumf
+    hsum_float_8_avx(accumulator)
 }
 
 fn get_scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
@@ -450,6 +466,49 @@ mod tests {
     }
 
     #[test]
+    fn q6_k_q8_k_projection_matches_pinned_llama_cpp_avx2_reduction_order() {
+        const BLOCKS: usize = 8;
+        let mut state = 0x517c_c1b7_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        let mut weight = vec![0_u8; BLOCKS * Q6_K_BLOCK_BYTES];
+        for block in 0..BLOCKS {
+            let start = block * Q6_K_BLOCK_BYTES;
+            for byte in &mut weight[start..start + Q6_K_BLOCK_BYTES] {
+                *byte = (next() >> 24) as u8;
+            }
+            let d = 0x2400_u16 + (next() % 0x1400) as u16;
+            weight[start + 208..start + 210].copy_from_slice(&d.to_le_bytes());
+        }
+        let input = (0..BLOCKS * QK_K)
+            .map(|_| {
+                let numerator = (next() % 20_001) as i32 - 10_000;
+                let denominator = next() % 997 + 3;
+                numerator as f32 / denominator as f32
+            })
+            .collect::<Vec<_>>();
+        let mut out = [0.0_f32; 1];
+
+        linear_q8_k_k_quant(
+            &input,
+            1,
+            GgmlKQuantMatrixRef {
+                input_features: BLOCKS * QK_K,
+                output_features: 1,
+                kind: GgmlKQuantKind::Q6K,
+                data: &weight,
+            },
+            &mut out,
+        )
+        .expect("pinned eight-block Q6_K x Q8_K tripwire must project");
+
+        // llama.cpp 856c3adac, x86 AVX2/FMA ggml_vec_dot_q6_K_q8_K.
+        assert_eq!(out[0].to_bits(), 0xc91b_7a91);
+    }
+
+    #[test]
     fn q5_k_q8_k_projection_matches_hand_checked_single_weight() {
         let weight = q5_single_weight_block();
         let mut x = vec![0.0_f32; QK_K * 2];
@@ -484,6 +543,51 @@ mod tests {
         .expect("Q5_K min term projection must succeed");
 
         assert_eq!(out, vec![-1.0]);
+    }
+
+    #[test]
+    fn q5_k_q8_k_projection_matches_pinned_llama_cpp_avx2_reduction_order() {
+        const BLOCKS: usize = 8;
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        let mut weight = vec![0_u8; BLOCKS * Q5_K_BLOCK_BYTES];
+        for block in 0..BLOCKS {
+            let start = block * Q5_K_BLOCK_BYTES;
+            let d = 0x2400_u16 + (next() % 0x1400) as u16;
+            let dmin = 0x2400_u16 + (next() % 0x1400) as u16;
+            weight[start..start + 2].copy_from_slice(&d.to_le_bytes());
+            weight[start + 2..start + 4].copy_from_slice(&dmin.to_le_bytes());
+            for byte in &mut weight[start + 4..start + Q5_K_BLOCK_BYTES] {
+                *byte = (next() >> 24) as u8;
+            }
+        }
+        let input = (0..BLOCKS * QK_K)
+            .map(|_| {
+                let numerator = (next() % 20_001) as i32 - 10_000;
+                let denominator = next() % 997 + 3;
+                numerator as f32 / denominator as f32
+            })
+            .collect::<Vec<_>>();
+        let mut out = [0.0_f32; 1];
+
+        linear_q8_k_k_quant(
+            &input,
+            1,
+            GgmlKQuantMatrixRef {
+                input_features: BLOCKS * QK_K,
+                output_features: 1,
+                kind: GgmlKQuantKind::Q5K,
+                data: &weight,
+            },
+            &mut out,
+        )
+        .expect("pinned eight-block Q5_K x Q8_K tripwire must project");
+
+        // llama.cpp 856c3adac, x86 AVX2/FMA ggml_vec_dot_q5_K_q8_K.
+        assert_eq!(out[0].to_bits(), 0x48f1_f1cd);
     }
 
     #[test]

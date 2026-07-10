@@ -136,6 +136,7 @@ mod tests {
     struct LlamaDebugTensorSummary {
         shape: Vec<usize>,
         sum: f32,
+        edge_samples: Vec<Vec<f32>>,
     }
 
     fn tiny_metadata() -> GgufTokenizerMetadata {
@@ -438,6 +439,7 @@ common_debug_cb_eval:            result_output = (f32)    MUL_MAT(out{4, 8, 1, 1
             Some(&LlamaDebugTensorSummary {
                 shape: vec![4, 1, 1, 1],
                 sum: 2.5,
+                edge_samples: vec![vec![0.25, 0.5, 0.75, 1.0]],
             })
         );
         assert_eq!(
@@ -445,6 +447,7 @@ common_debug_cb_eval:            result_output = (f32)    MUL_MAT(out{4, 8, 1, 1
             Some(&LlamaDebugTensorSummary {
                 shape: vec![8, 1, 1, 1],
                 sum: 36.0,
+                edge_samples: vec![vec![1.0, 2.0, 3.0, 8.0]],
             })
         );
     }
@@ -480,7 +483,25 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
             Some(&LlamaDebugTensorSummary {
                 shape: vec![1, 1, 1, 1],
                 sum: 2.0,
+                edge_samples: Vec::new(),
             })
+        );
+    }
+
+    #[test]
+    fn llama_debug_edge_samples_compare_first_and_last_values_per_token() {
+        let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let samples = vec![
+            vec![0.0, 1.0, 2.0, 5.0, 6.0, 7.0],
+            vec![8.0, 9.0, 10.0, 13.0, 14.0, 15.0],
+        ];
+
+        assert_llama_debug_edge_samples_close(
+            "selected output",
+            &[8, 2, 1, 1],
+            &samples,
+            &values,
+            1e-6,
         );
     }
 
@@ -929,8 +950,8 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
 
         let (_config, model) = load_text_projected_gemma4_model_with_native_attention(&model_path);
         let trace = model
-            .prefill_with_trace(&tokens)
-            .expect("Gemma4 text prefill trace must run");
+            .prefill_prefix_with_trace(&tokens, 1)
+            .expect("Gemma4 layer-0 prefix trace must run");
 
         for (llama_name, ocelotl_name) in comparisons {
             let llama = llama_tensors
@@ -953,6 +974,26 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
                 llama.shape,
                 ocelotl.len()
             );
+            let uses_edge_samples = llama.shape.len() == 4
+                && llama.shape[2..] == [1, 1]
+                && !llama.edge_samples.is_empty();
+            if uses_edge_samples {
+                assert_llama_debug_edge_samples_close(
+                    ocelotl_name,
+                    &llama.shape,
+                    &llama.edge_samples,
+                    ocelotl,
+                    fixture.tolerance,
+                );
+                let mean_sum_diff = (sum_f32(ocelotl) - llama.sum).abs() / element_count as f32;
+                assert!(
+                    mean_sum_diff <= fixture.tolerance,
+                    "Gemma4 tensor {ocelotl_name} vs llama {llama_name} mean sum error {mean_sum_diff} exceeds tolerance {}; llama shape {:?}",
+                    fixture.tolerance,
+                    llama.shape
+                );
+                continue;
+            }
             let got = sum_f32(ocelotl);
             let diff = (got - llama.sum).abs();
             assert!(
@@ -1479,23 +1520,23 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
         }
 
         let mut summaries = BTreeMap::new();
-        let mut pending: Option<(String, Vec<usize>)> = None;
+        let mut pending: Option<(String, Vec<usize>, Vec<Vec<f32>>)> = None;
 
         for line in raw.lines() {
             if let Some((name, shape)) = parse_llama_debug_tensor_header(line, &expected)? {
                 if pending.is_some() {
-                    let pending_name = pending.as_ref().map(|(name, _)| name.as_str()).unwrap();
+                    let pending_name = pending.as_ref().map(|(name, _, _)| name.as_str()).unwrap();
                     return Err(format!(
                         "missing sum line for llama-debug tensor {pending_name}"
                     ));
                 }
-                pending = Some((name, shape));
+                pending = Some((name, shape, Vec::new()));
                 continue;
             }
 
             let trimmed = line.trim();
             if let Some(sum_text) = trimmed.strip_prefix("sum =") {
-                let Some((name, shape)) = pending.take() else {
+                let Some((name, shape, edge_samples)) = pending.take() else {
                     continue;
                 };
                 let sum = sum_text.trim().parse::<f32>().map_err(|err| {
@@ -1509,11 +1550,25 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
                         "non-finite llama-debug tensor sum {sum} for {name}"
                     ));
                 }
-                summaries.insert(name, LlamaDebugTensorSummary { shape, sum });
+                summaries.insert(
+                    name,
+                    LlamaDebugTensorSummary {
+                        shape,
+                        sum,
+                        edge_samples,
+                    },
+                );
+                continue;
+            }
+
+            if let Some((name, _, edge_samples)) = pending.as_mut() {
+                if let Some(sample_row) = parse_llama_debug_tensor_edge_row(line, name)? {
+                    edge_samples.push(sample_row);
+                }
             }
         }
 
-        if let Some((name, _)) = pending {
+        if let Some((name, _, _)) = pending {
             return Err(format!("missing sum line for llama-debug tensor {name}"));
         }
 
@@ -1526,6 +1581,35 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
         }
 
         Ok(summaries)
+    }
+
+    fn parse_llama_debug_tensor_edge_row(
+        line: &str,
+        tensor_name: &str,
+    ) -> std::result::Result<Option<Vec<f32>>, String> {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('[') || !trimmed.contains(',') {
+            return Ok(None);
+        }
+
+        let mut values = Vec::new();
+        for part in trimmed.split(',') {
+            let value = part.trim().trim_matches(['[', ']', ' ']);
+            if value.is_empty() || value == "..." {
+                continue;
+            }
+            let parsed = value.parse::<f32>().map_err(|err| {
+                format!("invalid llama-debug tensor edge sample {value:?} for {tensor_name}: {err}")
+            })?;
+            if !parsed.is_finite() {
+                return Err(format!(
+                    "non-finite llama-debug tensor edge sample {parsed} for {tensor_name}"
+                ));
+            }
+            values.push(parsed);
+        }
+
+        Ok((!values.is_empty()).then_some(values))
     }
 
     fn parse_llama_debug_tensor_header(
@@ -1572,6 +1656,58 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
         shape
             .iter()
             .try_fold(1_usize, |acc, dim| acc.checked_mul(*dim))
+    }
+
+    fn assert_llama_debug_edge_samples_close(
+        name: &str,
+        llama_shape: &[usize],
+        llama_samples: &[Vec<f32>],
+        ocelotl_values: &[f32],
+        tolerance: f32,
+    ) {
+        assert_eq!(
+            llama_shape.len(),
+            4,
+            "llama-debug tensor {name} must expose a four-dimensional shape"
+        );
+        assert_eq!(
+            &llama_shape[2..],
+            &[1, 1],
+            "selected-element comparison for {name} expects singleton outer dimensions"
+        );
+        let width = llama_shape[0];
+        let rows = llama_shape[1];
+        assert_eq!(
+            ocelotl_values.len(),
+            width * rows,
+            "Ocelotl tensor {name} length must match llama-debug shape"
+        );
+        assert_eq!(
+            llama_samples.len(),
+            rows,
+            "llama-debug tensor {name} must provide one edge-sample row per token"
+        );
+
+        let sample_indices = if width > 6 {
+            vec![0, 1, 2, width - 3, width - 2, width - 1]
+        } else {
+            (0..width).collect()
+        };
+        for (row, samples) in llama_samples.iter().enumerate() {
+            assert_eq!(
+                samples.len(),
+                sample_indices.len(),
+                "llama-debug tensor {name} row {row} edge-sample count changed"
+            );
+            for (&column, &want) in sample_indices.iter().zip(samples) {
+                let got = ocelotl_values[row * width + column];
+                let diff = (got - want).abs();
+                assert!(
+                    diff <= tolerance,
+                    "Gemma4 tensor {name}[row={row}, column={column}]: got {got}, llama.cpp {want}, diff {diff} exceeds tolerance {tolerance}"
+                );
+            }
+        }
     }
 
     fn ocelotl_slice_for_llama_shape<'a>(
