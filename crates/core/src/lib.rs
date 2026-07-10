@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod limits;
+pub use limits::{ArtifactLimits, RequestLimits};
+
 pub type Result<T> = std::result::Result<T, OcelotlError>;
 
 // ---------------------------------------------------------------------------
@@ -431,6 +434,62 @@ mod tests {
             .validate_page_table(&[0, 3])
             .expect_err("out-of-range physical pages must be rejected");
         assert!(format!("{out_of_range}").contains("out of range"));
+    }
+
+    #[test]
+    fn alpha_request_limits_bound_generation_and_audio() {
+        let limits = RequestLimits::default();
+
+        assert_eq!(limits.max_new_tokens, 4_096);
+        assert_eq!(limits.max_context_tokens, 131_072);
+        assert_eq!(limits.max_audio_samples, 480_000);
+        assert_eq!(limits.validate_generation(128, 256).unwrap(), 384);
+
+        let too_many_tokens = limits
+            .validate_generation(128, limits.max_new_tokens + 1)
+            .expect_err("alpha generation limit must reject oversized output");
+        assert!(matches!(too_many_tokens, OcelotlError::InvalidRequest(_)));
+
+        let too_much_audio = limits
+            .validate_audio_samples(limits.max_audio_samples + 1)
+            .expect_err("alpha audio limit must reject oversized input");
+        assert!(matches!(too_much_audio, OcelotlError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn request_limits_detect_context_overflow_before_allocation() {
+        let limits = RequestLimits::default();
+        let err = limits
+            .validate_generation(usize::MAX, 1)
+            .expect_err("overflowing context arithmetic must fail");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "context_tokens");
+                assert!(invalid.message.contains("overflow"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alpha_artifact_limits_bound_file_and_gguf_counts() {
+        let limits = ArtifactLimits::default();
+
+        assert_eq!(limits.max_file_bytes, 32 * 1024 * 1024 * 1024);
+        limits
+            .validate_gguf_counts(None, 720, 100)
+            .expect("selected Gemma4 descriptor counts must fit alpha defaults");
+
+        let too_many_tensors = limits
+            .validate_gguf_counts(None, limits.max_tensors + 1, 0)
+            .expect_err("oversized tensor count must be rejected");
+        assert!(matches!(too_many_tensors, OcelotlError::InvalidModel(_)));
+
+        let too_large = limits
+            .validate_file_bytes(None, limits.max_file_bytes + 1)
+            .expect_err("oversized artifact must be rejected");
+        assert!(matches!(too_large, OcelotlError::InvalidModel(_)));
     }
 }
 
