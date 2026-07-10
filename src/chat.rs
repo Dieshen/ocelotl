@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use ocelotl_core::{
-    GenerationOptions, InvalidModelError, InvalidRequestError, IoError, OcelotlError, Result,
-    RequestLimits, TokenId, TokenizerError, UnsupportedError,
+    GenerationOptions, InvalidModelError, InvalidRequestError, IoError, OcelotlError,
+    RequestLimits, Result, TokenId, TokenizerError, UnsupportedError,
 };
 use ocelotl_models::qwen::Qwen2_5Model;
 use ocelotl_tokenizer::{ChatMessage, ChatTemplate, JsonTokenizer, Tokenizer};
