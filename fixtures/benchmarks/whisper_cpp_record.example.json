@@ -1,7 +1,162 @@
 {
-  "fixture_version": 1,
+  "fixture_version": 2,
   "manifest_name": "whisper_tiny_en_sample_16khz_mono",
   "status": "completed",
+  "benchmark_plan": {
+    "warmup_iterations": 1,
+    "measured_iterations": 3,
+    "execution_order": "alternating"
+  },
+  "environment": {
+    "captured_at_utc": "2026-07-10T12:00:00.0000000Z",
+    "repository_revision": "0123456789abcdef0123456789abcdef01234567",
+    "repository_dirty": false,
+    "os": "Windows 11",
+    "architecture": "X64",
+    "powershell_version": "7.5.2",
+    "logical_processors": 8
+  },
+  "comparison": {
+    "status": "comparable",
+    "workload_match": true,
+    "model_family": "whisper-tiny.en",
+    "language": "en",
+    "decoding_mode": "greedy_no_fallback",
+    "output_equivalence": "normalized_transcript",
+    "output_match": true,
+    "audio_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "reason": null
+  },
+  "samples": [
+    {
+      "sequence": 0,
+      "phase": "warmup",
+      "iteration": 0,
+      "engine": "ocelotl",
+      "status": "completed",
+      "wall_time_ms": 1300,
+      "exit_code": 0,
+      "output": {
+        "token_count": 8,
+        "text": "example transcript",
+        "stdout_excerpt": "Ocelotl warmup",
+        "parsed_json": { "matches_expected": true, "timings_ms": { "total": 1250 } }
+      },
+      "validation_error": null
+    },
+    {
+      "sequence": 1,
+      "phase": "warmup",
+      "iteration": 0,
+      "engine": "whisper_cpp",
+      "status": "completed",
+      "wall_time_ms": 470,
+      "exit_code": 0,
+      "output": {
+        "token_count": null,
+        "text": "example transcript",
+        "stdout_excerpt": "whisper.cpp warmup",
+        "parsed_json": null
+      },
+      "validation_error": null
+    },
+    {
+      "sequence": 2,
+      "phase": "measured",
+      "iteration": 0,
+      "engine": "ocelotl",
+      "status": "completed",
+      "wall_time_ms": 1234,
+      "exit_code": 0,
+      "output": {
+        "token_count": 8,
+        "text": "example transcript",
+        "stdout_excerpt": "Ocelotl measured sample 0",
+        "parsed_json": { "matches_expected": true, "timings_ms": { "total": 1200 } }
+      },
+      "validation_error": null
+    },
+    {
+      "sequence": 3,
+      "phase": "measured",
+      "iteration": 0,
+      "engine": "whisper_cpp",
+      "status": "completed",
+      "wall_time_ms": 456,
+      "exit_code": 0,
+      "output": {
+        "token_count": null,
+        "text": "example transcript",
+        "stdout_excerpt": "whisper.cpp measured sample 0",
+        "parsed_json": null
+      },
+      "validation_error": null
+    },
+    {
+      "sequence": 4,
+      "phase": "measured",
+      "iteration": 1,
+      "engine": "whisper_cpp",
+      "status": "completed",
+      "wall_time_ms": 460,
+      "exit_code": 0,
+      "output": {
+        "token_count": null,
+        "text": "example transcript",
+        "stdout_excerpt": "whisper.cpp measured sample 1",
+        "parsed_json": null
+      },
+      "validation_error": null
+    },
+    {
+      "sequence": 5,
+      "phase": "measured",
+      "iteration": 1,
+      "engine": "ocelotl",
+      "status": "completed",
+      "wall_time_ms": 1220,
+      "exit_code": 0,
+      "output": {
+        "token_count": 8,
+        "text": "example transcript",
+        "stdout_excerpt": "Ocelotl measured sample 1",
+        "parsed_json": { "matches_expected": true, "timings_ms": { "total": 1190 } }
+      },
+      "validation_error": null
+    },
+    {
+      "sequence": 6,
+      "phase": "measured",
+      "iteration": 2,
+      "engine": "ocelotl",
+      "status": "completed",
+      "wall_time_ms": 1240,
+      "exit_code": 0,
+      "output": {
+        "token_count": 8,
+        "text": "example transcript",
+        "stdout_excerpt": "Ocelotl measured sample 2",
+        "parsed_json": { "matches_expected": true, "timings_ms": { "total": 1210 } }
+      },
+      "validation_error": null
+    },
+    {
+      "sequence": 7,
+      "phase": "measured",
+      "iteration": 2,
+      "engine": "whisper_cpp",
+      "status": "completed",
+      "wall_time_ms": 452,
+      "exit_code": 0,
+      "output": {
+        "token_count": null,
+        "text": "example transcript",
+        "stdout_excerpt": "whisper.cpp measured sample 2",
+        "parsed_json": null
+      },
+      "validation_error": null
+    }
+  ],
   "ocelotl": {
     "command": [
       "target/release/ocelotl.exe",
@@ -17,18 +172,35 @@
       "--tokenizer-path",
       "local-artifacts/whisper_tiny_en/tokenizer.json",
       "--cpu-kernel-mode",
-      "scalar"
+      "scalar",
+      "--cpu-threads",
+      "4",
+      "--backend",
+      "cpu"
     ],
     "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
+    "model_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
-    "threads": 4,
+    "effective_config": {
+      "backend": "cpu",
+      "threads": 4,
+      "cpu_kernel_mode": "scalar",
+      "comparison_mode": null
+    },
     "status": "completed",
-    "wall_time_ms": 1234,
-    "exit_code": 0,
-    "output": {
+    "aggregate": {
+      "sample_count": 3,
+      "min_wall_time_ms": 1220,
+      "mean_wall_time_ms": 1231.3333333333333,
+      "median_wall_time_ms": 1234.0,
+      "p95_wall_time_ms": 1240.0,
+      "max_wall_time_ms": 1240
+    },
+    "latest_output": {
       "token_count": 8,
       "text": "example transcript",
-      "stdout_excerpt": "generated Whisper token IDs must exactly match reference/expected_tokens.json"
+      "stdout_excerpt": "Ocelotl measured sample 2",
+      "parsed_json": { "matches_expected": true, "timings_ms": { "total": 1210 } }
     },
     "skip_reason": null
   },
@@ -41,6 +213,7 @@
       "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
       "-t",
       "4",
+      "-ng",
       "-otxt",
       "-nt",
       "-bs",
@@ -50,15 +223,28 @@
       "-nf"
     ],
     "model_path": "local-artifacts/whisper_cpp/ggml-tiny.en.bin",
+    "model_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
-    "threads": 4,
+    "effective_config": {
+      "backend": "cpu",
+      "threads": 4,
+      "cpu_kernel_mode": null,
+      "comparison_mode": "greedy_no_fallback"
+    },
     "status": "completed",
-    "wall_time_ms": 456,
-    "exit_code": 0,
-    "output": {
+    "aggregate": {
+      "sample_count": 3,
+      "min_wall_time_ms": 452,
+      "mean_wall_time_ms": 456.0,
+      "median_wall_time_ms": 456.0,
+      "p95_wall_time_ms": 460.0,
+      "max_wall_time_ms": 460
+    },
+    "latest_output": {
       "token_count": null,
       "text": "example transcript",
-      "stdout_excerpt": "example transcript"
+      "stdout_excerpt": "whisper.cpp measured sample 2",
+      "parsed_json": null
     },
     "skip_reason": null
   }

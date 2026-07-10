@@ -1,10 +1,19 @@
 {
-  "fixture_version": 1,
+  "fixture_version": 2,
   "name": "whisper_tiny_en_sample_16khz_mono",
   "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
   "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
+  "model_family": "whisper-tiny.en",
+  "language": "en",
+  "decoding_mode": "greedy_no_fallback",
   "threads": 4,
+  "warmup_iterations": 1,
+  "measured_iterations": 10,
+  "execution_order": "alternating",
+  "output_equivalence": "normalized_transcript",
   "ocelotl": {
+    "backend": "cpu",
+    "cpu_kernel_mode": "scalar",
     "command": [
       "target/release/ocelotl.exe",
       "bench-whisper-transcribe",
@@ -19,7 +28,11 @@
       "--tokenizer-path",
       "local-artifacts/whisper_tiny_en/tokenizer.json",
       "--cpu-kernel-mode",
-      "scalar"
+      "scalar",
+      "--cpu-threads",
+      "4",
+      "--backend",
+      "cpu"
     ],
     "model_path": "local-artifacts/whisper_tiny_en/model.safetensors",
     "audio_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
@@ -33,6 +46,8 @@
   },
   "whisper_cpp": {
     "binary": "local-artifacts/whisper_cpp/whisper-cli.exe",
+    "transcript_path": "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav.txt",
+    "backend": "cpu",
     "comparison_mode": "greedy_no_fallback",
     "command": [
       "local-artifacts/whisper_cpp/whisper-cli.exe",
@@ -42,6 +57,7 @@
       "local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav",
       "-t",
       "4",
+      "-ng",
       "-otxt",
       "-nt",
       "-bs",

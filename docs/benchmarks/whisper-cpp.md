@@ -65,16 +65,29 @@ The default manifest fixture is:
 fixtures/benchmarks/whisper_cpp_manifest.example.json
 ```
 
-It names:
+The version 2 manifest names:
 
 - `model_path`: the Ocelotl safetensors model path.
 - `audio_path`: the shared WAV input path.
-- `threads`: the thread count passed to whisper.cpp.
+- `model_family`, `language`, and `decoding_mode`: the shared work contract.
+- `threads`: the thread count explicitly passed to both engines.
+- `warmup_iterations` and `measured_iterations`: the default sampling plan.
+- `execution_order = "alternating"`: the A/B order policy.
+- `output_equivalence = "normalized_transcript"`: the comparability check.
+- `ocelotl.backend` and `ocelotl.cpu_kernel_mode`: the configuration that
+  must appear in both the command and Ocelotl's emitted JSON.
 - `ocelotl.command`: the dedicated Ocelotl transcription timing hook.
 - `ocelotl.required_inputs`: the local Ocelotl artifact files checked before
   invoking the hook.
 - `whisper_cpp.binary`: the whisper.cpp executable to check before running.
+- `whisper_cpp.backend`: `cpu` for the committed equal-resource comparison.
+- `whisper_cpp.transcript_path`: the `-otxt` output used for equivalence.
 - `whisper_cpp.command`: the exact whisper.cpp invocation.
+
+The runner rejects a manifest before execution when `--cpu-threads`, `-t`,
+backend, kernel mode, or comparison-mode metadata disagrees with the commands.
+The CPU whisper.cpp command must include `-ng`, so a locally GPU-enabled build
+cannot silently make an equal-resource CPU record incomparable.
 
 The Ocelotl side now runs a dedicated binary hook outside the Rust test harness:
 
@@ -85,7 +98,9 @@ target/release/ocelotl.exe bench-whisper-transcribe `
   --audio-path local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav `
   --expected-tokens-path local-artifacts/whisper_tiny_en/reference/expected_tokens.json `
   --tokenizer-path local-artifacts/whisper_tiny_en/tokenizer.json `
-  --cpu-kernel-mode scalar
+  --cpu-kernel-mode scalar `
+  --cpu-threads 4 `
+  --backend cpu
 ```
 
 The hook loads the Ocelotl safetensors bundle, decodes the shared WAV input,
@@ -103,7 +118,7 @@ and performance probe.
 The whisper.cpp side of the example manifest runs:
 
 ```powershell
-local-artifacts/whisper_cpp/whisper-cli.exe -m local-artifacts/whisper_cpp/ggml-tiny.en.bin -f local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav -t 4 -otxt -nt -bs 1 -bo 1 -nf
+local-artifacts/whisper_cpp/whisper-cli.exe -m local-artifacts/whisper_cpp/ggml-tiny.en.bin -f local-artifacts/whisper_tiny_en/reference/sample_16khz_mono.wav -t 4 -ng -otxt -nt -bs 1 -bo 1 -nf
 ```
 
 The `-bs 1 -bo 1 -nf` flags pin a greedy, no-fallback whisper.cpp comparison.
@@ -120,11 +135,14 @@ pwsh -NoProfile -File tools/whisper-cpp-bench.ps1 `
   -DryRun
 ```
 
-Run the opt-in benchmark and write a local record:
+Run the opt-in benchmark and write a local record. Manifest defaults can be
+overridden for an exploratory run without editing the committed fixture:
 
 ```powershell
 pwsh -NoProfile -File tools/whisper-cpp-bench.ps1 `
   -ManifestPath fixtures/benchmarks/whisper_cpp_manifest.example.json `
+  -WarmupIterations 2 `
+  -MeasuredIterations 15 `
   -OutputPath local-artifacts/benchmarks/whisper_cpp_tiny_en.json
 ```
 
@@ -137,7 +155,7 @@ does not fail the default workflow. It emits a JSON record with:
 
 - top-level `status = "skipped"`;
 - `whisper_cpp.status = "skipped"`;
-- null `wall_time_ms` and `exit_code` for the skipped target;
+- an empty `samples` array and null aggregate for the skipped target;
 - a `skip_reason` that names the missing binary and this document.
 
 The committed fixture
@@ -152,10 +170,24 @@ are expected on machines that have not prepared `local-artifacts/`.
 
 ## Record Shape
 
-A completed benchmark record names both command lines, both model paths, the
-shared audio path, thread count, exit code, wall-clock time in milliseconds, and
-an output summary. The Ocelotl stdout JSON includes `cpu_kernel_mode` plus
-`resident_model_ms` and `timings_ms`.
+A completed benchmark record includes:
+
+- the actual warmup/measurement plan and alternating order;
+- timestamp, Git revision/dirty state, OS, architecture, PowerShell version,
+  logical processor count, and repository/manifest paths;
+- shared-audio SHA-256 plus per-engine model SHA-256 values;
+- every warmup and measured sample in execution order, with engine, phase,
+  iteration, exit code, wall-clock time, output excerpt, and parsed Ocelotl JSON;
+- per-engine mean, median, p95, minimum, and maximum wall time over measured
+  samples only;
+- the effective backend/thread/kernel or comparison-mode configuration;
+- a comparison decision that is `comparable` only when shared work metadata
+  matches, every Ocelotl sample passes exact expected-token parity, and both
+  engines produce one stable matching normalized transcript.
+
+An output mismatch makes the record `incomparable`; it does not make
+whisper.cpp a correctness oracle. The Ocelotl stdout JSON remains the source of
+`cpu_kernel_mode`, `cpu_threads`, `resident_model_ms`, and `timings_ms`.
 
 `resident_model_ms` separates the loaded-model product path from benchmark
 setup:
@@ -198,9 +230,11 @@ token: `decode_token` is the end-to-end per-token bucket, `decode_sample` is
 masked greedy selection over the current logits, and `decode_append` is the
 state-advance call for non-final tokens (`0` when no append is needed).
 
-The output summary is intentionally loose at W-ASR.13/W-ASR.20: it may carry
-token count, text, or a stdout excerpt depending on the target. Do not compare
-transcripts here as a correctness gate.
+Ocelotl's parsed JSON is retained per iteration so stage timing distributions
+can be analyzed without scraping the truncated diagnostic excerpt. whisper.cpp
+transcript text comes from the freshly written `-otxt` path named by the
+manifest. Transcript equivalence is a work-comparability gate, not the
+canonical Ocelotl correctness oracle.
 
 ## Current Limits
 
@@ -209,7 +243,7 @@ transcripts here as a correctness gate.
 - The Ocelotl and whisper.cpp model files use different on-disk formats, so the
   manifest must name both paths even when they represent the same tiny.en model.
 - The runner records wall-clock command time for both sides. Only the Ocelotl
-  side currently emits stage-level timings.
+  side currently emits structured stage-level timings.
 - No CPU performance parity claim exists yet. The 2026-05-12 tiny.en local run
   after encoded-audio reuse measured Ocelotl at 14,190 ms and whisper.cpp at
   482 ms (about 29.4x slower). Before encoder reuse, the same local comparison
@@ -626,9 +660,9 @@ The example manifest now includes:
 --tokenizer-path local-artifacts/whisper_tiny_en/tokenizer.json
 ```
 
-`tools/whisper-cpp-bench.ps1` also parses Ocelotl's JSON stdout into benchmark
-record `output.token_count` and `output.text`, while retaining a truncated
-`stdout_excerpt` for diagnostics.
+`tools/whisper-cpp-bench.ps1` parses Ocelotl's JSON stdout into every sample's
+`output.parsed_json`, `output.token_count`, and `output.text`, while retaining a
+truncated `stdout_excerpt` for diagnostics.
 
 A local tiny.en release proof with `--tokenizer-path` passed exact token parity
 and emitted:
@@ -643,8 +677,8 @@ timings_ms.text_decode = 0
 The text mirrors the current expected-token fixture, including its missing
 comma after "you"; exact token parity remains the correctness gate.
 
-A full local benchmark-runner pass also populated the Ocelotl record summary:
-`output.token_count = 26` and the same decoded `output.text`.
+A full local benchmark-runner pass also populated the Ocelotl engine summary:
+`latest_output.token_count = 26` and the same decoded `latest_output.text`.
 
 ## W-ASR.38 Multi-Threaded `linear_out_by_in`
 
