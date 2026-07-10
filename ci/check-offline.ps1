@@ -1,6 +1,6 @@
 # M2.8 — Offline-by-default CI gate.
 #
-# Scans the Rust workspace for patterns that would let a default
+# Scans every Rust workspace member for patterns that would let a default
 # `cargo test --workspace` run reach the network. Fails (exit 1) if any
 # disallowed pattern is found in production source or in non-`#[ignore]`'d
 # tests.
@@ -36,12 +36,45 @@ $ErrorActionPreference = 'Stop'
 
 # Resolve repo root: this script lives in <repo>/ci/check-offline.ps1.
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+$RootManifest = Join-Path $RepoRoot 'Cargo.toml'
 $CratesDir = Join-Path $RepoRoot 'crates'
 
-if (-not (Test-Path $CratesDir)) {
+if (-not (Test-Path -LiteralPath $RootManifest -PathType Leaf)) {
+    Write-Error "workspace Cargo.toml not found at $RootManifest — running from wrong directory?"
+    exit 2
+}
+
+if (-not (Test-Path -LiteralPath $CratesDir -PathType Container)) {
     Write-Error "crates/ not found at $CratesDir — running from wrong directory?"
     exit 2
 }
+
+# The root package is itself a workspace member. Keep it explicit so root
+# dependencies, inline tests, integration tests, examples, benches, and build
+# scripts receive the same policy as packages under crates/.
+$CargoManifests = @(
+    Get-Item -LiteralPath $RootManifest
+    Get-ChildItem -Path $CratesDir -Recurse -Filter 'Cargo.toml' -File
+)
+
+$RustSourceRoots = @(
+    (Join-Path $RepoRoot 'src')
+    (Join-Path $RepoRoot 'tests')
+    (Join-Path $RepoRoot 'benches')
+    (Join-Path $RepoRoot 'examples')
+    $CratesDir
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Container }
+
+$RustFiles = @(
+    foreach ($sourceRoot in $RustSourceRoots) {
+        Get-ChildItem -Path $sourceRoot -Recurse -Filter '*.rs' -File
+    }
+
+    $rootBuildScript = Join-Path $RepoRoot 'build.rs'
+    if (Test-Path -LiteralPath $rootBuildScript -PathType Leaf) {
+        Get-Item -LiteralPath $rootBuildScript
+    }
+) | Sort-Object -Property FullName -Unique
 
 # --- Forbidden patterns ---------------------------------------------------
 #
@@ -110,8 +143,8 @@ $ForbiddenCargoDeps = @(
 
 $Violations = New-Object System.Collections.Generic.List[string]
 
-# Scan Cargo.toml files.
-Get-ChildItem -Path $CratesDir -Recurse -Filter 'Cargo.toml' -File | ForEach-Object {
+# Scan the root and every crate Cargo.toml.
+$CargoManifests | ForEach-Object {
     $cargoPath = $_.FullName
     $relPath = $cargoPath.Substring($RepoRoot.Length).TrimStart('\', '/')
     $lines = Get-Content -LiteralPath $cargoPath
@@ -134,7 +167,7 @@ Get-ChildItem -Path $CratesDir -Recurse -Filter 'Cargo.toml' -File | ForEach-Obj
 
 # --- Source scan ----------------------------------------------------------
 #
-# For each *.rs under crates/, find lines matching any forbidden pattern.
+# For each workspace-member Rust source, find lines matching any forbidden pattern.
 # If the match is inside a test, verify the enclosing test is `#[ignore]`'d.
 # If the match is in production (non-test) code, fail unconditionally.
 
@@ -200,7 +233,7 @@ function Test-IsAllowedDocComment {
     return ($Line -match '^\s*///' -or $Line -match '^\s*//!')
 }
 
-Get-ChildItem -Path $CratesDir -Recurse -Filter '*.rs' -File | ForEach-Object {
+$RustFiles | ForEach-Object {
     $rsPath = $_.FullName
     $relPath = $rsPath.Substring($RepoRoot.Length).TrimStart('\', '/')
     $lines = Get-Content -LiteralPath $rsPath
