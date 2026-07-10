@@ -2,7 +2,9 @@
 
 use std::{f32::consts::PI, sync::OnceLock};
 
-use ocelotl_core::{OcelotlError, Result, UnsupportedError};
+use ocelotl_core::{
+    InvalidRequestError, OcelotlError, RequestLimits, Result, RuntimeError, UnsupportedError,
+};
 
 pub const WHISPER_SAMPLE_RATE_HZ: u32 = 16_000;
 pub const WHISPER_FFT_SIZE: usize = 400;
@@ -54,7 +56,17 @@ pub fn validate_audio_metadata(metadata: AudioMetadata) -> Result<()> {
 }
 
 pub fn log_mel_spectrogram(audio: &[f32], metadata: AudioMetadata) -> Result<LogMelSpectrogram> {
+    log_mel_spectrogram_with_limits(audio, metadata, RequestLimits::default())
+}
+
+/// Compute Whisper log-mel features under an explicit deployment policy.
+pub fn log_mel_spectrogram_with_limits(
+    audio: &[f32],
+    metadata: AudioMetadata,
+    limits: RequestLimits,
+) -> Result<LogMelSpectrogram> {
     validate_audio_metadata(metadata)?;
+    limits.validate_audio_samples(audio.len())?;
 
     if audio.len() < WHISPER_FFT_SIZE {
         return Err(OcelotlError::InvalidRequest(
@@ -67,11 +79,22 @@ pub fn log_mel_spectrogram(audio: &[f32], metadata: AudioMetadata) -> Result<Log
         ));
     }
 
-    let centered = reflect_pad_centered(audio);
+    let centered = reflect_pad_centered(audio)?;
     let frames = stft_frame_count(centered.len()).saturating_sub(1);
     let window = hann_window();
     let mel_filters = mel_filterbank();
-    let mut values = Vec::with_capacity(frames * WHISPER_MEL_BINS);
+    let value_count = frames.checked_mul(WHISPER_MEL_BINS).ok_or_else(|| {
+        invalid_request(
+            "audio_samples",
+            "Whisper log-mel output length overflows usize",
+        )
+    })?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(value_count).map_err(|source| {
+        OcelotlError::Runtime(RuntimeError {
+            message: format!("failed to reserve Whisper log-mel output: {source}"),
+        })
+    })?;
 
     for frame_idx in 0..frames {
         let start = frame_idx * WHISPER_HOP_LENGTH;
@@ -96,9 +119,54 @@ pub fn log_mel_spectrogram(audio: &[f32], metadata: AudioMetadata) -> Result<Log
     })
 }
 
-fn reflect_pad_centered(audio: &[f32]) -> Vec<f32> {
+/// Maximum audio samples whose two convolution stages fit the model context.
+pub fn max_audio_samples_for_context(audio_context_length: usize) -> Result<usize> {
+    if audio_context_length == 0 {
+        return Err(invalid_request(
+            "audio_context_length",
+            "must be greater than zero",
+        ));
+    }
+    audio_context_length
+        .checked_mul(2)
+        .and_then(|frames| frames.checked_mul(WHISPER_HOP_LENGTH))
+        .ok_or_else(|| {
+            invalid_request(
+                "audio_context_length",
+                "Whisper audio context sample ceiling overflows usize",
+            )
+        })
+}
+
+/// Reject audio that cannot fit the model encoder before preprocessing work.
+pub fn validate_audio_samples_for_context(
+    audio_samples: usize,
+    audio_context_length: usize,
+) -> Result<()> {
+    let max_audio_samples = max_audio_samples_for_context(audio_context_length)?;
+    if audio_samples > max_audio_samples {
+        return Err(invalid_request(
+            "audio_samples",
+            format!(
+                "audio sample count {audio_samples} exceeds {max_audio_samples} derived from audio_context_length {audio_context_length}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn reflect_pad_centered(audio: &[f32]) -> Result<Vec<f32>> {
     let pad = WHISPER_FFT_SIZE / 2;
-    let mut centered = Vec::with_capacity(audio.len() + 2 * pad);
+    let centered_len = audio
+        .len()
+        .checked_add(2 * pad)
+        .ok_or_else(|| invalid_request("audio_samples", "reflect padding overflows usize"))?;
+    let mut centered = Vec::new();
+    centered.try_reserve_exact(centered_len).map_err(|source| {
+        OcelotlError::Runtime(RuntimeError {
+            message: format!("failed to reserve Whisper reflect padding: {source}"),
+        })
+    })?;
 
     centered.extend(audio[1..=pad].iter().rev().copied());
     centered.extend_from_slice(audio);
@@ -109,7 +177,7 @@ fn reflect_pad_centered(audio: &[f32]) -> Vec<f32> {
             .copied(),
     );
 
-    centered
+    Ok(centered)
 }
 
 fn stft_frame_count(samples: usize) -> usize {
@@ -209,6 +277,13 @@ fn apply_whisper_log_mel_postprocess(values: &mut [f32]) {
         *value = value.max(max_floor);
         *value = (*value + 4.0) / 4.0;
     }
+}
+
+fn invalid_request(field: impl Into<String>, message: impl Into<String>) -> OcelotlError {
+    OcelotlError::InvalidRequest(InvalidRequestError {
+        field: field.into(),
+        message: message.into(),
+    })
 }
 
 fn hz_to_slaney_mel(hz: f32) -> f32 {
@@ -343,6 +418,40 @@ mod tests {
         apply_whisper_log_mel_postprocess(&mut values);
 
         assert_close(&values, &[-1.0, -1.0, 0.0, 1.0], 1e-6);
+    }
+
+    #[test]
+    fn audio_context_derives_a_checked_preprocessing_sample_ceiling() {
+        assert_eq!(max_audio_samples_for_context(1_500).unwrap(), 480_000);
+
+        let err = max_audio_samples_for_context(usize::MAX)
+            .expect_err("overflowing audio context arithmetic must fail");
+        assert!(matches!(err, OcelotlError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn log_mel_with_limits_rejects_audio_before_padding_or_allocation() {
+        let limits = RequestLimits {
+            max_audio_samples: WHISPER_FFT_SIZE,
+            ..RequestLimits::default()
+        };
+        let audio = vec![0.0; WHISPER_FFT_SIZE + 1];
+        let err = log_mel_spectrogram_with_limits(
+            &audio,
+            AudioMetadata {
+                sample_rate_hz: WHISPER_SAMPLE_RATE_HZ,
+                channels: 1,
+            },
+            limits,
+        )
+        .expect_err("audio above the configured ceiling must fail");
+
+        match err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "audio_samples");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     fn tiny_waveform_fixture() -> Vec<f32> {

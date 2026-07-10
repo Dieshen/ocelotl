@@ -66,6 +66,7 @@ impl WhisperModel {
         WhisperEncoderTimings,
     )> {
         validate_audio_request(&self.config, log_mel, mel_frames)?;
+        validate_mel_frames_for_audio_context(mel_frames, self.config.audio_context_length)?;
 
         let encoder_started = Instant::now();
         let (encoded_d, frames, mut encoder_detail) =
@@ -114,6 +115,23 @@ impl WhisperModel {
             encoder_detail,
         ))
     }
+}
+
+fn validate_mel_frames_for_audio_context(
+    mel_frames: usize,
+    audio_context_length: usize,
+) -> Result<()> {
+    let conv1_frames = conv_output_len(mel_frames, CONV_KERNEL_WIDTH, 1, 1)?;
+    let encoded_frames = conv_output_len(conv1_frames, CONV_KERNEL_WIDTH, 2, 1)?;
+    if encoded_frames > audio_context_length {
+        return Err(invalid_request(
+            "mel_frames",
+            &format!(
+                "convolution output length {encoded_frames} exceeds audio_context_length {audio_context_length}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Run the encoder forward pass. Returns the device-resident encoder output
@@ -396,4 +414,19 @@ fn precompute_cross_attention(
         caches.push(WhisperCrossAttentionCache { key, value });
     }
     Ok(caches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoder_context_preflight_rejects_oversized_mel_before_convolution() {
+        validate_mel_frames_for_audio_context(3_000, 1_500)
+            .expect("standard Whisper frame count must fit");
+
+        let err = validate_mel_frames_for_audio_context(3_001, 1_500)
+            .expect_err("one frame beyond the model context must fail");
+        assert!(format!("{err}").contains("audio_context_length"));
+    }
 }
