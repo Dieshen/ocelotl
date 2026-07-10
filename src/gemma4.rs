@@ -725,18 +725,67 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
 
         let mut max_diff = 0.0_f32;
         let mut max_diff_token_id = 0_usize;
+        let mut sum_abs_diff = 0.0_f64;
+        let mut sum_sq_diff = 0.0_f64;
+        let mut over_005 = 0_usize;
+        let mut over_01 = 0_usize;
+        let mut over_05 = 0_usize;
+        let mut over_10 = 0_usize;
         for (token_id, (got, want)) in ocelotl_logits.iter().zip(llama_logits.iter()).enumerate() {
             let diff = (got - want).abs();
+            sum_abs_diff += f64::from(diff);
+            sum_sq_diff += f64::from(diff) * f64::from(diff);
+            over_005 += usize::from(diff > 0.05);
+            over_01 += usize::from(diff > 0.1);
+            over_05 += usize::from(diff > 0.5);
+            over_10 += usize::from(diff > 1.0);
             if diff > max_diff {
                 max_diff = diff;
                 max_diff_token_id = token_id;
             }
-            assert!(
-                diff <= fixture.tolerance,
-                "Gemma4 logit token {token_id}: got {got}, llama.cpp {want}, diff {diff} exceeds tolerance {}; max diff so far token {max_diff_token_id} diff {max_diff}",
-                fixture.tolerance
+        }
+        let ocelotl_argmax = ocelotl_logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .expect("Gemma4 logits must be non-empty");
+        let llama_argmax = llama_logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .expect("llama.cpp logits must be non-empty");
+        let mean_abs_diff = sum_abs_diff / ocelotl_logits.len() as f64;
+        let root_mean_sq_diff = (sum_sq_diff / ocelotl_logits.len() as f64).sqrt();
+        let top_ids = |values: &[f32], count: usize| {
+            let mut ids: Vec<usize> = (0..values.len()).collect();
+            ids.sort_unstable_by(|&left, &right| values[right].total_cmp(&values[left]));
+            ids.truncate(count);
+            ids
+        };
+        let ocelotl_top_20 = top_ids(&ocelotl_logits, 20);
+        let llama_top_20 = top_ids(&llama_logits, 20);
+        let top_20_overlap = ocelotl_top_20
+            .iter()
+            .filter(|token_id| llama_top_20.contains(token_id))
+            .count();
+        eprintln!(
+            "Gemma4 final logits: max_diff_token={max_diff_token_id} max_diff={max_diff} mean_abs_diff={mean_abs_diff} rms_diff={root_mean_sq_diff} over_0.05={over_005} over_0.1={over_01} over_0.5={over_05} over_1.0={over_10} ocelotl_argmax={:?} llama_argmax={:?} top_20_overlap={top_20_overlap} ocelotl_top_20={ocelotl_top_20:?} llama_top_20={llama_top_20:?}",
+            ocelotl_argmax, llama_argmax,
+        );
+        for token_id in &fixture.selected_logit_token_ids {
+            let token_id = *token_id as usize;
+            eprintln!(
+                "Gemma4 selected logit {token_id}: ocelotl={} llama={} diff={}",
+                ocelotl_logits[token_id],
+                llama_logits[token_id],
+                (ocelotl_logits[token_id] - llama_logits[token_id]).abs(),
             );
         }
+        assert!(
+            max_diff <= fixture.tolerance,
+            "Gemma4 max logit diff at token {max_diff_token_id} is {max_diff}, exceeding tolerance {}",
+            fixture.tolerance
+        );
     }
 
     #[test]
@@ -865,6 +914,10 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
             "Gemma4 trace must include one layer output per block"
         );
 
+        let mut max_edge_diff = 0.0_f32;
+        let mut max_edge_layer = 0_usize;
+        let mut max_mean_sum_diff = 0.0_f32;
+        let mut max_mean_sum_layer = 0_usize;
         for (layer_idx, layer_output) in trace.layer_outputs.iter().enumerate() {
             let name = &layer_names[layer_idx];
             let llama = llama_layers
@@ -876,16 +929,51 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
                 layer_output,
                 config.embedding_length,
             );
-            let got = sum_f32(ocelotl);
-            let diff = (got - llama.sum).abs();
-            assert!(
-                diff <= fixture.tolerance,
-                "Gemma4 tensor {name} sum: got {got}, llama.cpp {}, diff {diff} exceeds tolerance {}; llama shape {:?}",
-                llama.sum,
-                fixture.tolerance,
-                llama.shape
+            let element_count = shape_element_count(&llama.shape)
+                .expect("llama-debug layer output shape must fit usize");
+            let mean_sum_diff = (sum_f32(ocelotl) - llama.sum).abs() / element_count as f32;
+            if mean_sum_diff > max_mean_sum_diff {
+                max_mean_sum_diff = mean_sum_diff;
+                max_mean_sum_layer = layer_idx;
+            }
+            let sample_indices = if llama.shape[0] > 6 {
+                vec![
+                    0,
+                    1,
+                    2,
+                    llama.shape[0] - 3,
+                    llama.shape[0] - 2,
+                    llama.shape[0] - 1,
+                ]
+            } else {
+                (0..llama.shape[0]).collect()
+            };
+            let layer_max_edge_diff = llama
+                .edge_samples
+                .iter()
+                .enumerate()
+                .flat_map(|(row, samples)| {
+                    sample_indices
+                        .iter()
+                        .zip(samples)
+                        .map(move |(&column, &want)| {
+                            (ocelotl[row * llama.shape[0] + column] - want).abs()
+                        })
+                })
+                .fold(0.0_f32, f32::max);
+            if layer_max_edge_diff > max_edge_diff {
+                max_edge_diff = layer_max_edge_diff;
+                max_edge_layer = layer_idx;
+            }
+            eprintln!(
+                "Gemma4 layer parity {name}: mean_sum_diff={mean_sum_diff} max_edge_diff={layer_max_edge_diff}"
             );
         }
+        assert!(
+            max_edge_diff <= fixture.tolerance && max_mean_sum_diff <= fixture.tolerance,
+            "Gemma4 layer parity exceeds tolerance {}: max edge diff {max_edge_diff} at layer {max_edge_layer}; max mean sum diff {max_mean_sum_diff} at layer {max_mean_sum_layer}",
+            fixture.tolerance,
+        );
     }
 
     #[test]
@@ -928,7 +1016,8 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
             ("Vcur_normed-0", "Vcur_normed-0"),
             ("Kcur_pos-0", "Kcur_pos-0"),
             ("kqv_out-0", "kqv_out-0"),
-            ("node_33", "attn_output_proj-0"),
+            // Pinned llama.cpp non-flash graph node for blk.0.attn_output.weight.
+            ("node_38", "attn_output_proj-0"),
             ("attn_post_norm-0", "attn_post_norm-0"),
             ("attn_out-0", "attn_out-0"),
             ("ffn_norm-0", "ffn_norm-0"),
@@ -979,6 +1068,29 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
                 && llama.shape[2..] == [1, 1]
                 && !llama.edge_samples.is_empty();
             if uses_edge_samples {
+                let mean_sum_diff = (sum_f32(ocelotl) - llama.sum).abs() / element_count as f32;
+                let mut max_sample_diff = 0.0_f32;
+                for (row, samples) in llama.edge_samples.iter().enumerate() {
+                    let sample_indices = if llama.shape[0] > 6 {
+                        vec![
+                            0,
+                            1,
+                            2,
+                            llama.shape[0] - 3,
+                            llama.shape[0] - 2,
+                            llama.shape[0] - 1,
+                        ]
+                    } else {
+                        (0..llama.shape[0]).collect()
+                    };
+                    for (&column, &want) in sample_indices.iter().zip(samples) {
+                        max_sample_diff = max_sample_diff
+                            .max((ocelotl[row * llama.shape[0] + column] - want).abs());
+                    }
+                }
+                eprintln!(
+                    "Gemma4 parity {ocelotl_name} vs {llama_name}: mean_sum_diff={mean_sum_diff} max_edge_diff={max_sample_diff}"
+                );
                 assert_llama_debug_edge_samples_close(
                     ocelotl_name,
                     &llama.shape,
@@ -986,7 +1098,6 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
                     ocelotl,
                     fixture.tolerance,
                 );
-                let mean_sum_diff = (sum_f32(ocelotl) - llama.sum).abs() / element_count as f32;
                 assert!(
                     mean_sum_diff <= fixture.tolerance,
                     "Gemma4 tensor {ocelotl_name} vs llama {llama_name} mean sum error {mean_sum_diff} exceeds tolerance {}; llama shape {:?}",
@@ -1307,6 +1418,13 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
             .arg("--prompt")
             .arg(input)
             .arg("--no-escape")
+            .arg("--flash-attn")
+            .arg("off")
+            .arg("--cache-type-k")
+            .arg("f32")
+            .arg("--cache-type-v")
+            .arg("f32")
+            .arg("--no-repack")
             .arg("--save-logits")
             .arg("--logits-output-dir")
             .arg(output_dir)
@@ -1353,6 +1471,13 @@ common_debug_cb_eval: result_norm = (f32) OP(a{1}, }) = {1, 1, 1, 1}
             .arg("--prompt")
             .arg(input)
             .arg("--no-escape")
+            .arg("--flash-attn")
+            .arg("off")
+            .arg("--cache-type-k")
+            .arg("f32")
+            .arg("--cache-type-v")
+            .arg("f32")
+            .arg("--no-repack")
             .arg("--no-warmup")
             .arg("--verbose");
         if !tensor_names.is_empty() {

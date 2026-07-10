@@ -86,18 +86,29 @@ pub fn silu_inplace(x: &mut [f32]) {
     }
 }
 
-/// GELU using ggml's `GGML_GLU_OP_GEGLU` tanh approximation.
+/// GELU using ggml's CPU F32-to-FP16 lookup-table semantics.
 ///
-/// This intentionally matches llama.cpp/ggml's GEGLU path for Gemma4 instead of
-/// the exact-erf GELU variant used by some other runtimes.
+/// ggml rounds the input to FP16, evaluates the tanh approximation used to
+/// populate its table, and rounds the result back through FP16. Matching both
+/// roundings is material for wide Gemma4 FFNs. Values outside `[-10, 10]` use
+/// ggml's exact saturation branches.
 pub fn gelu_tanh_inplace(x: &mut [f32]) {
     const GELU_COEF_A: f32 = 0.044_715;
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
 
     for v in x.iter_mut() {
-        let z = *v;
-        *v =
+        if *v <= -10.0 {
+            *v = 0.0;
+            continue;
+        }
+        if *v >= 10.0 {
+            continue;
+        }
+
+        let z = half::f16::from_f32(*v).to_f32();
+        let gelu =
             0.5_f32 * z * (1.0_f32 + (SQRT_2_OVER_PI * z * (1.0_f32 + GELU_COEF_A * z * z)).tanh());
+        *v = half::f16::from_f32(gelu).to_f32();
     }
 }
 
@@ -418,11 +429,17 @@ mod tests {
     }
 
     #[test]
-    fn gelu_tanh_inplace_matches_ggml_formula() {
+    fn gelu_tanh_inplace_matches_ggml_fp16_lookup_table() {
         let mut x = [0.0_f32, 1.0, -1.0, 2.0, 3.0];
         gelu_tanh_inplace(&mut x);
 
-        let expected = [0.0_f32, 0.841_192, -0.158_808, 1.954_597_7, 2.996_362_7];
+        let expected = [
+            0.0_f32,
+            0.841_308_6,
+            -0.158_813_48,
+            1.955_078_1,
+            2.996_093_8,
+        ];
         for (got, want) in x.iter().zip(expected.iter()) {
             assert!(
                 (got - want).abs() < 1e-6,
@@ -528,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn mlp_gated_gelu_tiny_fixture_matches_ggml_tanh_gelu() {
+    fn mlp_gated_gelu_tiny_fixture_matches_ggml_fp16_lookup() {
         let x = [1.0_f32, 2.0];
         let gate_w = [1.0_f32, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0];
         let up_w = [1.0_f32, 1.0, 0.0, 2.0, 1.0, -1.0, 1.0, 0.0];
@@ -552,7 +569,7 @@ mod tests {
         )
         .expect("well-formed mlp_gated_gelu must succeed");
 
-        let expected = [8.516_301_f32, -2.272_213_7];
+        let expected = [8.516_113_f32, -2.272_705];
         for (got, want) in out.iter().zip(expected.iter()) {
             assert!(
                 (got - want).abs() < 1e-5,

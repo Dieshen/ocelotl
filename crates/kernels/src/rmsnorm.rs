@@ -25,8 +25,8 @@
 //!   stream copy; the model block can alias `out` to a scratch buffer and
 //!   copy back if it wants in-place semantics.
 //! - The per-row reduction reads `x` once and writes `out` once. The
-//!   squared sum is accumulated in `f32`; precision-sensitive callers can
-//!   lift to `f64` later behind a feature flag if parity tests demand it.
+//!   squared sum uses an `f64` accumulator, matching ggml's `ggml_float`
+//!   reduction while preserving each squared product's F32 semantics.
 //! - Validation lives at the launch boundary, matching the M1.7 pattern.
 //! - The "Done when: model forward path calls the kernel boundary" half of
 //!   the M3.3 spec line defers to Phase 2 — it requires M3.1's metadata
@@ -108,17 +108,16 @@ pub fn rmsnorm(
         )));
     }
 
-    let hidden_f = hidden as f32;
     for r in 0..rows {
         let row_start = r * hidden;
         let row = &x[row_start..row_start + hidden];
 
         // Accumulate sum of squares for this row.
-        let mut sum_sq = 0.0_f32;
+        let mut sum_sq = 0.0_f64;
         for &v in row.iter() {
-            sum_sq += v * v;
+            sum_sq += f64::from(v * v);
         }
-        let mean_sq = sum_sq / hidden_f;
+        let mean_sq = (sum_sq / hidden as f64) as f32;
         let rms = (mean_sq + epsilon).sqrt();
         let inv_rms = 1.0_f32 / rms;
 
@@ -224,6 +223,22 @@ mod tests {
         rmsnorm(&x, 1, 1, &w, 0.0, &mut out).expect("single-element rmsnorm must succeed");
 
         assert!((out[0] - 1.0).abs() < 1e-6, "got {}", out[0]);
+    }
+
+    #[test]
+    fn rmsnorm_matches_ggml_double_precision_reduction() {
+        let mut x = vec![1.0e-4_f32; 1024];
+        x[0] = 1.0;
+        let weight = vec![1.0_f32; x.len()];
+        let mut out = vec![0.0_f32; x.len()];
+
+        rmsnorm(&x, 1, x.len(), &weight, 0.0, &mut out).expect("wide RMSNorm fixture must succeed");
+
+        let small_square = x[1] * x[1];
+        let sum = f64::from(x[0] * x[0]) + f64::from(small_square) * 1023.0;
+        let mean = (sum / x.len() as f64) as f32;
+        let expected = 1.0_f32 / mean.sqrt();
+        assert_eq!(out[0].to_bits(), expected.to_bits());
     }
 
     /// Multi-row inputs must be normalized independently. Two rows with
