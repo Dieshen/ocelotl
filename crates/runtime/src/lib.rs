@@ -114,8 +114,165 @@ impl<B: KernelBackend> Runtime<B> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use ocelotl_core::{DType, KvCacheStore, OcelotlError, TokenId};
+
+    #[derive(Debug)]
+    struct CountingAttentionBackend {
+        inner: CpuKernelBackend,
+        full_attention_calls: Arc<AtomicUsize>,
+        incremental_attention_calls: Arc<AtomicUsize>,
+    }
+
+    impl KernelBackend for CountingAttentionBackend {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn context(&self) -> &ocelotl_kernels::KernelContext {
+            self.inner.context()
+        }
+
+        fn matmul(
+            &self,
+            a: &[f32],
+            a_shape: (usize, usize),
+            b: &[f32],
+            b_shape: (usize, usize),
+            out: &mut [f32],
+        ) -> ocelotl_core::Result<()> {
+            self.inner.matmul(a, a_shape, b, b_shape, out)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn linear_out_by_in(
+            &self,
+            x: &[f32],
+            rows: usize,
+            in_features: usize,
+            weight_out_by_in: &[f32],
+            out_features: usize,
+            bias: Option<&[f32]>,
+            out: &mut [f32],
+        ) -> ocelotl_core::Result<()> {
+            self.inner.linear_out_by_in(
+                x,
+                rows,
+                in_features,
+                weight_out_by_in,
+                out_features,
+                bias,
+                out,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn scaled_dot_product_attention(
+            &self,
+            q: &[f32],
+            k: &[f32],
+            v: &[f32],
+            seq_len: usize,
+            num_q_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+            out: &mut [f32],
+        ) -> ocelotl_core::Result<()> {
+            self.full_attention_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                out,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn scaled_dot_product_attention_incremental(
+            &self,
+            q: &[f32],
+            k: &[f32],
+            v: &[f32],
+            seq_len: usize,
+            num_q_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+            out: &mut [f32],
+        ) -> ocelotl_core::Result<()> {
+            self.incremental_attention_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner.scaled_dot_product_attention_incremental(
+                q,
+                k,
+                v,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                out,
+            )
+        }
+
+        fn rope_apply_inplace(
+            &self,
+            x: &mut [f32],
+            head_dim: usize,
+            position: usize,
+            theta: f32,
+        ) -> ocelotl_core::Result<()> {
+            self.inner.rope_apply_inplace(x, head_dim, position, theta)
+        }
+
+        fn rmsnorm(
+            &self,
+            x: &[f32],
+            rows: usize,
+            hidden: usize,
+            weight: &[f32],
+            epsilon: f32,
+            out: &mut [f32],
+        ) -> ocelotl_core::Result<()> {
+            self.inner.rmsnorm(x, rows, hidden, weight, epsilon, out)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn mlp_gated_silu(
+            &self,
+            x: &[f32],
+            rows: usize,
+            hidden: usize,
+            intermediate: usize,
+            gate_w: &[f32],
+            up_w: &[f32],
+            down_w: &[f32],
+            gate_buf: &mut [f32],
+            up_buf: &mut [f32],
+            out: &mut [f32],
+        ) -> ocelotl_core::Result<()> {
+            self.inner.mlp_gated_silu(
+                x,
+                rows,
+                hidden,
+                intermediate,
+                gate_w,
+                up_w,
+                down_w,
+                gate_buf,
+                up_buf,
+                out,
+            )
+        }
+
+        fn vec_add(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> ocelotl_core::Result<()> {
+            self.inner.vec_add(a, b, out)
+        }
+    }
 
     // Pull in family-specific entry points the tests exercise. They live in
     // submodules now; importing them once here keeps every test below readable.
@@ -542,6 +699,42 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(state.cache().len_tokens(), prompt.len() + 1);
+    }
+
+    #[test]
+    fn contiguous_cache_decode_uses_one_query_incremental_attention() {
+        let (config, weights) = tiny_qwen_config_and_weights();
+        let full_attention_calls = Arc::new(AtomicUsize::new(0));
+        let incremental_attention_calls = Arc::new(AtomicUsize::new(0));
+        let model = Qwen2_5Model::with_kernel_backend(
+            config,
+            weights,
+            Arc::new(CountingAttentionBackend {
+                inner: CpuKernelBackend::scalar(),
+                full_attention_calls: Arc::clone(&full_attention_calls),
+                incremental_attention_calls: Arc::clone(&incremental_attention_calls),
+            }),
+        )
+        .expect("counting backend model must construct");
+
+        let mut state =
+            prepare_qwen2_5_contiguous_cache(&model, &[TokenId(1), TokenId(2), TokenId(3)])
+                .expect("cached prefill must succeed");
+        let full_after_prefill = full_attention_calls.load(Ordering::Relaxed);
+
+        decode_one_token_with_contiguous_cache(&model, &mut state)
+            .expect("cached decode must succeed");
+
+        assert_eq!(
+            full_attention_calls.load(Ordering::Relaxed),
+            full_after_prefill,
+            "cached decode must not construct or execute full-sequence causal attention"
+        );
+        assert_eq!(
+            incremental_attention_calls.load(Ordering::Relaxed),
+            model.config().num_hidden_layers,
+            "cached decode must execute one incremental attention row per layer"
+        );
     }
 
     #[test]

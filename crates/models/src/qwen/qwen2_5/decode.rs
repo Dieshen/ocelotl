@@ -57,8 +57,7 @@ impl Qwen2_5Model {
         let mut v_buf = vec![0.0_f32; kv_out];
         let mut k_cache = vec![0.0_f32; next_len * kv_out];
         let mut v_cache = vec![0.0_f32; next_len * kv_out];
-        let mut q_context = vec![0.0_f32; next_len * q_out];
-        let mut attn_context = vec![0.0_f32; next_len * q_out];
+        let mut attn_row = vec![0.0_f32; q_out];
         let mut o_buf = vec![0.0_f32; h];
         let mut residual_buf = vec![0.0_f32; h];
         let mut gate_buf = vec![0.0_f32; i_size];
@@ -89,24 +88,19 @@ impl Qwen2_5Model {
             cache.read_layer_keys(layer_idx, next_len, &mut k_cache)?;
             cache.read_layer_values(layer_idx, next_len, &mut v_cache)?;
 
-            q_context.fill(0.0);
-            let q_start = position * q_out;
-            q_context[q_start..q_start + q_out].copy_from_slice(&q_buf);
-            attn_context.fill(0.0);
-            self.kernels.scaled_dot_product_attention(
-                &q_context,
+            self.kernels.scaled_dot_product_attention_incremental(
+                &q_buf,
                 &k_cache,
                 &v_cache,
                 next_len,
                 cfg.num_attention_heads,
                 cfg.num_key_value_heads,
                 cfg.head_dim,
-                &mut attn_context,
+                &mut attn_row,
             )?;
 
-            let attn_start = position * q_out;
             self.kernels.matmul(
-                &attn_context[attn_start..attn_start + q_out],
+                &attn_row,
                 (1, q_out),
                 &layer.o_proj_w,
                 (q_out, h),

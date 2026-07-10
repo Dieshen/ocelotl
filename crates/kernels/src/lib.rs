@@ -140,6 +140,33 @@ pub trait KernelBackend: Debug + Send + Sync {
         out: &mut [f32],
     ) -> Result<()>;
 
+    /// Decode-time GQA attention for one query row over a visible K/V prefix.
+    /// Backends may override this to keep cache reads and attention resident;
+    /// the default CPU reference avoids constructing a full causal Q matrix.
+    #[allow(clippy::too_many_arguments)]
+    fn scaled_dot_product_attention_incremental(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        attention::scaled_dot_product_attention_incremental(
+            q,
+            k,
+            v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            out,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn scaled_dot_product_attention_with_scale(
         &self,

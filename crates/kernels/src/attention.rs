@@ -132,6 +132,94 @@ pub fn scaled_dot_product_attention(
     Ok(())
 }
 
+/// Compute causal attention for a single query row over an existing K/V
+/// prefix. This is the decode-time counterpart to
+/// [`scaled_dot_product_attention`]: `q` and `out` contain one row while
+/// `k`/`v` contain `seq_len` cached rows.
+#[allow(clippy::too_many_arguments)]
+pub fn scaled_dot_product_attention_incremental(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    if head_dim == 0 {
+        return Err(kernel_err(
+            "scaled_dot_product_attention_incremental head_dim must be non-zero".to_string(),
+        ));
+    }
+    if seq_len == 0 {
+        return Err(kernel_err(
+            "scaled_dot_product_attention_incremental seq_len must be non-zero".to_string(),
+        ));
+    }
+    if num_q_heads == 0 || num_kv_heads == 0 {
+        return Err(kernel_err(
+            "scaled_dot_product_attention_incremental head counts must be non-zero".to_string(),
+        ));
+    }
+    if num_q_heads % num_kv_heads != 0 {
+        return Err(kernel_err(format!(
+            "scaled_dot_product_attention_incremental num_q_heads ({num_q_heads}) must be a \
+             positive multiple of num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    let q_width = checked_len_product(
+        "scaled_dot_product_attention_incremental",
+        "q/out",
+        &[num_q_heads, head_dim],
+    )?;
+    let kv_total = checked_len_product(
+        "scaled_dot_product_attention_incremental",
+        "k/v",
+        &[seq_len, num_kv_heads, head_dim],
+    )?;
+    for (label, actual, expected) in [
+        ("q", q.len(), q_width),
+        ("k", k.len(), kv_total),
+        ("v", v.len(), kv_total),
+        ("out", out.len(), q_width),
+    ] {
+        if actual != expected {
+            return Err(kernel_err(format!(
+                "scaled_dot_product_attention_incremental {label}.len()={actual} does not match expected {expected}"
+            )));
+        }
+    }
+
+    let group_size = num_q_heads / num_kv_heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0_f32; seq_len];
+    for h in 0..num_q_heads {
+        let kh = h / group_size;
+        let q_base = h * head_dim;
+        for (position, score) in scores.iter_mut().enumerate() {
+            let k_base = (position * num_kv_heads + kh) * head_dim;
+            let mut acc = 0.0_f32;
+            for d in 0..head_dim {
+                acc += q[q_base + d] * k[k_base + d];
+            }
+            *score = acc * scale;
+        }
+        softmax(&mut scores);
+
+        let out_base = h * head_dim;
+        out[out_base..out_base + head_dim].fill(0.0);
+        for (position, &probability) in scores.iter().enumerate() {
+            let v_base = (position * num_kv_heads + kh) * head_dim;
+            for d in 0..head_dim {
+                out[out_base + d] += probability * v[v_base + d];
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn scaled_dot_product_attention_with_scale(
     q: &[f32],
@@ -1015,6 +1103,57 @@ mod tests {
         assert_eq!(
             out, expected,
             "GQA mapping must route q_heads 0,1 to kv_head 0 and q_heads 2,3 to kv_head 1"
+        );
+    }
+
+    #[test]
+    fn incremental_gqa_attention_matches_full_context_final_row() {
+        let seq_len = 3_usize;
+        let num_q_heads = 4_usize;
+        let num_kv_heads = 2_usize;
+        let head_dim = 2_usize;
+        let q_width = num_q_heads * head_dim;
+
+        let q: Vec<f32> = (0..seq_len * q_width)
+            .map(|idx| ((idx as f32) * 0.17).sin())
+            .collect();
+        let k: Vec<f32> = (0..seq_len * num_kv_heads * head_dim)
+            .map(|idx| ((idx as f32) * 0.11).cos())
+            .collect();
+        let v: Vec<f32> = (0..seq_len * num_kv_heads * head_dim)
+            .map(|idx| (idx as f32 - 5.0) * 0.25)
+            .collect();
+
+        let mut full = vec![0.0_f32; seq_len * q_width];
+        scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            &mut full,
+        )
+        .expect("full-context GQA attention must succeed");
+
+        let mut incremental = vec![0.0_f32; q_width];
+        scaled_dot_product_attention_incremental(
+            &q[(seq_len - 1) * q_width..],
+            &k,
+            &v,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            &mut incremental,
+        )
+        .expect("incremental GQA attention must succeed");
+
+        assert_eq!(
+            incremental,
+            full[(seq_len - 1) * q_width..],
+            "one-query incremental attention must preserve the full causal final row"
         );
     }
 
