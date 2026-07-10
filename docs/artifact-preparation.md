@@ -234,14 +234,15 @@ reference with the W-ASR.15 segment schema.
 ## 5. Post-M3 Model-Family Expansion Artifacts
 
 MF.1 pins the first Qwen3.5 and Gemma4 compatibility-discovery candidates in
-`fixtures/manifest/post_m3_model_family_targets.json`. These are not execution
-fixtures yet. They exist so MF.3-MF.5 can inspect and reject unsupported
-features against stable artifact identities instead of moving upstream branches.
+`fixtures/manifest/post_m3_model_family_targets.json`. Qwen3.5 remains an
+inspection/rejection target; the selected Gemma4 artifact now also drives
+opt-in text execution and parity proofs. Stable identities keep both tracks off
+moving upstream branches.
 
 | Target | Upstream artifact | Pinned revision | Local path | Notes |
 | --- | --- | --- | --- | --- |
 | Qwen3.5 | `Qwen/Qwen3.5-35B-A3B-FP8` | `9d1823d2dee688a6b25e77009dc727688c44936e` | `local-artifacts/qwen3_5_35b_a3b_fp8/` | Official FP8 safetensors candidate. Multimodal, hybrid attention, sparse MoE; reject before compute until the model contract lands. |
-| Gemma4 | `bartowski/google_gemma-4-E4B-it-GGUF` / `google_gemma-4-E4B-it-Q4_K_M.gguf` | `c04cb322fd63e347db759a08b6249b867488ccf8` | `local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf` | GGUF Q4_K_M candidate derived from `google/gemma-4-E4B-it`. Header-only inspection is supported; quantized execution is not. |
+| Gemma4 | `bartowski/google_gemma-4-E4B-it-GGUF` / `google_gemma-4-E4B-it-Q4_K_M.gguf` | `c04cb322fd63e347db759a08b6249b867488ccf8` | `local-artifacts/gemma4_e4b_it_q4_k_m/google_gemma-4-E4B-it-Q4_K_M.gguf` | GGUF Q4_K_M candidate derived from `google/gemma-4-E4B-it`. Text-only quantized execution exists; full final-logit parity remains red and multimodal input is unsupported. |
 
 Fetch Qwen3.5 FP8 only when you are working on the Qwen3.5 metadata/tensor
 contract. It is a large artifact and default tests do not require it:
@@ -328,7 +329,9 @@ cargo test -p ocelotl local_gemma4_q4_k_m_prefill_logits_match_llama_cpp_debug -
 The harness invokes:
 
 ```powershell
-llama-debug --model <model.gguf> --prompt "Hello" --no-escape --save-logits --logits-output-dir <temp-dir>
+llama-debug --model <model.gguf> --prompt "Hello" --no-escape `
+  --flash-attn off --cache-type-k f32 --cache-type-v f32 --no-repack `
+  --save-logits --logits-output-dir <temp-dir>
 ```
 
 `llama-debug` writes the full final-token logits vector to
@@ -336,11 +339,12 @@ llama-debug --model <model.gguf> --prompt "Hello" --no-escape --save-logits --lo
 that file, tokenizes `Hello` with the GGUF configured-BOS path, loads the GGUF
 through `load_gemma4_dequantized_tensors_from_gguf`, clears
 `Gemma4Config.multimodal` only for this text-only harness, attaches validated
-Q5_K/Q6_K native Q/K/V/O attention sidecars, runs `Gemma4TextModel` through
-`ocelotl_runtime::gemma::prefill`, and compares every final-position logit
-within the fixture tolerance. This is a mixed native-attention and
-eager-dequantized text-decoder parity proof, not an audio/image/video multimodal
-proof.
+Q4_K/Q5_K/Q6_K native sidecars for all text projections, runs
+`Gemma4TextModel` through `ocelotl_runtime::gemma::prefill`, and compares every
+final-position logit within the fixture tolerance. The explicit llama.cpp flags
+remove flash-attention, F16-cache, and repacking differences from the numeric
+comparison. This is a text-decoder parity proof, not an audio/image/video
+multimodal proof.
 
 For intermediate tensor triage, use the same paths with one of the ignored
 tensor-summary proofs:
@@ -355,16 +359,20 @@ These tensor-summary tests invoke `llama-debug --verbose --tensor-filter ...
 --no-warmup` without `--save-logits`, because local llama.cpp uses separate
 paths for final-logit files and tensor callback output.
 
-As of the 2026-06-11 local tensor-summary run, the full-logit proof has not been
-refreshed after the GGUF matrix-layout and native-attention changes. The layer-0
-sidecar inventory is Q6_K/Q5_K/Q6_K/Q5_K for Q/K/V/O, and the public text
-parity path now matches llama.cpp through `kqv_out-0`. The active red checkpoint
-is the Q5_K output projection: Ocelotl `attn_output_proj-0 = -3.062695`,
-llama.cpp `node_33 = -3.404522`, diff `0.34182692` at tolerance `0.05`. Treat
-this as the active MF.8 numeric worklist, not an artifact setup failure. The
-next useful discriminator is a selected-row or selected-element Q5_K output
-comparison against llama.cpp; aggregate sums are no longer enough to identify
-the remaining arithmetic difference.
+As of the 2026-07-10 local proofs, the layer-0 sidecar inventory is
+Q6_K/Q5_K/Q6_K/Q5_K for Q/K/V/O and the full native text path matches the
+pinned non-flash/F32-cache llama.cpp trace through `l_out-0`; the largest
+sampled layer-0 difference was approximately `6.2e-5` at tolerance `0.05`.
+Q4_K/Q5_K/Q6_K kernels and every text projection are therefore past the old
+`node_33` blocker.
+
+The refreshed full 42-layer proof executes but is still red. Against the
+non-repacked reference it reported max absolute logit error `2.1698594`, mean
+absolute error `0.38767775`, RMS error `0.48177935`, identical top-1, and 18/20
+top-20 overlap. Layer samples drift gradually, first exceeding `0.05` at layer
+7, with no discontinuity at the shared-KV transition. Treat accumulated
+later-layer numeric drift as the active MF.8 worklist, not an artifact setup or
+single-projection failure. Do not widen the fixture tolerance to make this pass.
 
 ## 6. Keeping Artifacts Out Of Git
 

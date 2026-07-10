@@ -11,11 +11,11 @@
     "tool": "llama-debug",
     "revision": "856c3adac1709be15e1ea2529a0e89f742d25fe0 (describe b9127-1-g856c3adac)",
     "source": "ggml-org/llama.cpp examples/debug; llama-debug evaluates the prompt, then --save-logits writes the final-token logits to llamacpp-<model-stem>.txt in the selected output directory.",
-    "command": ["llama-debug", "--model", "<model.gguf>", "--prompt", "Hello", "--no-escape", "--save-logits", "--logits-output-dir", "<output-dir>"]
+    "command": ["llama-debug", "--model", "<model.gguf>", "--prompt", "Hello", "--no-escape", "--flash-attn", "off", "--cache-type-k", "f32", "--cache-type-v", "f32", "--no-repack", "--save-logits", "--logits-output-dir", "<output-dir>"]
   },
   "ocelotl_reference": {
     "command": "OCELOTL_GEMMA4_GGUF_PATH=<model.gguf> OCELOTL_LLAMA_DEBUG_PATH=<llama-debug> cargo test -p ocelotl local_gemma4_q4_k_m_prefill_logits_match_llama_cpp_debug -- --ignored --nocapture",
-    "notes": "The Ocelotl side tokenizes with the GGUF tokenizer configured-BOS path, clears Gemma4Config.multimodal for this text-only harness, loads required tensors with load_gemma4_dequantized_tensors_from_gguf, builds Gemma4TextModel, and compares the full final-position logits vector."
+    "notes": "The Ocelotl side tokenizes with the GGUF tokenizer configured-BOS path, clears Gemma4Config.multimodal for this text-only harness, loads required dense fallback tensors plus validated native Q4_K/Q5_K/Q6_K text-projection sidecars, builds Gemma4TextModel, and compares the full final-position logits vector. The llama.cpp flags pin the scalar/non-flash F32-cache, non-repacked comparison surface used by the layer discriminators. The 2026-07-10 full comparison remains red: max absolute error 2.1698594, mean absolute error 0.38767775, RMS error 0.48177935, identical top-1, and 18/20 top-20 overlap."
   },
   "regeneration": "Build llama.cpp examples/debug at the pinned revision, set OCELOTL_GEMMA4_GGUF_PATH and OCELOTL_LLAMA_DEBUG_PATH, then run the ignored local parity test. If the selected artifact, prompt, tokenizer, llama.cpp revision, selected token IDs, or tolerance changes, update this fixture plus docs/validation/parity.md, docs/artifact-preparation.md, and docs/validation/test-matrix.md together."
 }

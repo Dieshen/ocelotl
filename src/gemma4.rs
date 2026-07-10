@@ -348,6 +348,25 @@ mod tests {
                 .any(|arg| arg == "--logits-output-dir"),
             "llama.cpp logits reference command must choose an output directory"
         );
+        let command = &fixture.llama_cpp_reference.command;
+        for expected_pair in [
+            ["--flash-attn", "off"],
+            ["--cache-type-k", "f32"],
+            ["--cache-type-v", "f32"],
+        ] {
+            assert!(
+                command
+                    .windows(2)
+                    .any(|args| args[0] == expected_pair[0] && args[1] == expected_pair[1]),
+                "llama.cpp logits reference command must pin {} {}",
+                expected_pair[0],
+                expected_pair[1]
+            );
+        }
+        assert!(
+            command.iter().any(|arg| arg == "--no-repack"),
+            "llama.cpp logits reference command must disable repacking"
+        );
         assert!(
             fixture
                 .ocelotl_reference

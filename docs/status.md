@@ -31,8 +31,8 @@ service.
 | M6 | closed for CPU/reference | Paged allocation, multi-page behavior, cleanup, and contiguous/paged parity are covered. GPU paged-attention kernels remain deferred. |
 | M7 | closed as correctness plumbing | Bounded admission, state transitions, cancellation, fairness, and deterministic batch parity are covered. The scheduler is not yet a throughput-optimized production scheduler. |
 | M8 | not started | There is no supported network server endpoint, streaming transport, authentication, or external error contract. |
-| Whisper ASR | implemented; alpha hardening active | Real local inference exists and exact-token local parity has passed, but local-artifact proof and performance evidence are not default CI gates. |
-| Gemma4 text | implemented subset; real parity blocked | Synthetic/public-path behavior and substantial real-artifact execution are present. Full real-artifact logits parity is still red. |
+| Whisper ASR | alpha candidate; opt-in evidence green | Real tiny.en exact-token parity and a repeated equal-resource whisper.cpp comparison passed locally. The proof remains opt-in because weights and reference binaries are not committed. |
+| Gemma4 text | executes; real final-logit parity blocked | The selected Q4_K_M text path loads and executes all 42 layers with native Q4_K/Q5_K/Q6_K projections. Layer 0 is green, but the final real-artifact logit distribution is still outside tolerance. |
 
 ## Whisper
 
@@ -51,20 +51,20 @@ service.
 - Default offline fixtures cover preprocessing, tensor contracts, model
   semantics, runtime lifecycle, cache parity, and CPU optimization parity.
 - The ignored tiny.en local-artifact proof has passed exact expected-token
-  comparison through the real adapter.
-- Stage-level timing and whisper.cpp comparison tooling exists. Its records are
-  diagnostic evidence, not a correctness oracle or a CI performance gate.
+  comparison through the real adapter on 2026-07-10.
+- The reproducible comparison runner now records warmups, repeated alternating
+  samples, raw timings, revision/dirty state, effective commands, and output
+  equivalence. A 2026-07-10 release run used one warmup plus ten measured
+  samples per engine and matched both expected Ocelotl tokens and normalized
+  transcript text. Ocelotl averaged `620 ms` (`629 ms` median, `645 ms` p95)
+  versus whisper.cpp `428 ms` (`425 ms` median, `497 ms` p95), or `1.449x`
+  whisper.cpp full-process wall time on that machine.
 
 ### Alpha Blockers And Limits
 
-- The benchmark runner must prove equal effective resources, warmups, repeated
-  samples, raw-sample retention, and output equivalence before results can gate
-  releases.
-- Public request and artifact budgets must reject excessive audio, token, and
-  allocation requests before expensive preprocessing or model work.
 - Local artifact parity is opt-in because weights and reference binaries are
-  not committed. Alpha evidence must name the exact model and reference
-  revisions used.
+  not committed. Release evidence must still be refreshed at the candidate
+  commit and name the exact model, reference revision, commands, and hardware.
 - Timestamped segments, streaming/chunk stitching, multilingual quality claims,
   and an approved WER threshold are outside the first alpha support claim.
 
@@ -77,8 +77,9 @@ service.
 - Text-only synthetic prefill/decode through the public runtime, including
   mixed sliding-window/global attention, shared KV, logit softcap, Gemma4 RoPE,
   per-layer embeddings, and post-branch normalization semantics.
-- Real Q4_K_M-origin text weights through dequantized F32 fallback plus native
-  Q5_K/Q6_K attention projection sidecars.
+- Real Q4_K_M-origin text weights through a dequantized F32 fallback plus native
+  Q4_K/Q5_K/Q6_K Q8_K projection sidecars for every text attention, FFN,
+  per-layer input/output, and tied output projection.
 
 ### Validated
 
@@ -86,21 +87,32 @@ service.
   GGUF rejection, tokenizer contracts, quantization arithmetic, and public
   runtime behavior.
 - The opt-in tokenizer proof matched the pinned llama.cpp reference.
-- The real-artifact layer-0 discriminator matches through `kqv_out-0`.
+- With llama.cpp pinned to non-flash attention, F32 K/V cache, and no repacking,
+  the complete real-artifact layer-0 discriminator matches through `l_out-0`;
+  the largest sampled difference was approximately `6.2e-5`, well inside the
+  `0.05` contract.
+- The full selected 42-layer artifact now loads and reaches final logits through
+  the public text prefill path. The latest run selected the same top-1 token as
+  llama.cpp and had 18/20 overlap in the top-20 token set.
 
 ### Alpha Blockers And Limits
 
-- Real-artifact execution diverges at the native Q5_K attention output
-  projection: the latest recorded discriminator has Ocelotl
-  `attn_output_proj-0 = -3.062695` versus llama.cpp `node_33 = -3.404522`, a
-  `0.34182692` difference at `0.05` tolerance.
-- After fixing the first divergent output, layer outputs and the full final-logit
-  vector must be refreshed through the same public text path before Gemma4 can
-  enter the alpha support claim.
+- Full final-logit parity remains red. Against the deterministic non-repacked
+  llama.cpp reference, the latest 262,144-logit comparison had max absolute
+  error `2.1698594`, mean absolute error `0.38767775`, RMS error `0.48177935`,
+  and 241,146 logits above `0.05`. The top-1 agreement is useful smoke evidence,
+  but it does not satisfy the numeric contract.
+- Layer tracing shows smooth accumulated drift rather than a new semantic cliff:
+  the first sampled layer above `0.05` was layer 7, the worst sampled edge was
+  about `0.2625` at layer 29, and the shared-KV transition at layer 24 was not a
+  discontinuity. The next parity work must narrow that accumulated numerical
+  drift without weakening the tolerance.
 - The selected artifact is multimodal, but the first alpha target is explicitly
   text-only. Gemma4 image/audio/video input remains unsupported.
-- Quantized performance and memory use need repeatable release-mode evidence;
-  synthetic green tests alone are not production proof.
+- The current loader retains eagerly dequantized dense fallback weights beside
+  native quantized sidecars. That is intentionally correctness-first, but its
+  peak memory and load-time cost must be removed or bounded before the selected
+  Gemma artifact is production-alpha ready.
 
 ## Alpha Release Gates
 

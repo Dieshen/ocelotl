@@ -1657,3 +1657,24 @@ includes log-mel extraction, model/tensor loading, tokenizer load, and output
 text decode. For core model compute, the next measured target is decoder block
 and logits projection cost under 8 threads; for end-to-end CLI parity, the next
 target is separating warm/resident timing from cold artifact/tokenizer setup.
+
+### Alpha comparison record (2026-07-10)
+
+The alpha-hardening runner now records the comparison context needed for a
+release claim rather than retaining only one best timing. The 2026-07-10 local
+tiny.en run used the pinned manifest commands, release binaries, one warmup per
+engine, and ten measured samples per engine in alternating order. The JSON
+record retained every raw sample, the git revision and dirty state, command
+lines, output summaries, and aggregate mean/median/p95.
+
+| Engine | Samples | Mean | Median | p95 | Output check |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Ocelotl | 10 | `620 ms` | `629 ms` | `645 ms` | exact expected token IDs |
+| whisper.cpp | 10 | `428 ms` | `425 ms` | `497 ms` | normalized transcript equal to Ocelotl |
+
+Ocelotl was `1.449x` whisper.cpp full-process wall time on that machine. The
+engines differed only in transcript punctuation, which the documented WER-style
+normalization correctly removes; the normalized words matched. This is local
+evidence, not a universal hardware claim. An alpha tag must rerun the same
+recording command at the candidate revision and preserve the generated JSON
+outside Git's ignored `local-artifacts/` tree as release evidence.

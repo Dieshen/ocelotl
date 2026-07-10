@@ -196,10 +196,13 @@ sidecars.
   tokenizes the same prompt with Ocelotl's GGUF tokenizer configured-BOS path,
   clears `Gemma4Config.multimodal` for this explicitly text-only harness, loads
   the selected GGUF tensors through
-  `load_gemma4_dequantized_tensors_from_gguf`, attaches validated Q5_K/Q6_K
-  native Q/K/V/O attention sidecars, builds `Gemma4TextModel`, runs
+  `load_gemma4_dequantized_tensors_from_gguf`, attaches validated
+  Q4_K/Q5_K/Q6_K native sidecars for every text projection, builds
+  `Gemma4TextModel`, runs
   `ocelotl_runtime::gemma::prefill`, and compares every final-position logit
-  against llama.cpp.
+  against llama.cpp. The reference command pins `--flash-attn off`, F32 K/V
+  cache types, and `--no-repack` so the discriminator compares the same
+  non-flash, non-repacked numerical surface.
 - **llama.cpp tensor-summary reference, opt-in local execution**:
   `local_gemma4_q4_k_m_late_tensor_summaries_match_llama_cpp_debug`,
   `local_gemma4_q4_k_m_layer_output_summaries_match_llama_cpp_debug`, and
@@ -214,38 +217,35 @@ sidecars.
   leaving other attention projections on the dense fallback.
   `local_gemma4_q4_k_m_native_attention_sidecar_inventory` pins the selected
   layer-0 Q/K/V/O types as Q6_K/Q5_K/Q6_K/Q5_K. Default loader, kernel, and
-  model tests pin bounded raw-byte loading, Q5_K/Q6_K x Q8_K projection, sidecar
-  validation, and native dispatch without making local artifacts a CI
+  model tests pin bounded raw-byte loading, Q4_K/Q5_K/Q6_K x Q8_K projection,
+  sidecar validation, and native dispatch without making local artifacts a CI
   dependency.
 
-Current status: the full-logit proof was last run before the GGUF matrix-layout
-and native-attention changes and failed at token 0 with `Ocelotl -2.544672`,
-llama.cpp `-18.2152`, diff `15.670528`. The current discriminator is the
-2026-06-11 tensor-summary proof against llama.cpp
-`856c3adac1709be15e1ea2529a0e89f742d25fe0`. Native Q5_K/Q6_K attention
-sidecars close the earlier `Qcur-0`, K/V, and attention mismatches: the layer-0
-proof now matches through `kqv_out-0`. The first remaining mismatch is the
-Q5_K `blk.0.attn_output.weight` projection: Ocelotl
-`attn_output_proj-0 = -3.062695`, llama.cpp `node_33 = -3.404522`, diff
-`0.34182692`. The closed semantic gaps so far are
-llama.cpp-style `sqrt(hidden)` token embedding scaling, Gemma4 score scale
-`1.0`, unweighted V RMSNorm before KV storage/reuse, tanh-approx GEGLU FFN,
-weighted post-attention/post-FFN RMSNorm before residual adds, per-layer input
-embeddings, layer output scales, Gemma4 global-attention RoPE frequency factors,
-and GGUF matrix layout at the Gemma4 weight adapter. A local tensor-name scan of
-the selected GGUF found `attn_v.weight` tensors and did not find
-`output.weight` or MoE router/expert tensors, so those optional llama.cpp
-branches are not the current selected-artifact explanation. Q5_K scalar layout,
-min-term, high-bit, orientation, and AVX2 accumulation-order audits have not
-explained the remaining output-projection delta. The next discriminator must
-compare Q5_K output rows or selected elements against llama.cpp rather than
-relying only on the aggregate tensor sum.
+Current status: the 2026-07-10 proofs use llama.cpp
+`856c3adac1709be15e1ea2529a0e89f742d25fe0`. Native Q4_K/Q5_K/Q6_K kernels
+now cover every selected text projection. The complete layer-0 trace matches
+through `l_out-0` with a largest sampled difference of approximately `6.2e-5`
+at tolerance `0.05`, closing the former `Qcur-0`, K/V/SDPA,
+`attn_output_proj-0`, FFN, and layer-output checkpoints. The comparison also
+pins ggml's FP16 lookup-table GELU and double-precision RMSNorm reduction
+semantics.
+
+The full 42-layer proof reaches the final 262,144-logit vector but remains red.
+With the deterministic non-repacked reference, max absolute error was
+`2.1698594` at token 99,398, mean absolute error was `0.38767775`, RMS error was
+`0.48177935`, 241,146 logits exceeded `0.05`, the argmax token was identical
+(`236888`), and top-20 overlap was 18/20. A separate default-repacked reference
+was also red (max `2.7153807`, mean `0.5866358`, RMS `0.7163334`). Layer-output
+samples cross `0.05` first at layer 7 and drift smoothly; the worst sampled edge
+was approximately `0.2625` at layer 29, and layer 24's shared-KV transition was
+not a cliff. The remaining discriminator is therefore accumulated later-layer
+numeric drift, not one unsupported format or projection.
 
 The `0.05` tolerance is deliberately wider than the synthetic `1e-4` fixture
-because this compares Ocelotl's mixed native-attention/eager-dequantized path
+because this compares Ocelotl's native-projection/eager-dequantized fallback path
 against llama.cpp's GGML Q4_K_M execution path on a 42-layer real artifact.
-Tighten it only after a local reference run reports the observed worst-case
-difference. Exact
+Do not widen it to admit the current distribution. Tighten it only after a
+local reference run reports a passing observed worst-case difference. Exact
 configured-BOS token equality is checked before logits so a BOS-policy mismatch
 cannot masquerade as numeric drift.
 
@@ -317,9 +317,11 @@ extends the ignored harness from "bundle is well-formed" to "output tokens equal
 expected tokens". W-ASR.15 keeps that proof intact and layers timestamped
 schema/default tests plus an optional timestamped ignored proof on top.
 
-The current branch does not include `local-artifacts/whisper_tiny_en`, so the
-exact local parity proof is still artifact-blocked until a contributor provides
-that bundle and runs the ignored test. The tensor contract uses OpenAI Whisper
-state-dict names as the canonical Ocelotl contract; aliases for HF/Burn-converted
+The no-timestamps tiny.en proof passed locally on 2026-07-10 against the
+provided bundle with exact generated token IDs. The optional timestamped
+fixture was absent and therefore skipped as designed. Because the bundle is not
+committed, contributors and release candidates must still provide it and rerun
+the ignored proof locally. The tensor contract uses OpenAI Whisper state-dict
+names as the canonical Ocelotl contract; aliases for HF/Burn-converted
 safetensors names should be added only after a local `model.safetensors`
 manifest proves the needed alternate names.

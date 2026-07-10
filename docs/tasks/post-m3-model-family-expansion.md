@@ -182,8 +182,8 @@ and does not modify the closed M3.6 MLP task.
   post-K-RMSNorm/post-RoPE K activations plus V activations from
   `kv_from_start - 2` for shared SWA/windowed layers and `kv_from_start - 1`
   for shared dense/global layers, and keeps current-layer Q, output projection,
-  and MLP behavior. Real Q4_K_M execution remains blocked on multimodal
-  handling and reference parity.
+  and MLP behavior. At this historical slice, real Q4_K_M execution was still
+  blocked on multimodal handling and reference parity.
 - `Follow-up`: Gemma4 dequantized Q4_K_M-origin text forward landed
   2026-06-09. The supported text path now accepts configs whose tensors came
   from Q4_K_M GGUF artifacts after the values have been explicitly
@@ -228,15 +228,15 @@ and does not modify the closed M3.6 MLP task.
   diagnostic tracing and ignored llama.cpp tensor-summary harnesses first
   isolated the real-artifact mismatch to `Qcur-0` after `inp_scaled` and
   `attn_norm-0` matched llama.cpp.
-- `Follow-up`: native Gemma4 attention K-quant sidecars landed after that
-  discriminator. `ocelotl-loader` exposes a bounded Q4_K/Q5_K/Q6_K raw-byte
-  API, `ocelotl-kernels` executes Q5_K/Q6_K x Q8_K projections, and
-  `Gemma4TextModel` can attach validated native Q/K/V/O sidecars while retaining
-  dense fallback behavior for Q4_K. The selected layer-0 inventory is
-  Q6_K/Q5_K/Q6_K/Q5_K. The local proof now matches llama.cpp through
-  `kqv_out-0`; the first remaining mismatch is the Q5_K output projection
-  (`attn_output_proj-0 = -3.062695` versus llama.cpp `node_33 = -3.404522`,
-  diff `0.34182692`).
+- `Follow-up`: native Gemma4 K-quant text projections completed 2026-07-10.
+  `ocelotl-loader` exposes a bounded Q4_K/Q5_K/Q6_K raw-byte API,
+  `ocelotl-kernels` executes Q4_K/Q5_K/Q6_K x Q8_K projections, and
+  `Gemma4TextModel` attaches validated native sidecars for every text attention,
+  FFN, per-layer input/output, and tied output projection. The selected layer-0
+  Q/K/V/O inventory remains Q6_K/Q5_K/Q6_K/Q5_K. Against the pinned
+  non-flash/F32-cache/no-repack llama.cpp reference, the complete layer now
+  matches through `l_out-0` with a largest sampled difference of approximately
+  `6.2e-5` at tolerance `0.05`.
 
 ## MF.8 Add Opt-In Real-Artifact Parity
 
@@ -255,16 +255,17 @@ and does not modify the closed M3.6 MLP task.
   text-only path by clearing `multimodal`, loads required tensors through
   `load_gemma4_dequantized_tensors_from_gguf`, and compares every
   final-position logit through `ocelotl_runtime::gemma::prefill`.
-- `Status`: latest local tensor-summary proof on 2026-06-11 runs against
-  llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0` and is still red.
-  After the GGUF matrix-layout and native-attention changes, the layer-0 proof
-  matches through `kqv_out-0`. The first mismatch is now the native Q5_K
-  `attn_output.weight` projection (`attn_output_proj-0 = -3.062695` versus
-  llama.cpp `node_33 = -3.404522`, diff `0.34182692`). The full-logit proof has
-  not been refreshed after these changes. Remaining work should add a
-  selected-row or selected-element Q5_K output discriminator, fix that numeric
-  delta, then rerun layer outputs and the complete logits vector before claiming
-  MF.8 parity.
+- `Status`: refreshed local layer and full-logit proofs ran on 2026-07-10
+  against llama.cpp `856c3adac1709be15e1ea2529a0e89f742d25fe0`. Layer 0 is
+  green through `l_out-0`. The full 42-layer path executes but is still red:
+  the deterministic non-repacked reference had max absolute logit error
+  `2.1698594`, mean absolute error `0.38767775`, RMS error `0.48177935`, the
+  same argmax token, and 18/20 top-20 overlap. Layer probes first cross `0.05`
+  at layer 7 and drift smoothly, with no shared-KV cliff. Remaining work is to
+  isolate and fix accumulated later-layer numerical drift, rerun full logits
+  and generated-token parity, then eliminate duplicate dense materialization or
+  otherwise prove an acceptable peak-memory bound. Do not widen the `0.05`
+  contract to close MF.8.
 
 ## Track Closure
 

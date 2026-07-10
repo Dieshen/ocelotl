@@ -39,9 +39,9 @@ ggml K-quant layouts and the loader has an explicit dequantizing value API:
 
 | GGML type | Elements per block | Bytes per block | Value status | Execution status |
 | --- | ---: | ---: | --- | --- |
-| `Q4K` | 256 | 144 | exact dequant tested | dense fallback only; native projection rejected |
-| `Q5K` | 256 | 176 | exact dequant and bounded raw-byte load tested | native Q8_K attention projection |
-| `Q6K` | 256 | 210 | exact dequant and bounded raw-byte load tested | native Q8_K attention projection |
+| `Q4K` | 256 | 144 | exact dequant and bounded raw-byte load tested | native Q8_K text projection |
+| `Q5K` | 256 | 176 | exact dequant and bounded raw-byte load tested | native Q8_K text projection |
+| `Q6K` | 256 | 210 | exact dequant and bounded raw-byte load tested | native Q8_K text projection |
 
 `inspect_gguf` rejects Q4K/Q5K/Q6K tensors whose row width or total element
 count is not divisible by 256, and validates the computed byte range against
@@ -65,19 +65,33 @@ pattern metadata, sliding-window masking, shared-KV reuse, final logit softcap,
 post-branch RMSNorms, per-layer embeddings, layer output scales, and Gemma4
 RoPE frequency factors for that subset. Follow-up coverage also executes
 explicitly dequantized Q4_K_M-origin text tensors in that path. Raw quantized
-tensors cannot enter `Gemma4TextWeights`; native bytes are held in separate
-validated attention-projection sidecars. The selected real Gemma4 GGUF artifact
-remains blocked on multimodal handling and complete llama.cpp reference parity.
+tensors cannot enter `Gemma4TextWeights`; native bytes are held in separate,
+shape-validated text-projection sidecars. The native path now covers Q4_K,
+Q5_K, and Q6_K matrices for attention, FFN gate/up/down, per-layer input/output,
+and the tied output projection. Each kernel quantizes the F32 activation row to
+Q8_K and follows the pinned llama.cpp AVX2 reduction order.
 
-As of the 2026-06-11 local proof, Gemma4 loads validated native attention
-sidecars for the selected artifact's layer-0 Q/K/V/O types
-Q6_K/Q5_K/Q6_K/Q5_K. The public text parity path uses native Q5_K/Q6_K x Q8_K
-projection for those tensors and matches llama.cpp through `kqv_out-0`, which
-closes the prior `Qcur-0` projection and K/V/SDPA gaps. The first remaining
-mismatch is the Q5_K output projection: Ocelotl `attn_output_proj-0` sums to
-`-3.062695`, while llama.cpp `node_33` sums to `-3.404522` (diff
-`0.34182692`, tolerance `0.05`). Q4_K native projection remains explicitly
-unsupported and uses the tested eager-dequantized dense fallback where needed.
+As of the 2026-07-10 local proof, the selected layer-0 Q/K/V/O inventory remains
+Q6_K/Q5_K/Q6_K/Q5_K, but the complete text model now uses native sidecars for
+all supported quantized projection matrices. With the pinned llama.cpp
+reference forced to non-flash attention, F32 K/V cache, and `--no-repack`, the
+real layer-0 trace matches through `l_out-0` with a largest sampled difference
+of approximately `6.2e-5` at tolerance `0.05`. Default tests independently pin
+hand-checked Q4_K/Q5_K/Q6_K values, scale/min behavior, malformed lengths, and
+the pinned llama.cpp AVX2 reduction result.
+
+The full 42-layer path reaches final logits, but parity is not closed. The
+latest non-repacked reference comparison had max absolute error `2.1698594`,
+mean absolute error `0.38767775`, RMS error `0.48177935`, identical top-1, and
+18/20 top-20 overlap. Layer samples begin crossing `0.05` at layer 7 and drift
+smoothly rather than failing at one projection. This remains a numeric-parity
+blocker; the `0.05` tolerance must not be widened to hide accumulated drift.
+
+The correctness-first loader currently materializes eager F32 fallbacks in
+addition to native sidecars. That simplifies discriminators but duplicates
+large weights. A production-alpha implementation should avoid dense
+materialization where a validated native sidecar exists and measure peak memory,
+load latency, and tokens per second on the selected artifact.
 
 ## Kernel Contract
 

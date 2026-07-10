@@ -133,9 +133,9 @@ Gemma4:
   shared dense/global layers reuse `kv_from_start - 1`. `Gemma4TextModel`
   reuses cached post-K-RMSNorm, post-RoPE K activations plus V activations from
   the source layer while keeping current-layer Q, output projection, and MLP
-  behavior. A later semantics slice normalizes V before it is cached. Real
-  Q4_K_M execution remains blocked on multimodal handling and real-artifact
-  logits parity.
+  behavior. A later semantics slice normalizes V before it is cached. At this
+  historical slice, real Q4_K_M execution was still blocked on multimodal
+  handling and real-artifact logits parity.
 - A follow-up dequantized-origin slice allows the same text-forward path to
   execute Q4_K_M-origin Gemma4 text tensors after they have been explicitly
   materialized through `load_gguf_tensors_dequantized_f32`. The gate now trusts
@@ -186,15 +186,20 @@ Gemma4:
   layer outputs, and layer-0 substeps. The initial 2026-06-11 local
   discriminator showed `inp_scaled` and `attn_norm-0` matching llama.cpp before
   `Qcur-0` diverged.
-- A follow-up native attention K-quant slice adds bounded Q4_K/Q5_K/Q6_K raw
-  payload loading, Q5_K/Q6_K x Q8_K kernels, and validated Gemma4 Q/K/V/O
-  sidecars. The selected layer-0 inventory is Q6_K/Q5_K/Q6_K/Q5_K, and the
-  public text parity path now matches llama.cpp through `kqv_out-0`. The active
-  real-artifact blocker is the Q5_K output projection: Ocelotl
-  `attn_output_proj-0 = -3.062695` versus llama.cpp
-  `node_33 = -3.404522`, diff `0.34182692` at tolerance `0.05`. Q4_K native
-  projection remains explicitly unsupported and uses the dequantized dense
-  fallback.
+- Follow-up native K-quant slices add bounded Q4_K/Q5_K/Q6_K raw payload
+  loading, Q4_K/Q5_K/Q6_K x Q8_K kernels, and validated Gemma4 sidecars for
+  every text attention, FFN, per-layer input/output, and tied output projection.
+  The selected layer-0 Q/K/V/O inventory is Q6_K/Q5_K/Q6_K/Q5_K. The
+  2026-07-10 pinned non-flash/F32-cache/no-repack llama.cpp proof matches the
+  complete layer through `l_out-0`, with a largest sampled difference of about
+  `6.2e-5` at tolerance `0.05`.
+- The full selected 42-layer artifact now executes to its 262,144-logit output,
+  but MF.8 parity remains open. The same deterministic reference reported max
+  absolute error `2.1698594`, mean absolute error `0.38767775`, RMS error
+  `0.48177935`, identical top-1, and 18/20 top-20 overlap. Layer probes show
+  accumulated drift beginning at layer 7 rather than a new single-projection or
+  shared-KV cliff. The eager F32 fallback is also still materialized beside
+  native sidecars, so peak-memory and load-time hardening remains required.
 - MF.4 adds `Qwen3_5Config`, a Qwen-family metadata contract for the
   `qwen3_5_moe` Hugging Face config shape. It recognizes Qwen3.5 separately
   from Qwen2.5 and rejects hybrid attention, sparse MoE, multimodal, and FP8
