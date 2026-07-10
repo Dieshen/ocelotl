@@ -6,7 +6,9 @@
 
 use std::collections::VecDeque;
 
-use ocelotl_core::{InvalidRequestError, OcelotlError, Result, RuntimeError, TokenId};
+use ocelotl_core::{
+    InvalidRequestError, OcelotlError, RequestLimits, Result, RuntimeError, TokenId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
@@ -92,6 +94,7 @@ struct RequestSlot {
 #[derive(Debug, Clone)]
 pub struct ContinuousBatchScheduler {
     config: SchedulerConfig,
+    limits: RequestLimits,
     pending: VecDeque<RequestSlot>,
     active: VecDeque<RequestSlot>,
     completed: Vec<ScheduledGenerationResponse>,
@@ -103,12 +106,27 @@ impl ContinuousBatchScheduler {
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
             config,
+            limits: RequestLimits::default(),
             pending: VecDeque::new(),
             active: VecDeque::new(),
             completed: Vec::new(),
             cleanup_log: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    /// Construct a scheduler with deployment-specific request ceilings.
+    pub fn with_limits(config: SchedulerConfig, limits: RequestLimits) -> Result<Self> {
+        limits.validate()?;
+        Ok(Self {
+            config,
+            limits,
+            pending: VecDeque::new(),
+            active: VecDeque::new(),
+            completed: Vec::new(),
+            cleanup_log: Vec::new(),
+            events: Vec::new(),
+        })
     }
 
     pub fn submit(&mut self, request: ScheduledGenerationRequest) -> Result<()> {
@@ -133,6 +151,8 @@ impl ContinuousBatchScheduler {
                 message: "must be greater than zero".to_string(),
             }));
         }
+        self.limits
+            .validate_generation(request.prompt_tokens.len(), request.max_new_tokens)?;
         if self
             .pending
             .iter()
@@ -149,10 +169,23 @@ impl ContinuousBatchScheduler {
             }));
         }
 
+        let mut generated_tokens = Vec::new();
+        generated_tokens
+            .try_reserve_exact(request.max_new_tokens)
+            .map_err(|source| {
+                OcelotlError::Runtime(RuntimeError {
+                    message: format!(
+                        "failed to reserve {} generated tokens: {source}",
+                        request.max_new_tokens
+                    ),
+                })
+            })?;
+
+        self.start_new_batch_history_if_idle();
         let slot = RequestSlot {
             request_id: request.request_id,
             prompt_tokens: request.prompt_tokens,
-            generated_tokens: Vec::with_capacity(request.max_new_tokens),
+            generated_tokens,
             max_new_tokens: request.max_new_tokens,
             state: SchedulerRequestState::Queued,
         };
@@ -222,7 +255,7 @@ impl ContinuousBatchScheduler {
                 });
                 self.completed.push(ScheduledGenerationResponse {
                     request_id: slot.request_id,
-                    tokens: slot.generated_tokens.clone(),
+                    tokens: std::mem::take(&mut slot.generated_tokens),
                 });
                 self.cleanup(slot)?;
             } else {
@@ -236,13 +269,14 @@ impl ContinuousBatchScheduler {
             }
         }
 
-        self.completed.sort_by_key(|response| {
+        let mut completed = std::mem::take(&mut self.completed);
+        completed.sort_by_key(|response| {
             self.events
                 .iter()
                 .position(|event| event.request_id == response.request_id)
                 .unwrap_or(usize::MAX)
         });
-        Ok(self.completed.clone())
+        Ok(completed)
     }
 
     pub fn cleanup_log(&self) -> &[u64] {
@@ -281,6 +315,13 @@ impl ContinuousBatchScheduler {
         });
         self.cleanup_log.push(slot.request_id);
         Ok(())
+    }
+
+    fn start_new_batch_history_if_idle(&mut self) {
+        if self.pending.is_empty() && self.active.is_empty() && self.completed.is_empty() {
+            self.events.clear();
+            self.cleanup_log.clear();
+        }
     }
 }
 
@@ -433,5 +474,64 @@ mod tests {
         assert_eq!(emitted[0], 1);
         assert_eq!(emitted[1], 2);
         assert!(emitted[2..].iter().all(|id| *id == 1));
+    }
+
+    #[test]
+    fn scheduler_with_limits_rejects_output_and_combined_context_before_reservation() {
+        let limits = RequestLimits {
+            max_prompt_tokens: 4,
+            max_new_tokens: 2,
+            max_context_tokens: 5,
+            max_audio_samples: 16_000,
+        };
+        let mut scheduler =
+            ContinuousBatchScheduler::with_limits(SchedulerConfig { max_queue_len: 4 }, limits)
+                .expect("valid limits must construct a scheduler");
+
+        let output_err = scheduler
+            .submit(request(1, &[1], 3))
+            .expect_err("max_new_tokens over the policy must fail");
+        assert!(matches!(output_err, OcelotlError::InvalidRequest(_)));
+
+        let context_err = scheduler
+            .submit(request(2, &[1, 2, 3, 4], 2))
+            .expect_err("prompt plus output over the context policy must fail");
+        match context_err {
+            OcelotlError::InvalidRequest(invalid) => {
+                assert_eq!(invalid.field, "context_tokens");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheduler_rejects_pathological_reservation_without_panicking() {
+        let mut scheduler = ContinuousBatchScheduler::new(SchedulerConfig { max_queue_len: 1 });
+
+        let err = scheduler
+            .submit(request(1, &[1], usize::MAX))
+            .expect_err("pathological token capacity must return an error");
+
+        assert!(matches!(err, OcelotlError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn scheduler_reuse_returns_only_current_batch_and_replaces_history() {
+        let mut scheduler = ContinuousBatchScheduler::new(SchedulerConfig { max_queue_len: 2 });
+        scheduler.submit(request(1, &[1], 1)).unwrap();
+        let first = scheduler.run_to_completion(&IncrementingMockModel).unwrap();
+        assert_eq!(first[0].request_id, 1);
+
+        scheduler.submit(request(2, &[10], 1)).unwrap();
+        let second = scheduler.run_to_completion(&IncrementingMockModel).unwrap();
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].request_id, 2);
+        assert!(scheduler.events().iter().all(|event| event.request_id == 2));
+        assert_eq!(scheduler.cleanup_log(), &[2]);
+
+        scheduler
+            .submit(request(1, &[100], 1))
+            .expect("a completed request id may be reused in a later batch");
     }
 }
