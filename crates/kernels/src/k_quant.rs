@@ -1,4 +1,4 @@
-use ocelotl_core::{OcelotlError, Result, UnsupportedError};
+use ocelotl_core::Result;
 
 use crate::{checked_len_product, kernel_err};
 
@@ -31,25 +31,13 @@ pub fn linear_q8_k_k_quant(
     matrix: GgmlKQuantMatrixRef<'_>,
     out: &mut [f32],
 ) -> Result<()> {
-    if matrix.kind == GgmlKQuantKind::Q4K {
-        return Err(unsupported_k_quant_projection(matrix.kind));
-    }
-
     validate_k_quant_linear(x, rows, matrix, out)?;
 
     match matrix.kind {
+        GgmlKQuantKind::Q4K => linear_q8_k_q4_k(x, rows, matrix, out),
         GgmlKQuantKind::Q5K => linear_q8_k_q5_k(x, rows, matrix, out),
         GgmlKQuantKind::Q6K => linear_q8_k_q6_k(x, rows, matrix, out),
-        GgmlKQuantKind::Q4K => unreachable!("Q4_K returns Unsupported before validation"),
     }
-}
-
-fn unsupported_k_quant_projection(kind: GgmlKQuantKind) -> OcelotlError {
-    OcelotlError::Unsupported(UnsupportedError {
-        feature: "ggml_k_quant_projection".to_string(),
-        requested: Some(format!("{kind:?}")),
-        supported: vec!["Q5K".to_string(), "Q6K".to_string()],
-    })
 }
 
 fn validate_k_quant_linear(
@@ -111,6 +99,29 @@ fn validate_k_quant_linear(
             "linear_q8_k_k_quant raw weight bytes {} do not match expected {expected_bytes}",
             matrix.data.len()
         )));
+    }
+    Ok(())
+}
+
+fn linear_q8_k_q4_k(
+    x: &[f32],
+    rows: usize,
+    matrix: GgmlKQuantMatrixRef<'_>,
+    out: &mut [f32],
+) -> Result<()> {
+    let blocks_per_output = matrix.input_features / QK_K;
+    let row_bytes = blocks_per_output * Q4_K_BLOCK_BYTES;
+
+    for row in 0..rows {
+        let x_start = row * matrix.input_features;
+        let q8_blocks = quantize_row_q8_k(&x[x_start..x_start + matrix.input_features])?;
+        for output in 0..matrix.output_features {
+            let weight_start = output * row_bytes;
+            out[row * matrix.output_features + output] = vec_dot_q4_k_q8_k(
+                &matrix.data[weight_start..weight_start + row_bytes],
+                &q8_blocks,
+            );
+        }
     }
     Ok(())
 }
@@ -224,6 +235,60 @@ fn quantize_row_q8_k(input: &[f32]) -> Result<Vec<Q8KBlock>> {
     Ok(blocks)
 }
 
+fn vec_dot_q4_k_q8_k(raw_q4_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
+    debug_assert_eq!(raw_q4_k_row.len(), q8_blocks.len() * Q4_K_BLOCK_BYTES);
+    let mut accumulator = [0.0_f32; 8];
+    let mut min_accumulator = [0.0_f32; 4];
+
+    for (raw_block, q8) in raw_q4_k_row
+        .chunks_exact(Q4_K_BLOCK_BYTES)
+        .zip(q8_blocks.iter())
+    {
+        let d = q8.d * f16_le_at(raw_block, 0);
+        let dmin = -q8.d * f16_le_at(raw_block, 2);
+        let scales = &raw_block[4..16];
+        let qs = &raw_block[16..144];
+
+        for (lane, min_acc) in min_accumulator.iter_mut().enumerate() {
+            let group0 = lane * 2;
+            let group1 = group0 + 1;
+            let (_, min0) = get_scale_min_k4(group0, scales);
+            let (_, min1) = get_scale_min_k4(group1, scales);
+            let sum0 = q8.sums16[group0 * 2] + q8.sums16[group0 * 2 + 1];
+            let sum1 = q8.sums16[group1 * 2] + q8.sums16[group1 * 2 + 1];
+            let min_product = i32::from(min0) * sum0 + i32::from(min1) * sum1;
+            *min_acc = dmin.mul_add(min_product as f32, *min_acc);
+        }
+
+        let mut aux32 = [0_i32; 8];
+        for group64 in 0..QK_K / 64 {
+            let (low_scale, _) = get_scale_min_k4(group64 * 2, scales);
+            let (high_scale, _) = get_scale_min_k4(group64 * 2 + 1, scales);
+            let q_start = group64 * 32;
+            let value_start = group64 * 64;
+            for (lane, aux) in aux32.iter_mut().enumerate() {
+                let chunk_start = lane * 4;
+                let mut low_sum = 0_i32;
+                let mut high_sum = 0_i32;
+                for offset in 0..4 {
+                    let packed = qs[q_start + chunk_start + offset];
+                    low_sum += i32::from(q8.qs[value_start + chunk_start + offset])
+                        * i32::from(packed & 0x0f);
+                    high_sum += i32::from(q8.qs[value_start + 32 + chunk_start + offset])
+                        * i32::from(packed >> 4);
+                }
+                *aux += i32::from(low_scale) * low_sum + i32::from(high_scale) * high_sum;
+            }
+        }
+
+        for (lane, aux) in aux32.iter().enumerate() {
+            accumulator[lane] = d.mul_add(*aux as f32, accumulator[lane]);
+        }
+    }
+
+    hsum_float_8_avx(accumulator) + hsum_float_4_sse(min_accumulator)
+}
+
 fn vec_dot_q5_k_q8_k(raw_q5_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
     debug_assert_eq!(raw_q5_k_row.len(), q8_blocks.len() * Q5_K_BLOCK_BYTES);
     let mut accumulator = [0.0_f32; 8];
@@ -267,14 +332,14 @@ fn vec_dot_q5_k_q8_k(raw_q5_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
         for group32 in 0..QK_K / 32 {
             let (scale, _) = get_scale_min_k4(group32, scales);
             let value_start = group32 * 32;
-            for lane in 0..8 {
+            for (lane, aux) in aux32.iter_mut().enumerate() {
                 let chunk_start = value_start + lane * 4;
                 let chunk_sum = (0..4)
                     .map(|offset| {
                         i32::from(q8.qs[chunk_start + offset]) * quants[chunk_start + offset]
                     })
                     .sum::<i32>();
-                aux32[lane] += i32::from(scale) * chunk_sum;
+                *aux += i32::from(scale) * chunk_sum;
             }
         }
 
@@ -292,6 +357,10 @@ fn hsum_float_8_avx(values: [f32; 8]) -> f32 {
     let pair2 = values[6] + values[2];
     let pair3 = values[7] + values[3];
     (pair0 + pair2) + (pair1 + pair3)
+}
+
+fn hsum_float_4_sse(values: [f32; 4]) -> f32 {
+    (values[0] + values[2]) + (values[1] + values[3])
 }
 
 fn vec_dot_q6_k_q8_k(raw_q6_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
@@ -328,7 +397,7 @@ fn vec_dot_q6_k_q8_k(raw_q6_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
             let value_start = group32 * 32;
             let low_scale = i32::from(i8::from_ne_bytes([scales[group32 * 2]]));
             let high_scale = i32::from(i8::from_ne_bytes([scales[group32 * 2 + 1]]));
-            for lane in 0..8 {
+            for (lane, aux) in aux32.iter_mut().enumerate() {
                 let chunk_start = value_start + lane * 4;
                 let chunk_sum = (0..4)
                     .map(|offset| {
@@ -336,15 +405,15 @@ fn vec_dot_q6_k_q8_k(raw_q6_k_row: &[u8], q8_blocks: &[Q8KBlock]) -> f32 {
                     })
                     .sum::<i32>();
                 let scale = if lane < 4 { low_scale } else { high_scale };
-                aux32[lane] += scale * chunk_sum;
+                *aux += scale * chunk_sum;
             }
         }
 
-        for lane in 0..8 {
+        for (lane, aux) in aux32.iter_mut().enumerate() {
             let scale0 = i32::from(i8::from_ne_bytes([scales[lane * 2]]));
             let scale1 = i32::from(i8::from_ne_bytes([scales[lane * 2 + 1]]));
             let zero_point = (q8.sums16[lane * 2] * scale0 + q8.sums16[lane * 2 + 1] * scale1) * 32;
-            aux32[lane] -= zero_point;
+            *aux -= zero_point;
         }
 
         let d = q8.d * f16_le_at(raw_block, 208);
@@ -412,6 +481,22 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ocelotl_core::OcelotlError;
+
+    fn q4_single_weight_block() -> Vec<u8> {
+        let mut block = vec![0_u8; Q4_K_BLOCK_BYTES];
+        block[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[4] = 1;
+        block[16] = 0x01;
+        block
+    }
+
+    fn q4_single_min_block() -> Vec<u8> {
+        let mut block = vec![0_u8; Q4_K_BLOCK_BYTES];
+        block[2..4].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[8] = 1;
+        block
+    }
 
     fn q6_single_weight_block() -> Vec<u8> {
         let mut block = vec![0_u8; Q6_K_BLOCK_BYTES];
@@ -444,6 +529,88 @@ mod tests {
             kind,
             data,
         }
+    }
+
+    #[test]
+    fn q4_k_q8_k_projection_matches_hand_checked_single_weight() {
+        let weight = q4_single_weight_block();
+        let mut x = vec![0.0_f32; QK_K * 2];
+        x[0] = 1.0;
+        x[QK_K] = 2.0;
+        let mut out = vec![0.0_f32; 2];
+
+        linear_q8_k_k_quant(
+            &x,
+            2,
+            single_output_matrix(&weight, GgmlKQuantKind::Q4K),
+            &mut out,
+        )
+        .expect("Q4_K x Q8_K projection must succeed");
+
+        assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn q4_k_q8_k_projection_applies_min_term() {
+        let weight = q4_single_min_block();
+        let mut x = vec![0.0_f32; QK_K];
+        x[0] = 1.0;
+        let mut out = vec![0.0_f32; 1];
+
+        linear_q8_k_k_quant(
+            &x,
+            1,
+            single_output_matrix(&weight, GgmlKQuantKind::Q4K),
+            &mut out,
+        )
+        .expect("Q4_K min term projection must succeed");
+
+        assert_eq!(out, vec![-1.0]);
+    }
+
+    #[test]
+    fn q4_k_q8_k_projection_matches_pinned_llama_cpp_avx2_reduction_order() {
+        const BLOCKS: usize = 8;
+        let mut state = 0xa341_316c_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        let mut weight = vec![0_u8; BLOCKS * Q4_K_BLOCK_BYTES];
+        for block in 0..BLOCKS {
+            let start = block * Q4_K_BLOCK_BYTES;
+            let d = 0x2400_u16 + (next() % 0x1400) as u16;
+            let dmin = 0x2400_u16 + (next() % 0x1400) as u16;
+            weight[start..start + 2].copy_from_slice(&d.to_le_bytes());
+            weight[start + 2..start + 4].copy_from_slice(&dmin.to_le_bytes());
+            for byte in &mut weight[start + 4..start + Q4_K_BLOCK_BYTES] {
+                *byte = (next() >> 24) as u8;
+            }
+        }
+        let input = (0..BLOCKS * QK_K)
+            .map(|_| {
+                let numerator = (next() % 20_001) as i32 - 10_000;
+                let denominator = next() % 997 + 3;
+                numerator as f32 / denominator as f32
+            })
+            .collect::<Vec<_>>();
+        let mut out = [0.0_f32; 1];
+
+        linear_q8_k_k_quant(
+            &input,
+            1,
+            GgmlKQuantMatrixRef {
+                input_features: BLOCKS * QK_K,
+                output_features: 1,
+                kind: GgmlKQuantKind::Q4K,
+                data: &weight,
+            },
+            &mut out,
+        )
+        .expect("pinned eight-block Q4_K x Q8_K tripwire must project");
+
+        // llama.cpp 856c3adac, x86 AVX2/FMA ggml_vec_dot_q4_K_q8_K.
+        assert_eq!(out[0].to_bits(), 0x47d5_bab8);
     }
 
     #[test]
@@ -632,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn q4_k_projection_remains_explicitly_unsupported() {
+    fn q4_k_q8_k_projection_rejects_bad_weight_byte_length() {
         let q4_weight = vec![0_u8; Q4_K_BLOCK_BYTES - 1];
         let x = vec![0.0_f32; QK_K];
         let mut out = vec![0.0_f32; 1];
@@ -643,15 +810,11 @@ mod tests {
             single_output_matrix(&q4_weight, GgmlKQuantKind::Q4K),
             &mut out,
         )
-        .expect_err("Q4_K native projection is not implemented in this slice");
+        .expect_err("bad Q4_K byte length must fail");
 
         match err {
-            OcelotlError::Unsupported(unsupported) => {
-                assert_eq!(unsupported.feature, "ggml_k_quant_projection");
-                assert_eq!(unsupported.requested.as_deref(), Some("Q4K"));
-                assert_eq!(unsupported.supported, vec!["Q5K", "Q6K"]);
-            }
-            other => panic!("expected Unsupported for Q4K, got {other:?}"),
+            OcelotlError::Kernel(kernel) => assert!(kernel.message.contains("raw weight bytes")),
+            other => panic!("expected KernelError for bad Q4_K bytes, got {other:?}"),
         }
     }
 }
