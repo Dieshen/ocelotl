@@ -17,3 +17,10 @@ cubecl-wgpu = ["cubecl", "cubecl/wgpu"]
 cubecl = { version = "0.10.0", default-features = false, optional = true }
 ocelotl-core.workspace = true
 rayon = "1.10"
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "kernel_primitives"
+harness = false

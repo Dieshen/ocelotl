@@ -20,5 +20,10 @@ ocelotl-tokenizer.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 ocelotl-loader.workspace = true
 serde_json.workspace = true
+
+[[bench]]
+name = "qwen_cached_decode"
+harness = false

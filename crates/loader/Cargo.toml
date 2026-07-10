@@ -15,4 +15,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 ocelotl-core = { workspace = true, features = ["test-fixtures"] }
+
+[[bench]]
+name = "loader_artifacts"
+harness = false

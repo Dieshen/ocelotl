@@ -21,4 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 ocelotl-tokenizer.workspace = true
+
+[[bench]]
+name = "whisper_audio"
+harness = false
