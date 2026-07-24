@@ -352,6 +352,12 @@ fn missing_whisper_cpp_binary_record_has_clear_remediation() {
 
 #[test]
 fn dry_run_emits_plan_environment_and_truthful_effective_configuration() {
+    if !pwsh_available() {
+        eprintln!(
+            "skipping dry_run_emits_plan_environment_and_truthful_effective_configuration: pwsh (PowerShell) not on PATH"
+        );
+        return;
+    }
     let repo_root = repo_root();
     let output = Command::new("pwsh")
         .args([
@@ -400,6 +406,12 @@ fn dry_run_emits_plan_environment_and_truthful_effective_configuration() {
 
 #[test]
 fn dry_run_rejects_command_thread_configuration_mismatch() {
+    if !pwsh_available() {
+        eprintln!(
+            "skipping dry_run_rejects_command_thread_configuration_mismatch: pwsh (PowerShell) not on PATH"
+        );
+        return;
+    }
     let repo_root = repo_root();
     let mut manifest: serde_json::Value =
         serde_json::from_str(&read_fixture("whisper_cpp_manifest.example.json"))
@@ -451,6 +463,12 @@ fn dry_run_rejects_command_thread_configuration_mismatch() {
 
 #[test]
 fn runner_executes_alternating_samples_and_preserves_ocelotl_timing_json() {
+    if !pwsh_available() {
+        eprintln!(
+            "skipping runner_executes_alternating_samples_and_preserves_ocelotl_timing_json: pwsh (PowerShell) not on PATH"
+        );
+        return;
+    }
     let repo_root = repo_root();
     let pwsh = powershell_executable();
     let nonce = SystemTime::now()
@@ -728,6 +746,22 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
+}
+
+/// Returns true when a `pwsh` (PowerShell) interpreter is on `PATH`.
+///
+/// The whisper.cpp benchmark harness is a PowerShell script
+/// (`tools/whisper-cpp-bench.ps1`), so the tests that launch it can only run
+/// where PowerShell is installed — the Windows dev box, or a Linux host with
+/// the optional `powershell` package. Elsewhere (default Linux CI / Cortex)
+/// those tests skip rather than fail, mirroring the artifact-gated Whisper
+/// parity tests that `return` early when their inputs are absent.
+fn pwsh_available() -> bool {
+    Command::new("pwsh")
+        .args(["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn powershell_executable() -> String {
