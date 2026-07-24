@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 
 use ocelotl_core::{DType, Result};
+pub use ocelotl_kernels::transpose_2d;
 use ocelotl_loader::{LoadedTensor, SupportedDtype};
 
 use super::{checked_len_product, config::Qwen2_5Config, invalid_model, validate_config_for_model};
@@ -239,16 +240,6 @@ impl Qwen2_5Weights {
 /// row-major slice. Used at weight-load time to flip HF's
 /// `[out_features, in_features]` storage into the `[in, out]` layout the
 /// matmul kernel consumes without re-walking memory in column order.
-pub fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    debug_assert_eq!(src.len(), rows * cols);
-    let mut dst = vec![0.0_f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            dst[c * rows + r] = src[r * cols + c];
-        }
-    }
-    dst
-}
 
 fn take_tensor_values(
     by_name: &mut BTreeMap<String, LoadedTensor>,

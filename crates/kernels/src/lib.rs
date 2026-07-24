@@ -53,9 +53,11 @@ pub use cubecl_backend::{
 pub use cubecl_backend::{CubeClKernelBackend, linear_out_by_in_cubecl, rope_apply_inplace_cubecl};
 pub mod k_quant;
 pub use k_quant::{GgmlKQuantKind, GgmlKQuantMatrixRef, linear_q8_k_k_quant};
+pub mod layout;
 pub mod mlp;
 pub mod rmsnorm;
 pub mod tensor;
+pub use layout::transpose_2d;
 pub use tensor::{DeviceBuffer, DeviceTensor, HostBorrow, HostBorrowMut, Residency};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
