@@ -41,7 +41,7 @@ pub mod pooling;
 pub use cpu_backend::CpuKernelBackend;
 #[cfg(feature = "cubecl")]
 pub mod cubecl_backend;
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 pub use cubecl_backend::{
     CUBECL_WGPU_BACKEND, WgpuDeviceBuffer, linear_out_by_in_wgpu, rope_apply_inplace_wgpu,
 };

@@ -340,7 +340,7 @@ impl EmbeddingGemmaModel {
 // and L2 stay on host (a single small vector). This is the batched-friendly
 // path the design note argued for: the encoder is a stack of GEMMs.
 // ---------------------------------------------------------------------------
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 mod gpu {
     use super::*;
     use ocelotl_kernels::{CubeClKernelBackend, DeviceTensor, KernelBackend};
@@ -657,7 +657,7 @@ mod gpu {
     }
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 pub use gpu::EmbeddingGemmaGpu;
 
 #[cfg(test)]
@@ -743,7 +743,7 @@ mod tests {
     }
 
     /// GPU device-resident embedding dump, for external cosine vs the reference.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     #[ignore = "requires OCELOTL_EMBGEMMA_GGUF + a WGPU GPU; dumps the GPU embedding"]
     fn embeddinggemma_gpu_dump_embedding() {
@@ -770,7 +770,7 @@ mod tests {
     }
 
     /// GPU throughput bench (load-once, time-many). Weights resident on device.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     #[ignore = "requires OCELOTL_EMBGEMMA_GGUF + OCELOTL_BENCH_TOKENS + a WGPU GPU"]
     fn embeddinggemma_gpu_bench() {
@@ -811,7 +811,7 @@ mod tests {
     /// equal-length sequences (the first bench prompt, replicated so the batch
     /// is uniform-length) and runs one `embed_batch`. Also asserts batch parity:
     /// every batched embedding must match the single-embed path (cosine ~1).
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     #[ignore = "requires OCELOTL_EMBGEMMA_GGUF + OCELOTL_BENCH_TOKENS + a WGPU GPU"]
     fn embeddinggemma_gpu_bench_batched() {
