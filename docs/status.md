@@ -33,7 +33,7 @@ service.
 | M8 | not started | There is no supported network server endpoint, streaming transport, authentication, or external error contract. |
 | Whisper ASR | alpha candidate; opt-in evidence green | Real tiny.en exact-token parity and a repeated equal-resource whisper.cpp comparison passed locally. The proof remains opt-in because weights and reference binaries are not committed. |
 | Gemma4 text | executes; real final-logit parity blocked | The selected Q4_K_M text path loads and executes all 42 layers with native Q4_K/Q5_K/Q6_K projections. Layer 0 is green, but the final real-artifact logit distribution is still outside tolerance. |
-| Text embeddings | parity-clean on CPU; unoptimized | Two bidirectional encoders (`gemma::embedding::EmbeddingGemmaModel`, `qwen::pplx_embed::PplxEmbedModel`) produce mean-pooled, L2-normalized embeddings. Cosine ≥ 0.9999997 vs `llama-embedding` with full retrieval-ranking agreement on a 12-sentence corpus. CPU kernels are naive scalar (EmbeddingGemma ~1.5 s/embed, pplx ~23.6 s/embed); optimization and GPU residency are follow-ups. Parity proof is opt-in (needs the GGUFs). |
+| Text embeddings | parity-clean; CPU at/above llama.cpp on bulk | Two bidirectional encoders (`gemma::embedding::EmbeddingGemmaModel`, `qwen::pplx_embed::PplxEmbedModel`) produce mean-pooled, L2-normalized embeddings. Cosine ≥ 0.9999997 vs `llama-embedding` with full retrieval-ranking agreement on a 12-sentence corpus. AVX2 `linear_out_by_in` fast path: single-seq 78 ms / 196 ms (EmbeddingGemma / pplx, ~2–2.5× llama.cpp); bulk (rayon over sentences) 13.1 ms/embed (2.4× *faster* than llama.cpp) / 98.8 ms (parity). Remaining: AVX-512 microkernel, GPU residency. Parity proof is opt-in (needs the GGUFs). |
 
 ## Whisper
 
