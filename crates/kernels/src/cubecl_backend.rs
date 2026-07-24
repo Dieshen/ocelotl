@@ -401,6 +401,44 @@ impl KernelBackend for CubeClKernelBackend {
         out.write_from_host_slice(&out_buf)
     }
 
+    /// Device-resident **RMSNorm** (Gemma/Qwen normalization — no mean, no
+    /// bias). Launches the cube kernel when every operand is on the WGPU
+    /// runtime; otherwise reads back and runs the host scalar `rmsnorm`.
+    fn rmsnorm_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        hidden: usize,
+        weight: &DeviceTensor,
+        eps: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        if weight.len() != hidden || x.len() != rows * hidden || out.len() != rows * hidden {
+            return Err(cubecl_err(format!(
+                "rmsnorm_d shape mismatch: x={} weight={} out={} expected rows*hidden={}",
+                x.len(),
+                weight.len(),
+                out.len(),
+                rows * hidden
+            )));
+        }
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(x_buf), Some(w_buf), Some(out_buf)) = (
+                extract_wgpu_buf(x),
+                extract_wgpu_buf(weight),
+                extract_wgpu_buf(out),
+            ) {
+                return run_rmsnorm_d_wgpu(x_buf, rows, hidden, w_buf, eps, out_buf);
+            }
+        }
+        let x_host = x.to_host_owned()?;
+        let w_host = weight.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; rows * hidden];
+        crate::rmsnorm::rmsnorm(&x_host, rows, hidden, &w_host, eps, &mut out_buf)?;
+        out.write_from_host_slice(&out_buf)
+    }
+
     /// Device-resident encoder self-attention. When every operand is a
     /// `WgpuDeviceBuffer`, launch the fused cube kernel against the
     /// existing handles — no host bounce, no scalar fallback. When the
@@ -980,6 +1018,38 @@ fn layer_norm_naive_f32(
     }
 }
 
+/// Device-resident **RMSNorm** (no mean subtraction, no bias): one thread per
+/// row computes `out[c] = x[c] / sqrt(mean(x²) + eps) * weight[c]`. This is the
+/// normalization Gemma/Qwen use (the `layer_norm` kernel above is standard
+/// LayerNorm and is *not* interchangeable). Same naive one-pass-per-row shape as
+/// `layer_norm_naive_f32`; encoder rows are small so a fused reduction is not
+/// worth it yet.
+#[cfg(feature = "cubecl-wgpu")]
+#[cube(launch_unchecked)]
+fn rmsnorm_naive_f32(
+    x: &Array<f32>,
+    weight: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] hidden: usize,
+    eps: f32,
+) {
+    let row = ABSOLUTE_POS;
+    let row_start = row * hidden;
+    if row_start + hidden > output.len() {
+        terminate!();
+    }
+    let mut sq_sum = f32::new(0.0);
+    for c in 0..hidden {
+        let v = x[row_start + c];
+        sq_sum += v * v;
+    }
+    let mean_sq = sq_sum / f32::cast_from(hidden as u32);
+    let inv_rms = f32::new(1.0) / f32::sqrt(mean_sq + eps);
+    for c in 0..hidden {
+        output[row_start + c] = x[row_start + c] * inv_rms * weight[c];
+    }
+}
+
 /// Compute `(workgroup_count, workgroup_size)` for a 1-D elementwise
 /// launch sized `total` (in cells), rounded up to whole workgroups. Same
 /// pattern as `prepare_linear_launch`: WGPU caps workgroup size at 256 on
@@ -1173,6 +1243,38 @@ fn run_layer_norm_d_wgpu(
             ArrayArg::from_raw_parts(x.clone_handle(), x.len_f32()),
             ArrayArg::from_raw_parts(weight.clone_handle(), weight.len_f32()),
             ArrayArg::from_raw_parts(bias.clone_handle(), bias.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), out.len_f32()),
+            hidden,
+            eps,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_rmsnorm_d_wgpu(
+    x: &WgpuDeviceBuffer,
+    rows: usize,
+    hidden: usize,
+    weight: &WgpuDeviceBuffer,
+    eps: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_per_row_launch(rows)?;
+    let out_handle = client.empty(out.len_f32() * std::mem::size_of::<f32>());
+
+    unsafe {
+        rmsnorm_naive_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(x.clone_handle(), x.len_f32()),
+            ArrayArg::from_raw_parts(weight.clone_handle(), weight.len_f32()),
             ArrayArg::from_raw_parts(out_handle.clone(), out.len_f32()),
             hidden,
             eps,
@@ -3421,6 +3523,47 @@ mod tests {
             assert!(
                 abs <= 1e-4 || rel <= 1e-4,
                 "GPU layer_norm drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_rmsnorm_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_rmsnorm_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+
+        let rows = 19usize;
+        let hidden = 29usize;
+        let eps = 1e-6_f32;
+        let x_vec: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32) * 0.013).cos() * 3.0)
+            .collect();
+        // Gemma-like large-ish norm weights to exercise the affine scale.
+        let weight: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.4).collect();
+
+        let mut expected = vec![0.0_f32; rows * hidden];
+        crate::rmsnorm::rmsnorm(&x_vec, rows, hidden, &weight, eps, &mut expected)
+            .expect("scalar rmsnorm");
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x_vec).expect("upload x");
+        let w_d = backend.upload(&weight).expect("upload weight");
+        let out_d = backend.alloc(rows * hidden).expect("alloc output");
+        backend
+            .rmsnorm_d(&x_d, rows, hidden, &w_d, eps, &out_d)
+            .expect("device rmsnorm_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU rmsnorm drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
             );
         }
     }

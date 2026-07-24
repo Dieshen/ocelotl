@@ -34,10 +34,10 @@ pub use rope::{rope_apply_inplace, rope_apply_inplace_with_factors};
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
 pub mod attention;
-pub mod pooling;
 #[cfg(target_arch = "x86_64")]
 mod cpu_avx2;
 mod cpu_backend;
+pub mod pooling;
 pub use cpu_backend::CpuKernelBackend;
 #[cfg(feature = "cubecl")]
 pub mod cubecl_backend;
@@ -455,6 +455,27 @@ pub trait KernelBackend: Debug + Send + Sync {
             eps,
             &mut out_buf,
         );
+        out.write_from_host_slice(&out_buf)
+    }
+
+    /// Device-resident **RMSNorm** (`out = x / sqrt(mean(x²) + eps) * weight`;
+    /// no mean subtraction, no bias) — the normalization Gemma/Qwen use. The
+    /// default reads back and runs the host scalar `rmsnorm`; GPU backends
+    /// override it to stay on device. Distinct from [`Self::layer_norm_d`],
+    /// which is standard LayerNorm and not interchangeable here.
+    fn rmsnorm_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        hidden: usize,
+        weight: &DeviceTensor,
+        eps: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        let x_host = x.to_host_owned()?;
+        let weight_host = weight.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; rows * hidden];
+        rmsnorm::rmsnorm(&x_host, rows, hidden, &weight_host, eps, &mut out_buf)?;
         out.write_from_host_slice(&out_buf)
     }
 
