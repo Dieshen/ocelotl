@@ -333,6 +333,197 @@ impl EmbeddingGemmaModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Device-resident (GPU) forward. Uploads all weights once, chains every layer
+// on-device via the `_d` kernels (rmsnorm/linear/rope/GQA-expand/encoder-attn/
+// gelu/mul/add), and only reads back the final pre-pool hidden state. Mean-pool
+// and L2 stay on host (a single small vector). This is the batched-friendly
+// path the design note argued for: the encoder is a stack of GEMMs.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "cubecl-wgpu")]
+mod gpu {
+    use super::*;
+    use ocelotl_kernels::{CubeClKernelBackend, DeviceTensor, KernelBackend};
+
+    /// Per-position NEOX cos/sin tables `[n_positions * head_dim/2]`.
+    fn rope_tables(head_dim: usize, n_positions: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
+        let half = head_dim / 2;
+        let mut cos = Vec::with_capacity(n_positions * half);
+        let mut sin = Vec::with_capacity(n_positions * half);
+        for pos in 0..n_positions {
+            for i in 0..half {
+                let inv_freq = theta.powf(-2.0 * (i as f32) / head_dim as f32);
+                let angle = pos as f32 * inv_freq;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+        (cos, sin)
+    }
+
+    struct GpuLayer {
+        attn_norm: DeviceTensor,
+        attn_q: DeviceTensor,
+        attn_k: DeviceTensor,
+        attn_v: DeviceTensor,
+        attn_q_norm: DeviceTensor,
+        attn_k_norm: DeviceTensor,
+        attn_output: DeviceTensor,
+        post_attention_norm: DeviceTensor,
+        ffn_norm: DeviceTensor,
+        ffn_gate: DeviceTensor,
+        ffn_up: DeviceTensor,
+        ffn_down: DeviceTensor,
+        post_ffw_norm: DeviceTensor,
+    }
+
+    /// EmbeddingGemma with all weights resident on the GPU.
+    pub struct EmbeddingGemmaGpu {
+        config: EmbeddingGemmaConfig,
+        backend: CubeClKernelBackend,
+        token_embd: Vec<f32>,
+        output_norm: DeviceTensor,
+        layers: Vec<GpuLayer>,
+    }
+
+    impl EmbeddingGemmaGpu {
+        /// Load the GGUF on CPU, then upload every weight to GPU ordinal 0.
+        pub fn load_from_gguf(path: &std::path::Path) -> Result<Self> {
+            let cpu = EmbeddingGemmaModel::load_from_gguf(path)?;
+            let backend = CubeClKernelBackend::new_gpu(0);
+            let up = |v: &[f32]| backend.upload(v);
+            let output_norm = up(&cpu.output_norm)?;
+            let mut layers = Vec::with_capacity(cpu.layers.len());
+            for l in &cpu.layers {
+                layers.push(GpuLayer {
+                    attn_norm: up(&l.attn_norm)?,
+                    attn_q: up(&l.attn_q)?,
+                    attn_k: up(&l.attn_k)?,
+                    attn_v: up(&l.attn_v)?,
+                    attn_q_norm: up(&l.attn_q_norm)?,
+                    attn_k_norm: up(&l.attn_k_norm)?,
+                    attn_output: up(&l.attn_output)?,
+                    post_attention_norm: up(&l.post_attention_norm)?,
+                    ffn_norm: up(&l.ffn_norm)?,
+                    ffn_gate: up(&l.ffn_gate)?,
+                    ffn_up: up(&l.ffn_up)?,
+                    ffn_down: up(&l.ffn_down)?,
+                    post_ffw_norm: up(&l.post_ffw_norm)?,
+                });
+            }
+            Ok(Self {
+                config: cpu.config,
+                backend,
+                token_embd: cpu.token_embd,
+                output_norm,
+                layers,
+            })
+        }
+
+        pub fn config(&self) -> &EmbeddingGemmaConfig {
+            &self.config
+        }
+
+        /// Device-resident encoder forward → mean-pooled, L2-normalized vector.
+        pub fn embed(&self, tokens: &[TokenId]) -> Result<Vec<f32>> {
+            let cfg = &self.config;
+            let seq = tokens.len();
+            if seq == 0 {
+                return Err(rt("EmbeddingGemma embed requires at least one token"));
+            }
+            let h = cfg.embedding_length;
+            let hd = cfg.head_dim;
+            let nq = cfg.head_count;
+            let nkv = cfg.head_count_kv;
+            let q_dim = nq * hd;
+            let kv_dim = nkv * hd;
+            let f = cfg.feed_forward_length;
+            let eps = cfg.rms_norm_eps;
+            let scale = 1.0_f32 / (hd as f32).sqrt();
+            let b = &self.backend;
+
+            // Token gather + Gemma √h scale on host, then upload.
+            let mut hidden_host = vec![0.0_f32; seq * h];
+            for (pos, tok) in tokens.iter().enumerate() {
+                let src = (tok.0 as usize) * h;
+                if src + h > self.token_embd.len() {
+                    return Err(rt(format!("token id {} out of vocab range", tok.0)));
+                }
+                hidden_host[pos * h..pos * h + h].copy_from_slice(&self.token_embd[src..src + h]);
+            }
+            let embed_scale = (h as f32).sqrt();
+            for x in &mut hidden_host {
+                *x *= embed_scale;
+            }
+            let hidden = b.upload(&hidden_host)?;
+
+            // Dual-base RoPE tables (global vs sliding-window layers).
+            let (cg, sg) = rope_tables(hd, seq, cfg.rope_freq_base);
+            let (cs, ss) = rope_tables(hd, seq, cfg.rope_freq_base_swa);
+            let (cg, sg) = (b.upload(&cg)?, b.upload(&sg)?);
+            let (cs, ss) = (b.upload(&cs)?, b.upload(&ss)?);
+
+            // Reusable device scratch.
+            let norm = b.alloc(seq * h)?;
+            let q = b.alloc(seq * q_dim)?;
+            let k = b.alloc(seq * kv_dim)?;
+            let v = b.alloc(seq * kv_dim)?;
+            let qn = b.alloc(seq * q_dim)?;
+            let kn = b.alloc(seq * kv_dim)?;
+            let kn_exp = b.alloc(seq * q_dim)?;
+            let v_exp = b.alloc(seq * q_dim)?;
+            let attn = b.alloc(seq * q_dim)?;
+            let o = b.alloc(seq * h)?;
+            let post = b.alloc(seq * h)?;
+            let ffn_in = b.alloc(seq * h)?;
+            let gate = b.alloc(seq * f)?;
+            let up = b.alloc(seq * f)?;
+            let mlp_out = b.alloc(seq * h)?;
+
+            for (il, layer) in self.layers.iter().enumerate() {
+                let (cos_d, sin_d) = if is_global_layer(il) {
+                    (&cg, &sg)
+                } else {
+                    (&cs, &ss)
+                };
+                // Attention.
+                b.rmsnorm_d(&hidden, seq, h, &layer.attn_norm, eps, &norm)?;
+                b.linear_d(&norm, seq, h, &layer.attn_q, q_dim, None, &q)?;
+                b.linear_d(&norm, seq, h, &layer.attn_k, kv_dim, None, &k)?;
+                b.linear_d(&norm, seq, h, &layer.attn_v, kv_dim, None, &v)?;
+                b.rmsnorm_d(&q, seq * nq, hd, &layer.attn_q_norm, eps, &qn)?;
+                b.rmsnorm_d(&k, seq * nkv, hd, &layer.attn_k_norm, eps, &kn)?;
+                b.rope_tables_d(&qn, cos_d, sin_d, hd, nq)?;
+                b.rope_tables_d(&kn, cos_d, sin_d, hd, nkv)?;
+                b.expand_kv_heads_d(&kn, &kn_exp, hd, nq, nkv)?;
+                b.expand_kv_heads_d(&v, &v_exp, hd, nq, nkv)?;
+                b.attention_encoder_d(&qn, &kn_exp, &v_exp, seq, nq, hd, scale, &attn)?;
+                b.linear_d(&attn, seq, q_dim, &layer.attn_output, h, None, &o)?;
+                b.rmsnorm_d(&o, seq, h, &layer.post_attention_norm, eps, &post)?;
+                b.add_inplace_d(&hidden, &post)?;
+                // FFN (gated-tanh-GELU).
+                b.rmsnorm_d(&hidden, seq, h, &layer.ffn_norm, eps, &ffn_in)?;
+                b.linear_d(&ffn_in, seq, h, &layer.ffn_gate, f, None, &gate)?;
+                b.linear_d(&ffn_in, seq, h, &layer.ffn_up, f, None, &up)?;
+                b.gelu_inplace_d(&gate)?;
+                b.mul_inplace_d(&gate, &up)?;
+                b.linear_d(&gate, seq, f, &layer.ffn_down, h, None, &mlp_out)?;
+                b.rmsnorm_d(&mlp_out, seq, h, &layer.post_ffw_norm, eps, &post)?;
+                b.add_inplace_d(&hidden, &post)?;
+            }
+
+            b.rmsnorm_d(&hidden, seq, h, &self.output_norm, eps, &norm)?;
+            let normed = norm.to_host_owned()?;
+            let mut emb = mean_pool(&normed, seq, h)?;
+            l2_normalize(&mut emb);
+            Ok(emb)
+        }
+    }
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+pub use gpu::EmbeddingGemmaGpu;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +600,71 @@ mod tests {
         let elapsed = start.elapsed().as_secs_f64();
         eprintln!(
             "EMBGEMMA_BENCH parallel={parallel} embeds={iters} elapsed_s={elapsed:.3} ms_per_embed={:.3} embeds_per_s={:.1} tokens_per_s={:.1}",
+            elapsed / iters as f64 * 1000.0,
+            iters as f64 / elapsed,
+            total_tokens as f64 / elapsed,
+        );
+    }
+
+    /// GPU device-resident embedding dump, for external cosine vs the reference.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    #[ignore = "requires OCELOTL_EMBGEMMA_GGUF + a WGPU GPU; dumps the GPU embedding"]
+    fn embeddinggemma_gpu_dump_embedding() {
+        let gguf = std::env::var("OCELOTL_EMBGEMMA_GGUF").expect("set OCELOTL_EMBGEMMA_GGUF");
+        let model = EmbeddingGemmaGpu::load_from_gguf(std::path::Path::new(&gguf))
+            .expect("GPU EmbeddingGemma must load");
+        let default_q1 =
+            "2 8071 236787 3927 1354 1109 7609 236787 2088 776 564 14724 1041 27971 8918 236881 1";
+        let tok_str =
+            std::env::var("OCELOTL_EMBGEMMA_TOKENS").unwrap_or_else(|_| default_q1.into());
+        let toks: Vec<TokenId> = tok_str
+            .split_whitespace()
+            .map(|x| TokenId(x.parse().expect("token id must be u32")))
+            .collect();
+        let emb = model.embed(&toks).expect("gpu embed must run");
+        assert_eq!(emb.len(), model.config().embedding_length);
+        eprintln!(
+            "EMBGEMMA_GPU {}",
+            emb.iter()
+                .map(|x| format!("{x:.6}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
+    /// GPU throughput bench (load-once, time-many). Weights resident on device.
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    #[ignore = "requires OCELOTL_EMBGEMMA_GGUF + OCELOTL_BENCH_TOKENS + a WGPU GPU"]
+    fn embeddinggemma_gpu_bench() {
+        let gguf = std::env::var("OCELOTL_EMBGEMMA_GGUF").expect("set OCELOTL_EMBGEMMA_GGUF");
+        let tokens_path = std::env::var("OCELOTL_BENCH_TOKENS").expect("set OCELOTL_BENCH_TOKENS");
+        let iters: usize = std::env::var("OCELOTL_BENCH_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let prompts: Vec<Vec<TokenId>> = std::fs::read_to_string(&tokens_path)
+            .expect("read tokens file")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                l.split_whitespace()
+                    .map(|x| TokenId(x.parse().unwrap()))
+                    .collect()
+            })
+            .collect();
+        let model = EmbeddingGemmaGpu::load_from_gguf(std::path::Path::new(&gguf))
+            .expect("model must load");
+        let _ = model.embed(&prompts[0]).unwrap();
+        let total_tokens: usize = (0..iters).map(|i| prompts[i % prompts.len()].len()).sum();
+        let start = std::time::Instant::now();
+        for i in 0..iters {
+            let _ = model.embed(&prompts[i % prompts.len()]).expect("embed");
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!(
+            "EMBGEMMA_GPU_BENCH embeds={iters} elapsed_s={elapsed:.3} ms_per_embed={:.3} embeds_per_s={:.1} tokens_per_s={:.1}",
             elapsed / iters as f64 * 1000.0,
             iters as f64 / elapsed,
             total_tokens as f64 / elapsed,
