@@ -518,6 +518,142 @@ mod gpu {
             l2_normalize(&mut emb);
             Ok(emb)
         }
+
+        /// Batched device-resident forward over `batch` **equal-length**
+        /// sequences (bucket by length at the caller). The linears, norms,
+        /// RoPE, and activations run over all `batch*seq_len` rows in one launch
+        /// each; attention is block-diagonal (`attention_encoder_batched_d`).
+        /// This amortizes the ~14-launches-per-layer fixed cost over the whole
+        /// batch — the point of GPU batching. Returns one embedding per input.
+        pub fn embed_batch(&self, batch: &[&[TokenId]]) -> Result<Vec<Vec<f32>>> {
+            let cfg = &self.config;
+            let bs = batch.len();
+            if bs == 0 {
+                return Ok(Vec::new());
+            }
+            let seq = batch[0].len();
+            if seq == 0 || batch.iter().any(|s| s.len() != seq) {
+                return Err(rt("embed_batch requires non-empty equal-length sequences"));
+            }
+            let h = cfg.embedding_length;
+            let hd = cfg.head_dim;
+            let nq = cfg.head_count;
+            let nkv = cfg.head_count_kv;
+            let q_dim = nq * hd;
+            let kv_dim = nkv * hd;
+            let f = cfg.feed_forward_length;
+            let eps = cfg.rms_norm_eps;
+            let scale = 1.0_f32 / (hd as f32).sqrt();
+            let rows = bs * seq;
+            let b = &self.backend;
+
+            // Gather + Gemma √h scale for every sequence, concatenated.
+            let mut hidden_host = vec![0.0_f32; rows * h];
+            for (bi, toks) in batch.iter().enumerate() {
+                for (pos, tok) in toks.iter().enumerate() {
+                    let src = (tok.0 as usize) * h;
+                    if src + h > self.token_embd.len() {
+                        return Err(rt(format!("token id {} out of vocab range", tok.0)));
+                    }
+                    let dst = (bi * seq + pos) * h;
+                    hidden_host[dst..dst + h].copy_from_slice(&self.token_embd[src..src + h]);
+                }
+            }
+            let embed_scale = (h as f32).sqrt();
+            for x in &mut hidden_host {
+                *x *= embed_scale;
+            }
+            let hidden = b.upload(&hidden_host)?;
+
+            // Periodic RoPE tables: position for global token g is g % seq.
+            let (cg, sg) = rope_tables_periodic(hd, seq, bs, cfg.rope_freq_base);
+            let (cs, ss) = rope_tables_periodic(hd, seq, bs, cfg.rope_freq_base_swa);
+            let (cg, sg) = (b.upload(&cg)?, b.upload(&sg)?);
+            let (cs, ss) = (b.upload(&cs)?, b.upload(&ss)?);
+
+            let norm = b.alloc(rows * h)?;
+            let q = b.alloc(rows * q_dim)?;
+            let k = b.alloc(rows * kv_dim)?;
+            let v = b.alloc(rows * kv_dim)?;
+            let qn = b.alloc(rows * q_dim)?;
+            let kn = b.alloc(rows * kv_dim)?;
+            let kn_exp = b.alloc(rows * q_dim)?;
+            let v_exp = b.alloc(rows * q_dim)?;
+            let attn = b.alloc(rows * q_dim)?;
+            let o = b.alloc(rows * h)?;
+            let post = b.alloc(rows * h)?;
+            let ffn_in = b.alloc(rows * h)?;
+            let gate = b.alloc(rows * f)?;
+            let up = b.alloc(rows * f)?;
+            let mlp_out = b.alloc(rows * h)?;
+
+            for (il, layer) in self.layers.iter().enumerate() {
+                let (cos_d, sin_d) = if is_global_layer(il) {
+                    (&cg, &sg)
+                } else {
+                    (&cs, &ss)
+                };
+                b.rmsnorm_d(&hidden, rows, h, &layer.attn_norm, eps, &norm)?;
+                b.linear_d(&norm, rows, h, &layer.attn_q, q_dim, None, &q)?;
+                b.linear_d(&norm, rows, h, &layer.attn_k, kv_dim, None, &k)?;
+                b.linear_d(&norm, rows, h, &layer.attn_v, kv_dim, None, &v)?;
+                b.rmsnorm_d(&q, rows * nq, hd, &layer.attn_q_norm, eps, &qn)?;
+                b.rmsnorm_d(&k, rows * nkv, hd, &layer.attn_k_norm, eps, &kn)?;
+                b.rope_tables_d(&qn, cos_d, sin_d, hd, nq)?;
+                b.rope_tables_d(&kn, cos_d, sin_d, hd, nkv)?;
+                b.expand_kv_heads_d(&kn, &kn_exp, hd, nq, nkv)?;
+                b.expand_kv_heads_d(&v, &v_exp, hd, nq, nkv)?;
+                b.attention_encoder_batched_d(&qn, &kn_exp, &v_exp, bs, seq, nq, hd, scale, &attn)?;
+                b.linear_d(&attn, rows, q_dim, &layer.attn_output, h, None, &o)?;
+                b.rmsnorm_d(&o, rows, h, &layer.post_attention_norm, eps, &post)?;
+                b.add_inplace_d(&hidden, &post)?;
+                b.rmsnorm_d(&hidden, rows, h, &layer.ffn_norm, eps, &ffn_in)?;
+                b.linear_d(&ffn_in, rows, h, &layer.ffn_gate, f, None, &gate)?;
+                b.linear_d(&ffn_in, rows, h, &layer.ffn_up, f, None, &up)?;
+                b.gelu_inplace_d(&gate)?;
+                b.mul_inplace_d(&gate, &up)?;
+                b.linear_d(&gate, rows, f, &layer.ffn_down, h, None, &mlp_out)?;
+                b.rmsnorm_d(&mlp_out, rows, h, &layer.post_ffw_norm, eps, &post)?;
+                b.add_inplace_d(&hidden, &post)?;
+            }
+
+            b.rmsnorm_d(&hidden, rows, h, &self.output_norm, eps, &norm)?;
+            let normed = norm.to_host_owned()?;
+            // Per-sequence mean-pool + L2.
+            let mut out = Vec::with_capacity(bs);
+            for bi in 0..bs {
+                let block = &normed[bi * seq * h..(bi + 1) * seq * h];
+                let mut emb = mean_pool(block, seq, h)?;
+                l2_normalize(&mut emb);
+                out.push(emb);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Periodic NEOX cos/sin tables `[batch*seq_len * head_dim/2]` where the
+    /// per-position angle for global token `g` uses position `g % seq_len` —
+    /// so `rope_tables_d` (which indexes by global token row) applies the right
+    /// per-sequence rotation across a stacked batch with no kernel change.
+    fn rope_tables_periodic(
+        head_dim: usize,
+        seq_len: usize,
+        batch: usize,
+        theta: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let half = head_dim / 2;
+        let mut cos = Vec::with_capacity(batch * seq_len * half);
+        let mut sin = Vec::with_capacity(batch * seq_len * half);
+        for g in 0..batch * seq_len {
+            let pos = (g % seq_len) as f32;
+            for i in 0..half {
+                let inv_freq = theta.powf(-2.0 * (i as f32) / head_dim as f32);
+                let angle = pos * inv_freq;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+        (cos, sin)
     }
 }
 
@@ -668,6 +804,53 @@ mod tests {
             elapsed / iters as f64 * 1000.0,
             iters as f64 / elapsed,
             total_tokens as f64 / elapsed,
+        );
+    }
+
+    /// Batched GPU throughput bench. Builds a batch of `OCELOTL_BENCH_ITERS`
+    /// equal-length sequences (the first bench prompt, replicated so the batch
+    /// is uniform-length) and runs one `embed_batch`. Also asserts batch parity:
+    /// every batched embedding must match the single-embed path (cosine ~1).
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    #[ignore = "requires OCELOTL_EMBGEMMA_GGUF + OCELOTL_BENCH_TOKENS + a WGPU GPU"]
+    fn embeddinggemma_gpu_bench_batched() {
+        let gguf = std::env::var("OCELOTL_EMBGEMMA_GGUF").expect("set OCELOTL_EMBGEMMA_GGUF");
+        let tokens_path = std::env::var("OCELOTL_BENCH_TOKENS").expect("set OCELOTL_BENCH_TOKENS");
+        let batch_n: usize = std::env::var("OCELOTL_BENCH_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let first: Vec<TokenId> = std::fs::read_to_string(&tokens_path)
+            .expect("read tokens file")
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .expect("at least one prompt")
+            .split_whitespace()
+            .map(|x| TokenId(x.parse().unwrap()))
+            .collect();
+        let seq = first.len();
+        let model = EmbeddingGemmaGpu::load_from_gguf(std::path::Path::new(&gguf))
+            .expect("model must load");
+        let batch: Vec<Vec<TokenId>> = (0..batch_n).map(|_| first.clone()).collect();
+        let refs: Vec<&[TokenId]> = batch.iter().map(|v| v.as_slice()).collect();
+        // Warm up + parity: batched[0] must match the single-embed path.
+        let single = model.embed(&first).expect("single embed");
+        let warm = model.embed_batch(&refs).expect("batch embed");
+        let cos: f32 = single.iter().zip(warm[0].iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            cos > 0.9999,
+            "batched vs single cosine {cos} (should be ~1)"
+        );
+
+        let start = std::time::Instant::now();
+        let _ = model.embed_batch(&refs).expect("batch embed");
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!(
+            "EMBGEMMA_GPU_BATCHED batch={batch_n} seq={seq} batch_cos={cos:.6} elapsed_s={elapsed:.3} ms_per_embed={:.3} embeds_per_s={:.1} tokens_per_s={:.1}",
+            elapsed / batch_n as f64 * 1000.0,
+            batch_n as f64 / elapsed,
+            (batch_n * seq) as f64 / elapsed,
         );
     }
 }

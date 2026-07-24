@@ -134,6 +134,61 @@ impl CubeClKernelBackend {
         dst.write_from_host_slice(&dst_h)
     }
 
+    /// Device-resident **block-diagonal** encoder attention over a batch of
+    /// `batch` equal-length (`seq_len`) sequences stacked in `q`/`k`/`v` as
+    /// `[batch*seq_len, n_head*head_dim]`. Each sequence attends only within
+    /// itself. One launch covers the whole batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_encoder_batched_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        batch: usize,
+        seq_len: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(qb), Some(kb), Some(vb), Some(ob)) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(k),
+                extract_wgpu_buf(v),
+                extract_wgpu_buf(out),
+            ) {
+                return run_attention_encoder_batched_d_wgpu(
+                    qb, kb, vb, batch, seq_len, n_head, head_dim, scale, ob,
+                );
+            }
+        }
+        // Host fallback: run the scalar encoder attention per sequence block.
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let state = n_head * head_dim;
+        let block = seq_len * state;
+        let mut out_host = vec![0.0_f32; batch * block];
+        for b in 0..batch {
+            let s = b * block;
+            let mut block_out = vec![0.0_f32; block];
+            crate::attention_encoder_scalar(
+                &q_host[s..s + block],
+                &k_host[s..s + block],
+                &v_host[s..s + block],
+                seq_len,
+                n_head,
+                head_dim,
+                scale,
+                &mut block_out,
+            );
+            out_host[s..s + block].copy_from_slice(&block_out);
+        }
+        out.write_from_host_slice(&out_host)
+    }
+
     #[cfg(feature = "cubecl-wgpu")]
     pub fn rope_apply_inplace(
         &self,
@@ -1766,6 +1821,82 @@ fn attention_encoder_f32(
     }
 }
 
+/// Block-diagonal encoder attention for a batch of equal-length sequences.
+/// Layout is `[batch * seq_len, n_head * head_dim]` with sequences stacked
+/// contiguously; query row `r`'s block is `r / seq_len`, and it attends only
+/// keys in `[block*seq_len, block*seq_len + seq_len)` — no cross-sequence
+/// leakage. Same online-softmax body as `attention_encoder_f32`, just with the
+/// key range offset by the block, so one launch covers the whole batch (the
+/// point of batching: amortize dispatch overhead over many sequences).
+#[cfg(feature = "cubecl-wgpu")]
+#[cube(launch_unchecked)]
+fn attention_encoder_batched_f32(
+    q: &Array<f32>,
+    k: &Array<f32>,
+    v: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] seq_len: usize,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    scale: f32,
+) {
+    #[allow(clippy::unnecessary_cast)]
+    let pos = ABSOLUTE_POS as usize;
+    let state = n_head * head_dim;
+    let total_rows = output.len() / state;
+    let total = total_rows * n_head;
+    if pos >= total {
+        terminate!();
+    }
+
+    let query_row = pos / n_head;
+    let head = pos - query_row * n_head;
+    let block = query_row / seq_len;
+    let key_start = block * seq_len;
+    let q_base = query_row * state + head * head_dim;
+
+    // Seed with the block's first key.
+    let k_base_0 = key_start * state + head * head_dim;
+    let mut m = f32::new(0.0);
+    for d in 0..head_dim {
+        m += q[q_base + d] * k[k_base_0 + d];
+    }
+    m *= scale;
+
+    let p0 = f32::new(1.0);
+    let mut l = p0;
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let mut acc = SharedMemory::<f32>::new(ENC_ATTN_WG as usize * head_dim);
+    let acc_base = lane * head_dim;
+    for d in 0..head_dim {
+        acc[acc_base + d] = p0 * v[k_base_0 + d];
+    }
+
+    for jj in 1..seq_len {
+        let j = key_start + jj;
+        let k_base = j * state + head * head_dim;
+        let mut s = f32::new(0.0);
+        for d in 0..head_dim {
+            s += q[q_base + d] * k[k_base + d];
+        }
+        s *= scale;
+        let m_new = f32::max(m, s);
+        let alpha = f32::exp(m - m_new);
+        let p = f32::exp(s - m_new);
+        l = l * alpha + p;
+        let v_base = j * state + head * head_dim;
+        for d in 0..head_dim {
+            acc[acc_base + d] = acc[acc_base + d] * alpha + p * v[v_base + d];
+        }
+        m = m_new;
+    }
+
+    for d in 0..head_dim {
+        output[q_base + d] = acc[acc_base + d] / l;
+    }
+}
+
 /// Launch helper for the fused encoder-attention kernel. Validates buffer
 /// lengths (the kernel can't), allocates a fresh output handle, runs the
 /// kernel, and swaps the handle into `out_buf` so subsequent device reads
@@ -1822,6 +1953,73 @@ fn run_attention_encoder_d_wgpu(
             ArrayArg::from_raw_parts(v.clone_handle(), v.len_f32()),
             ArrayArg::from_raw_parts(out_handle.clone(), expected),
             seq,
+            n_head,
+            head_dim,
+            scale,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_encoder_batched_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    k: &WgpuDeviceBuffer,
+    v: &WgpuDeviceBuffer,
+    batch: usize,
+    seq_len: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        cubecl_wgpu_err("attention_encoder_batched_d n_head*head_dim overflowed usize")
+    })?;
+    let rows = batch.checked_mul(seq_len).ok_or_else(|| {
+        cubecl_wgpu_err("attention_encoder_batched_d batch*seq_len overflowed usize")
+    })?;
+    let expected = rows.checked_mul(state).ok_or_else(|| {
+        cubecl_wgpu_err("attention_encoder_batched_d rows*state overflowed usize")
+    })?;
+    for (label, len) in [
+        ("q", q.len_f32()),
+        ("k", k.len_f32()),
+        ("v", v.len_f32()),
+        ("out", out.len_f32()),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_encoder_batched_d {label} len {len} != batch*seq_len*state {expected}"
+            )));
+        }
+    }
+
+    let total = u32::try_from(rows * n_head).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_encoder_batched_d thread count {} exceeds u32 launch limit",
+            rows * n_head
+        ))
+    })?;
+    let workgroup_count = total.div_ceil(ENC_ATTN_WG).max(1);
+    let client = q.client();
+    let out_handle = client.empty(expected * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_encoder_batched_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(ENC_ATTN_WG),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(k.clone_handle(), k.len_f32()),
+            ArrayArg::from_raw_parts(v.clone_handle(), v.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), expected),
+            seq_len,
             n_head,
             head_dim,
             scale,
@@ -4012,6 +4210,66 @@ mod tests {
             .expect("expand_kv_heads_d");
         let got = dst_d.to_host_owned().expect("readback");
         assert_eq!(got, expected);
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_attention_encoder_batched_d_matches_per_block_scalar() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_encoder_batched_d_matches_per_block_scalar: no adapter"
+            );
+            return;
+        }
+        let batch = 3usize;
+        let seq_len = 5usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let block = seq_len * state;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let total = batch * block;
+        let q: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.021).sin()).collect();
+        let k: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.017).cos()).collect();
+        let v: Vec<f32> = (0..total)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+            .collect();
+        // Reference: independent per-block scalar encoder attention.
+        let mut expected = vec![0.0_f32; total];
+        for b in 0..batch {
+            let s = b * block;
+            let mut bo = vec![0.0_f32; block];
+            crate::attention_encoder_scalar(
+                &q[s..s + block],
+                &k[s..s + block],
+                &v[s..s + block],
+                seq_len,
+                n_head,
+                head_dim,
+                scale,
+                &mut bo,
+            );
+            expected[s..s + block].copy_from_slice(&bo);
+        }
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(total).expect("alloc out");
+        backend
+            .attention_encoder_batched_d(
+                &q_d, &k_d, &v_d, batch, seq_len, n_head, head_dim, scale, &out_d,
+            )
+            .expect("batched attention");
+        let got = out_d.to_host_owned().expect("readback");
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "batched attention drift at {idx}: scalar={s} gpu={g}"
+            );
+        }
     }
 
     #[cfg(feature = "cubecl-wgpu")]
