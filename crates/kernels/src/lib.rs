@@ -425,6 +425,32 @@ pub trait KernelBackend: Debug + Send + Sync {
         x.write_from_host_slice(&host)
     }
 
+    /// Elementwise SiLU `x = x * sigmoid(x)` (SwiGLU activation). Default
+    /// reads back and runs the host scalar; GPU backends override on device.
+    fn silu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
+        let mut host = x.to_host_owned()?;
+        mlp::silu_inplace(&mut host);
+        x.write_from_host_slice(&host)
+    }
+
+    /// Elementwise in-place product `lhs *= rhs` (the gated-MLP combine).
+    /// Default reads back and multiplies on host; GPU backends override.
+    fn mul_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
+        let mut lhs_host = lhs.to_host_owned()?;
+        let rhs_host = rhs.to_host_owned()?;
+        if lhs_host.len() != rhs_host.len() {
+            return Err(kernel_err(format!(
+                "mul_inplace_d length mismatch: lhs={} rhs={}",
+                lhs_host.len(),
+                rhs_host.len()
+            )));
+        }
+        for (l, r) in lhs_host.iter_mut().zip(rhs_host.iter()) {
+            *l *= *r;
+        }
+        lhs.write_from_host_slice(&lhs_host)
+    }
+
     /// Per-row LayerNorm with affine. `weight` and `bias` are length
     /// `hidden`; `x` and `out` are length `rows * hidden`. Variance uses
     /// the biased estimator (divide by `hidden`, not `hidden - 1`) so this

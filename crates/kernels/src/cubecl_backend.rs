@@ -56,6 +56,84 @@ impl CubeClKernelBackend {
         }
     }
 
+    /// Device-resident batched NEOX RoPE over `x = [seq * n_heads, head_dim]`.
+    /// `cos`/`sin` are per-position tables `[n_positions * (head_dim/2)]`
+    /// (position `p`, pair `i` at index `p*(head_dim/2)+i`). Rotates in place
+    /// (swap-on-write). Off the WGPU runtime it falls back to host tables.
+    pub fn rope_tables_d(
+        &self,
+        x: &DeviceTensor,
+        cos: &DeviceTensor,
+        sin: &DeviceTensor,
+        head_dim: usize,
+        n_heads: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(x_buf), Some(c_buf), Some(s_buf)) = (
+                extract_wgpu_buf(x),
+                extract_wgpu_buf(cos),
+                extract_wgpu_buf(sin),
+            ) {
+                return run_rope_tables_d_wgpu(x_buf, c_buf, s_buf, head_dim, n_heads);
+            }
+        }
+        // Host fallback: apply the same table rotation on readback.
+        let mut xs = x.to_host_owned()?;
+        let cos_h = cos.to_host_owned()?;
+        let sin_h = sin.to_host_owned()?;
+        let half = head_dim / 2;
+        let rows = xs.len() / head_dim;
+        for row in 0..rows {
+            let position = row / n_heads;
+            let base = row * head_dim;
+            for i in 0..half {
+                let c = cos_h[position * half + i];
+                let s = sin_h[position * half + i];
+                let lo = base + i;
+                let hi = lo + half;
+                let x_lo = xs[lo];
+                let x_hi = xs[hi];
+                xs[lo] = x_lo * c - x_hi * s;
+                xs[hi] = x_lo * s + x_hi * c;
+            }
+        }
+        x.write_from_host_slice(&xs)
+    }
+
+    /// Device-resident GQA key/value head expansion: `src = [seq, nkv,
+    /// head_dim]` → `dst = [seq, nq, head_dim]`, replicating each KV head
+    /// `nq/nkv` times so the MHA `attention_encoder_d` kernel applies.
+    pub fn expand_kv_heads_d(
+        &self,
+        src: &DeviceTensor,
+        dst: &DeviceTensor,
+        head_dim: usize,
+        nq: usize,
+        nkv: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(src_buf), Some(dst_buf)) = (extract_wgpu_buf(src), extract_wgpu_buf(dst)) {
+                return run_expand_kv_heads_d_wgpu(src_buf, dst_buf, head_dim, nq, nkv);
+            }
+        }
+        let src_h = src.to_host_owned()?;
+        let seq = src_h.len() / (nkv * head_dim);
+        let group = nq / nkv;
+        let mut dst_h = vec![0.0_f32; seq * nq * head_dim];
+        for token in 0..seq {
+            for out_head in 0..nq {
+                let src_head = out_head / group;
+                let src_base = (token * nkv + src_head) * head_dim;
+                let dst_base = (token * nq + out_head) * head_dim;
+                dst_h[dst_base..dst_base + head_dim]
+                    .copy_from_slice(&src_h[src_base..src_base + head_dim]);
+            }
+        }
+        dst.write_from_host_slice(&dst_h)
+    }
+
     #[cfg(feature = "cubecl-wgpu")]
     pub fn rope_apply_inplace(
         &self,
@@ -356,6 +434,33 @@ impl KernelBackend for CubeClKernelBackend {
             *v = crate::gelu_whisper_scalar(*v);
         }
         x.write_from_host_slice(&host)
+    }
+
+    fn silu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let Some(buf) = extract_wgpu_buf(x) {
+                return run_silu_inplace_d_wgpu(buf);
+            }
+        }
+        let mut host = x.to_host_owned()?;
+        crate::mlp::silu_inplace(&mut host);
+        x.write_from_host_slice(&host)
+    }
+
+    fn mul_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
+        #[cfg(feature = "cubecl-wgpu")]
+        {
+            if let (Some(lhs_buf), Some(rhs_buf)) = (extract_wgpu_buf(lhs), extract_wgpu_buf(rhs)) {
+                return run_mul_inplace_d_wgpu(lhs_buf, rhs_buf);
+            }
+        }
+        let mut lhs_host = lhs.to_host_owned()?;
+        let rhs_host = rhs.to_host_owned()?;
+        for (l, r) in lhs_host.iter_mut().zip(rhs_host.iter()) {
+            *l *= *r;
+        }
+        lhs.write_from_host_slice(&lhs_host)
     }
 
     /// Device-resident LayerNorm. When every operand is a
@@ -1135,6 +1240,34 @@ fn add_out_f32(lhs: &Array<f32>, rhs: &Array<f32>, output: &mut Array<f32>) {
     output[i] = lhs[i] + rhs[i];
 }
 
+/// Out-of-place elementwise product `output = lhs * rhs` (the gated-MLP
+/// `silu(gate) * up` / `gelu(gate) * up` step). Same kernel-vs-caller "in
+/// place" naming as `add_out_f32`.
+#[cfg(feature = "cubecl-wgpu")]
+#[cube(launch_unchecked)]
+fn mul_out_f32(lhs: &Array<f32>, rhs: &Array<f32>, output: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    if i >= output.len() {
+        terminate!();
+    }
+    output[i] = lhs[i] * rhs[i];
+}
+
+/// Out-of-place SiLU `output = x * sigmoid(x) = x / (1 + exp(-x))` (Qwen/pplx
+/// SwiGLU activation). `exp` is the same frontend intrinsic the attention
+/// softmax uses.
+#[cfg(feature = "cubecl-wgpu")]
+#[cube(launch_unchecked)]
+fn silu_out_f32(input: &Array<f32>, output: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    if i >= output.len() {
+        terminate!();
+    }
+    let v = input[i];
+    let sig = f32::new(1.0) / (f32::new(1.0) + f32::exp(-v));
+    output[i] = v * sig;
+}
+
 #[cfg(feature = "cubecl-wgpu")]
 fn run_copy_into_d_wgpu(
     src: &WgpuDeviceBuffer,
@@ -1193,6 +1326,63 @@ fn run_gelu_inplace_d_wgpu(x: &WgpuDeviceBuffer) -> Result<()> {
 
     unsafe {
         gelu_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(in_handle, len),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+        );
+    }
+
+    *x.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_mul_inplace_d_wgpu(lhs: &WgpuDeviceBuffer, rhs: &WgpuDeviceBuffer) -> Result<()> {
+    if lhs.len_f32() != rhs.len_f32() {
+        return Err(cubecl_wgpu_err(format!(
+            "mul_inplace_d length mismatch: lhs={} rhs={}",
+            lhs.len_f32(),
+            rhs.len_f32()
+        )));
+    }
+    let len = lhs.len_f32();
+    let client = lhs.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let lhs_handle = lhs.clone_handle();
+    let rhs_handle = rhs.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        mul_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(lhs_handle, len),
+            ArrayArg::from_raw_parts(rhs_handle, len),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+        );
+    }
+
+    *lhs.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_silu_inplace_d_wgpu(x: &WgpuDeviceBuffer) -> Result<()> {
+    let len = x.len_f32();
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let in_handle = x.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        silu_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(workgroup_size),
@@ -1282,6 +1472,74 @@ fn run_rmsnorm_d_wgpu(
     }
 
     *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_rope_tables_d_wgpu(
+    x: &WgpuDeviceBuffer,
+    cos: &WgpuDeviceBuffer,
+    sin: &WgpuDeviceBuffer,
+    head_dim: usize,
+    n_heads: usize,
+) -> Result<()> {
+    let len = x.len_f32();
+    let total_rows = len / head_dim;
+    let total_pairs = total_rows * (head_dim / 2);
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(total_pairs)?;
+    let in_handle = x.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        rope_tables_rows_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(in_handle, len),
+            ArrayArg::from_raw_parts(cos.clone_handle(), cos.len_f32()),
+            ArrayArg::from_raw_parts(sin.clone_handle(), sin.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+            head_dim,
+            n_heads,
+        );
+    }
+
+    *x.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "cubecl-wgpu")]
+fn run_expand_kv_heads_d_wgpu(
+    src: &WgpuDeviceBuffer,
+    dst: &WgpuDeviceBuffer,
+    head_dim: usize,
+    nq: usize,
+    nkv: usize,
+) -> Result<()> {
+    let len = dst.len_f32();
+    let client = src.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        expand_kv_heads_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(src.clone_handle(), src.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+            head_dim,
+            nq,
+            nkv,
+        );
+    }
+
+    *dst.handle
         .lock()
         .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
     Ok(())
@@ -2541,6 +2799,71 @@ fn rope_apply_f32(
     output[hi] = x_lo * s + x_hi * c;
 }
 
+/// Batched NEOX RoPE over a whole `[seq * n_heads, head_dim]` activation using
+/// per-position trig tables (`cos`/`sin` are `[n_positions * half]`, row-major
+/// by position). One thread per `(row, pair)`: `row = pos*n_heads + head`, so
+/// `position = row / n_heads`. Applying the whole tensor in one launch (instead
+/// of the per-(pos,head) host-slice `rope_apply_f32`) is what keeps RoPE
+/// device-resident inside the encoder forward.
+#[cfg(feature = "cubecl-wgpu")]
+#[cube(launch_unchecked)]
+fn rope_tables_rows_f32(
+    input: &Array<f32>,
+    cos: &Array<f32>,
+    sin: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] head_dim: usize,
+    #[comptime] n_heads: usize,
+) {
+    let half = head_dim / 2;
+    let pair = ABSOLUTE_POS;
+    let total_pairs = (output.len() / head_dim) * half;
+    if pair >= total_pairs {
+        terminate!();
+    }
+    let row = pair / half;
+    let i = pair - row * half;
+    let position = row / n_heads;
+    let base = row * head_dim;
+    let lo = base + i;
+    let hi = lo + half;
+    let c = cos[position * half + i];
+    let s = sin[position * half + i];
+    let x_lo = input[lo];
+    let x_hi = input[hi];
+    // Every cell is written: pair i writes lo (in [0,half)) and hi (in
+    // [half,head_dim)), so the two halves together cover the whole head.
+    output[lo] = x_lo * c - x_hi * s;
+    output[hi] = x_lo * s + x_hi * c;
+}
+
+/// Expand GQA key/value heads to match the query head count so the MHA-only
+/// `attention_encoder` kernel applies. `src` is `[seq * nkv * head_dim]`, `dst`
+/// is `[seq * nq * head_dim]`; each destination head `h` reads source head
+/// `h / (nq / nkv)`. One thread per destination cell.
+#[cfg(feature = "cubecl-wgpu")]
+#[cube(launch_unchecked)]
+fn expand_kv_heads_f32(
+    src: &Array<f32>,
+    dst: &mut Array<f32>,
+    #[comptime] head_dim: usize,
+    #[comptime] nq: usize,
+    #[comptime] nkv: usize,
+) {
+    let cell = ABSOLUTE_POS;
+    if cell >= dst.len() {
+        terminate!();
+    }
+    let group = nq / nkv;
+    let d = cell % head_dim;
+    let rem = cell / head_dim;
+    let out_head = rem % nq;
+    let token = rem / nq;
+    let src_head = out_head / group;
+    let src_idx = (token * nkv + src_head) * head_dim + d;
+    dst[cell] = src[src_idx];
+}
+
 /// Compute a single `[row, out_dim]` cell of `output = x * weight^T + bias`.
 ///
 /// `weight` is row-major `[out_features, in_features]` matching the CPU
@@ -3566,6 +3889,129 @@ mod tests {
                 "GPU rmsnorm drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
             );
         }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_silu_inplace_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_silu_inplace_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+        let x: Vec<f32> = (0..97).map(|i| (i as f32 - 48.0) * 0.2).collect();
+        let mut expected = x.clone();
+        crate::mlp::silu_inplace(&mut expected);
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x).expect("upload");
+        backend.silu_inplace_d(&x_d).expect("silu_d");
+        let got = x_d.to_host_owned().expect("readback");
+        for (s, g) in expected.iter().zip(got.iter()) {
+            let abs = (s - g).abs();
+            assert!(abs <= 1e-4, "silu drift scalar={s} gpu={g}");
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_mul_inplace_d_matches_scalar() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_mul_inplace_d_matches_scalar: no adapter");
+            return;
+        }
+        let a: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1).collect();
+        let b: Vec<f32> = (0..64).map(|i| (i as f32) * -0.03 + 1.0).collect();
+        let expected: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x * y).collect();
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let a_d = backend.upload(&a).expect("upload a");
+        let b_d = backend.upload(&b).expect("upload b");
+        backend.mul_inplace_d(&a_d, &b_d).expect("mul_d");
+        let got = a_d.to_host_owned().expect("readback");
+        for (s, g) in expected.iter().zip(got.iter()) {
+            assert!((s - g).abs() <= 1e-5, "mul drift scalar={s} gpu={g}");
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_rope_tables_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_rope_tables_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+        let seq = 5usize;
+        let n_heads = 3usize;
+        let head_dim = 8usize;
+        let theta = 1_000_000.0_f32;
+        let half = head_dim / 2;
+        let rows = seq * n_heads;
+        let x: Vec<f32> = (0..rows * head_dim)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        // Reference: apply the CPU rope per row with position = row / n_heads.
+        let mut expected = x.clone();
+        for row in 0..rows {
+            let position = row / n_heads;
+            let base = row * head_dim;
+            crate::rope::rope_apply_inplace(
+                &mut expected[base..base + head_dim],
+                head_dim,
+                position,
+                theta,
+            )
+            .expect("cpu rope");
+        }
+        // Build per-position cos/sin tables [seq * half].
+        let mut cos = Vec::with_capacity(seq * half);
+        let mut sin = Vec::with_capacity(seq * half);
+        for p in 0..seq {
+            let (c, s) = crate::rope::rope_trig_tables(head_dim, p, theta);
+            cos.extend_from_slice(&c);
+            sin.extend_from_slice(&s);
+        }
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x).expect("upload x");
+        let cos_d = backend.upload(&cos).expect("upload cos");
+        let sin_d = backend.upload(&sin).expect("upload sin");
+        backend
+            .rope_tables_d(&x_d, &cos_d, &sin_d, head_dim, n_heads)
+            .expect("rope_tables_d");
+        let got = x_d.to_host_owned().expect("readback");
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            assert!(abs <= 1e-4, "rope drift at {idx}: scalar={s} gpu={g}");
+        }
+    }
+
+    #[cfg(feature = "cubecl-wgpu")]
+    #[test]
+    fn wgpu_expand_kv_heads_d_matches_reference() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_expand_kv_heads_d_matches_reference: no adapter");
+            return;
+        }
+        let seq = 4usize;
+        let nkv = 2usize;
+        let nq = 6usize;
+        let head_dim = 5usize;
+        let group = nq / nkv;
+        let src: Vec<f32> = (0..seq * nkv * head_dim).map(|i| i as f32).collect();
+        let mut expected = vec![0.0_f32; seq * nq * head_dim];
+        for token in 0..seq {
+            for out_head in 0..nq {
+                let src_head = out_head / group;
+                let sb = (token * nkv + src_head) * head_dim;
+                let db = (token * nq + out_head) * head_dim;
+                expected[db..db + head_dim].copy_from_slice(&src[sb..sb + head_dim]);
+            }
+        }
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let src_d = backend.upload(&src).expect("upload src");
+        let dst_d = backend.alloc(seq * nq * head_dim).expect("alloc dst");
+        backend
+            .expand_kv_heads_d(&src_d, &dst_d, head_dim, nq, nkv)
+            .expect("expand_kv_heads_d");
+        let got = dst_d.to_host_owned().expect("readback");
+        assert_eq!(got, expected);
     }
 
     #[cfg(feature = "cubecl-wgpu")]
