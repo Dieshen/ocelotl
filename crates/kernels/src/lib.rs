@@ -34,6 +34,7 @@ pub use rope::{rope_apply_inplace, rope_apply_inplace_with_factors};
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
 pub mod attention;
+pub mod pooling;
 #[cfg(target_arch = "x86_64")]
 mod cpu_avx2;
 mod cpu_backend;
