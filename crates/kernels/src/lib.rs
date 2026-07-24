@@ -28,12 +28,16 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+pub mod recurrent;
+pub mod relpos;
 pub mod rope;
 pub use rope::{rope_apply_inplace, rope_apply_inplace_with_factors};
 
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
+pub mod activation;
 pub mod attention;
+pub mod conv;
 #[cfg(target_arch = "x86_64")]
 mod cpu_avx2;
 mod cpu_backend;
