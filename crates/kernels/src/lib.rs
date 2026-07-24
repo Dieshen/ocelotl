@@ -852,7 +852,10 @@ pub(crate) fn erf_whisper_scalar(x: f32) -> f32 {
 /// Scalar LayerNorm matching `whisper::primitives::layer_norm` op-for-op
 /// (biased variance, `1.0 / sqrt(var + eps)`, then `(x - mean) * inv_std
 /// * weight + bias`).
-pub(crate) fn layer_norm_whisper_scalar(
+///
+/// Public because the Parakeet Conformer block needs it five times per layer;
+/// exposing the single existing implementation rather than adding a second.
+pub fn layer_norm_whisper_scalar(
     x: &[f32],
     rows: usize,
     hidden: usize,

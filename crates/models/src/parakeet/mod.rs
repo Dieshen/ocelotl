@@ -7,4 +7,5 @@
 //! or mutates it.
 
 pub mod audio;
+pub mod encoder;
 pub mod subsample;
