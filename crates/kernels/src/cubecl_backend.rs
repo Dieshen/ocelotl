@@ -3120,6 +3120,10 @@ fn linear_out_by_in_f32(
 /// 24 chunks with no tail.
 const LINEAR_TILE_M: usize = 16;
 const LINEAR_TILE_N: usize = 16;
+// `linear_out_by_in_tiled_f32` (1-output-per-thread) is retained as a parity
+// reference; the live path is `linear_out_by_in_regtiled_f32`. TILE_K is only
+// read by the reference kernel's launch, which no longer runs.
+#[allow(dead_code)]
 const LINEAR_TILE_K: usize = 16;
 
 /// Workgroup-tiled `output = x * weight^T + bias`.
@@ -3221,6 +3225,145 @@ fn linear_out_by_in_tiled_f32(
     }
 }
 
+/// Register-blocked `output = x · weightᵀ + bias`.
+///
+/// Each workgroup computes a `RT_BM × RT_BN` output block; each of its
+/// `(RT_BN/RT_TN) × (RT_BM/RT_TM)` threads computes an `RT_TM × RT_TN`
+/// micro-tile held in registers. The K axis is walked in `RT_BK` chunks
+/// staged through shared memory. The point of the micro-tile: every value
+/// loaded from shared memory feeds `RT_TN` (for x) or `RT_TM` (for w) FMAs
+/// instead of one, so arithmetic intensity rises ~`RT_TM·RT_TN`× over the
+/// one-output-per-thread `linear_out_by_in_tiled_f32`. This is the standard
+/// step toward rocBLAS-class throughput. Weight is `[out, in]` row-major
+/// (the CPU `linear_out_by_in` contract); `bias` is `[out]` or a dummy.
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn linear_out_by_in_regtiled_f32(
+    x: &Array<f32>,
+    weight: &Array<f32>,
+    bias: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] rows: usize,
+    #[comptime] in_features: usize,
+    #[comptime] out_features: usize,
+    #[comptime] bm: usize,
+    #[comptime] bn: usize,
+    #[comptime] bk: usize,
+    #[comptime] tm: usize,
+    #[comptime] tn: usize,
+    #[comptime] has_bias: bool,
+) {
+    let tile_row = CUBE_POS_Y as usize;
+    let tile_col = CUBE_POS_X as usize;
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let threads = (bn / tn) * (bm / tm);
+    let tid = ty * (bn / tn) + tx;
+
+    let row_block = tile_row * bm;
+    let col_block = tile_col * bn;
+
+    let mut x_tile = SharedMemory::<f32>::new(bm * bk); // [row_in_block][k]
+    let mut w_tile = SharedMemory::<f32>::new(bn * bk); // [col_in_block][k]
+
+    // Register accumulators for this thread's TM×TN micro-tile.
+    let mut acc = Array::<f32>::new(tm * tn);
+    #[unroll]
+    for i in 0..tm {
+        #[unroll]
+        for j in 0..tn {
+            let col = col_block + tx * tn + j;
+            let mut b = f32::new(0.0);
+            if has_bias && col < out_features {
+                b = bias[col];
+            }
+            acc[i * tn + j] = b;
+        }
+    }
+
+    let chunks = in_features.div_ceil(bk);
+    let x_loads = (bm * bk) / threads;
+    let w_loads = (bn * bk) / threads;
+    for chunk in 0..chunks {
+        let k_base = chunk * bk;
+        // Cooperative staged load of x_tile ([row_in_block][k]).
+        #[unroll]
+        for l in 0..x_loads {
+            let e = tid + l * threads;
+            let r = e / bk;
+            let k = e % bk;
+            let gr = row_block + r;
+            let gk = k_base + k;
+            let mut xv = f32::new(0.0);
+            if gr < rows && gk < in_features {
+                xv = x[gr * in_features + gk];
+            }
+            x_tile[e] = xv;
+        }
+        // Cooperative staged load of w_tile ([col_in_block][k]).
+        #[unroll]
+        for l in 0..w_loads {
+            let e = tid + l * threads;
+            let c = e / bk;
+            let k = e % bk;
+            let gc = col_block + c;
+            let gk = k_base + k;
+            let mut wv = f32::new(0.0);
+            if gc < out_features && gk < in_features {
+                wv = weight[gc * in_features + gk];
+            }
+            w_tile[e] = wv;
+        }
+        sync_cube();
+
+        // Micro-kernel: each shared load feeds tm (or tn) FMAs.
+        #[unroll]
+        for k in 0..bk {
+            let mut xr = Array::<f32>::new(tm);
+            #[unroll]
+            for i in 0..tm {
+                xr[i] = x_tile[(ty * tm + i) * bk + k];
+            }
+            let mut wr = Array::<f32>::new(tn);
+            #[unroll]
+            for j in 0..tn {
+                wr[j] = w_tile[(tx * tn + j) * bk + k];
+            }
+            #[unroll]
+            for i in 0..tm {
+                #[unroll]
+                for j in 0..tn {
+                    acc[i * tn + j] += xr[i] * wr[j];
+                }
+            }
+        }
+        sync_cube();
+    }
+
+    #[unroll]
+    for i in 0..tm {
+        #[unroll]
+        for j in 0..tn {
+            let gr = row_block + ty * tm + i;
+            let gc = col_block + tx * tn + j;
+            if gr < rows && gc < out_features {
+                output[gr * out_features + gc] = acc[i * tn + j];
+            }
+        }
+    }
+}
+
+/// Register-tile config for `linear_out_by_in_regtiled_f32`. Constraints:
+/// `bm*bk == bn*bk == threads * N` (whole cooperative loads) with
+/// `threads = (bn/tn)*(bm/tm)`. 64/64/8 with 4×4 micro-tiles → 256 threads,
+/// 4KB shared, each staged load feeding 4 FMAs.
+const RT_BM: usize = 64;
+const RT_BN: usize = 64;
+const RT_BK: usize = 8;
+const RT_TM: usize = 4;
+const RT_TN: usize = 4;
+
 /// Derive the 2-D workgroup grid for a tiled `linear_out_by_in` launch
 /// and validate shape invariants that the kernel itself relies on (u32
 /// indexing, non-zero cell count). Caller is expected to have already
@@ -3286,15 +3429,19 @@ fn launch_linear_out_by_in_kernel<R: Runtime>(
     in_features: usize,
     out_features: usize,
 ) -> Result<()> {
-    let (cube_count_x, cube_count_y) = prepare_linear_launch(rows, in_features, out_features)?;
+    // Validate shape fits the u32 launch limits (reuses the tiled checks).
+    prepare_linear_launch(rows, in_features, out_features)?;
+    // Register-blocked grid: one workgroup per RT_BM×RT_BN output block.
+    let cube_count_x = (out_features as u32).div_ceil(RT_BN as u32).max(1);
+    let cube_count_y = (rows as u32).div_ceil(RT_BM as u32).max(1);
 
     unsafe {
-        linear_out_by_in_tiled_f32::launch_unchecked::<R>(
+        linear_out_by_in_regtiled_f32::launch_unchecked::<R>(
             client,
             CubeCount::Static(cube_count_x, cube_count_y, 1),
-            // CubeDim x = out_in_tile axis (matches UNIT_POS_X / tx),
-            // CubeDim y = row_in_tile axis (matches UNIT_POS_Y / ty).
-            CubeDim::new_2d(LINEAR_TILE_N as u32, LINEAR_TILE_M as u32),
+            // CubeDim x = out-tile axis (tx, RT_BN/RT_TN), y = row-tile axis
+            // (ty, RT_BM/RT_TM).
+            CubeDim::new_2d((RT_BN / RT_TN) as u32, (RT_BM / RT_TM) as u32),
             ArrayArg::from_raw_parts(x_handle, x_len),
             ArrayArg::from_raw_parts(weight_handle, weight_len),
             ArrayArg::from_raw_parts(bias_handle, bias_len),
@@ -3302,9 +3449,11 @@ fn launch_linear_out_by_in_kernel<R: Runtime>(
             rows,
             in_features,
             out_features,
-            LINEAR_TILE_M,
-            LINEAR_TILE_N,
-            LINEAR_TILE_K,
+            RT_BM,
+            RT_BN,
+            RT_BK,
+            RT_TM,
+            RT_TN,
             has_bias,
         );
     }
