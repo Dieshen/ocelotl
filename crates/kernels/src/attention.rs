@@ -153,7 +153,14 @@ pub fn scaled_dot_product_attention_bidirectional_with_scale(
     out: &mut [f32],
 ) -> Result<()> {
     let group_size = validate_scaled_dot_product_attention(
-        q, k, v, seq_len, num_q_heads, num_kv_heads, head_dim, out,
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        out,
     )?;
     let mut scores = vec![0.0_f32; seq_len];
     for i in 0..seq_len {
@@ -197,7 +204,15 @@ pub fn scaled_dot_product_attention_bidirectional(
 ) -> Result<()> {
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     scaled_dot_product_attention_bidirectional_with_scale(
-        q, k, v, seq_len, num_q_heads, num_kv_heads, head_dim, scale, out,
+        q,
+        k,
+        v,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        out,
     )
 }
 

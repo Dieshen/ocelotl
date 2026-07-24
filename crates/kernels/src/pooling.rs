@@ -6,7 +6,7 @@
 //! **L2-normalized** so cosine similarity is a dot product. Both steps live
 //! here as small, testable primitives the model forward composes.
 
-use crate::{kernel_err, Result};
+use crate::{Result, kernel_err};
 
 /// Mean-pool token hidden states: `out[d] = mean_i hidden[i, d]`.
 ///
