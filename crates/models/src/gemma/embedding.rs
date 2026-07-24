@@ -22,17 +22,20 @@
 //! bidirectional attention for longer inputs is a follow-up (see `is_global_layer`).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ocelotl_core::{OcelotlError, Result, RuntimeError, TokenId};
+use ocelotl_kernels::KernelBackend;
 use ocelotl_kernels::attention::scaled_dot_product_attention_bidirectional_with_scale;
-use ocelotl_kernels::matmul;
-use ocelotl_kernels::mlp::mlp_gated_gelu;
+use ocelotl_kernels::mlp::gelu_tanh_inplace;
 use ocelotl_kernels::pooling::{l2_normalize, mean_pool};
 use ocelotl_kernels::rmsnorm::rmsnorm;
 use ocelotl_kernels::rope::rope_apply_inplace;
 use ocelotl_loader::{
     GgufManifest, GgufMetadataValue, LoadedTensor, inspect_gguf, load_gguf_tensors_f32,
 };
+
+use crate::cpu_embedding_backend;
 
 fn rt<S: Into<String>>(message: S) -> OcelotlError {
     OcelotlError::Runtime(RuntimeError {
@@ -119,6 +122,7 @@ pub struct EmbeddingGemmaModel {
     token_embd: Vec<f32>,
     output_norm: Vec<f32>,
     layers: Vec<Layer>,
+    kernels: Arc<dyn KernelBackend>,
 }
 
 fn take(map: &mut BTreeMap<String, LoadedTensor>, name: &str) -> Result<Vec<f32>> {
@@ -127,25 +131,10 @@ fn take(map: &mut BTreeMap<String, LoadedTensor>, name: &str) -> Result<Vec<f32>
         .ok_or_else(|| rt(format!("EmbeddingGemma GGUF missing tensor `{name}`")))
 }
 
-/// Transpose a row-major `[rows][cols]` matrix to `[cols][rows]`.
-///
-/// GGUF stores a linear weight as `[out_features][in_features]` (row-major), but
-/// ocelotl's `matmul`/`mlp_gated_gelu` expect `[in][out]` (so `out[o] =
-/// Σ_i x[i]·W[i,o]`). Gemma4 does the same transpose at load; without it the
-/// projections read the wrong element for any non-square matrix (K/V/FFN) and
-/// scramble direction. `rows`/`cols` are the GGUF dims (`out`, `in`).
-fn transpose(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    debug_assert_eq!(src.len(), rows * cols);
-    let mut dst = vec![0.0_f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            dst[c * rows + r] = src[r * cols + c];
-        }
-    }
-    dst
-}
-
-/// Take a 2D linear weight and transpose GGUF `[out][in]` → `[in][out]`.
+/// Take a 2D linear weight in the raw GGUF `[out_features][in_features]` layout,
+/// validating its length. This is exactly the layout `linear_out_by_in` (and
+/// its AVX2 microkernel) consume — `out[o] = Σ_i x[i]·W[o,i]` — so no transpose
+/// is needed (unlike the `matmul` path, which wants `[in][out]`).
 fn take_linear(
     map: &mut BTreeMap<String, LoadedTensor>,
     name: &str,
@@ -159,7 +148,7 @@ fn take_linear(
             raw.len()
         )));
     }
-    Ok(transpose(&raw, out_dim, in_dim))
+    Ok(raw)
 }
 
 impl EmbeddingGemmaModel {
@@ -195,7 +184,7 @@ impl EmbeddingGemmaModel {
 
         let token_embd = take(&mut map, "token_embd.weight")?;
         let output_norm = take(&mut map, "output_norm.weight")?;
-        // Dimensions for the transposed linear layouts.
+        // Dimensions for the raw [out][in] linear layouts.
         let h = config.embedding_length;
         let hd = config.head_dim;
         let q_dim = config.head_count * hd;
@@ -227,6 +216,7 @@ impl EmbeddingGemmaModel {
             token_embd,
             output_norm,
             layers,
+            kernels: cpu_embedding_backend(),
         })
     }
 
@@ -289,10 +279,13 @@ impl EmbeddingGemmaModel {
             };
 
             // --- attention sublayer ---
+            // Projections use `linear_out_by_in` on the raw GGUF [out][in]
+            // weights so the AVX2 microkernel (contiguous dot products) applies.
             rmsnorm(&hidden, seq, h, &layer.attn_norm, eps, &mut norm)?;
-            matmul(&norm, (seq, h), &layer.attn_q, (h, q_dim), &mut q)?;
-            matmul(&norm, (seq, h), &layer.attn_k, (h, kv_dim), &mut k)?;
-            matmul(&norm, (seq, h), &layer.attn_v, (h, kv_dim), &mut v)?;
+            let kern = self.kernels.as_ref();
+            kern.linear_out_by_in(&norm, seq, h, &layer.attn_q, q_dim, None, &mut q)?;
+            kern.linear_out_by_in(&norm, seq, h, &layer.attn_k, kv_dim, None, &mut k)?;
+            kern.linear_out_by_in(&norm, seq, h, &layer.attn_v, kv_dim, None, &mut v)?;
             // QK-norm: per-head RMSNorm over head_dim, weight shared across heads.
             rmsnorm(&q, seq * nq, hd, &layer.attn_q_norm, eps, &mut qn)?;
             rmsnorm(&k, seq * nkv, hd, &layer.attn_k_norm, eps, &mut kn)?;
@@ -311,26 +304,21 @@ impl EmbeddingGemmaModel {
             scaled_dot_product_attention_bidirectional_with_scale(
                 &qn, &kn, &v, seq, nq, nkv, hd, attn_scale, &mut attn,
             )?;
-            matmul(&attn, (seq, q_dim), &layer.attn_output, (q_dim, h), &mut o)?;
+            kern.linear_out_by_in(&attn, seq, q_dim, &layer.attn_output, h, None, &mut o)?;
             rmsnorm(&o, seq, h, &layer.post_attention_norm, eps, &mut post)?;
             for i in 0..seq * h {
                 hidden[i] += post[i];
             }
 
-            // --- FFN sublayer ---
+            // --- FFN sublayer (gated-tanh-GELU, [out][in] projections) ---
             rmsnorm(&hidden, seq, h, &layer.ffn_norm, eps, &mut ffn_in)?;
-            mlp_gated_gelu(
-                &ffn_in,
-                seq,
-                h,
-                f,
-                &layer.ffn_gate,
-                &layer.ffn_up,
-                &layer.ffn_down,
-                &mut gate_buf,
-                &mut up_buf,
-                &mut mlp_out,
-            )?;
+            kern.linear_out_by_in(&ffn_in, seq, h, &layer.ffn_gate, f, None, &mut gate_buf)?;
+            kern.linear_out_by_in(&ffn_in, seq, h, &layer.ffn_up, f, None, &mut up_buf)?;
+            gelu_tanh_inplace(&mut gate_buf);
+            for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
+                *g *= *u;
+            }
+            kern.linear_out_by_in(&gate_buf, seq, f, &layer.ffn_down, h, None, &mut mlp_out)?;
             rmsnorm(&mlp_out, seq, h, &layer.post_ffw_norm, eps, &mut post)?;
             for i in 0..seq * h {
                 hidden[i] += post[i];
@@ -401,20 +389,26 @@ mod tests {
                     .collect()
             })
             .collect();
+        let parallel = std::env::var("OCELOTL_BENCH_PARALLEL").is_ok();
         let model = EmbeddingGemmaModel::load_from_gguf(std::path::Path::new(&gguf))
             .expect("model must load");
         // Warm up.
         let _ = model.embed(&prompts[0]).unwrap();
-        let mut total_tokens = 0usize;
+        let total_tokens: usize = (0..iters).map(|i| prompts[i % prompts.len()].len()).sum();
         let start = std::time::Instant::now();
-        for i in 0..iters {
-            let p = &prompts[i % prompts.len()];
-            total_tokens += p.len();
-            let _ = model.embed(p).expect("embed");
+        if parallel {
+            use rayon::prelude::*;
+            (0..iters).into_par_iter().for_each(|i| {
+                let _ = model.embed(&prompts[i % prompts.len()]).expect("embed");
+            });
+        } else {
+            for i in 0..iters {
+                let _ = model.embed(&prompts[i % prompts.len()]).expect("embed");
+            }
         }
         let elapsed = start.elapsed().as_secs_f64();
         eprintln!(
-            "EMBGEMMA_BENCH embeds={iters} elapsed_s={elapsed:.3} ms_per_embed={:.3} embeds_per_s={:.1} tokens_per_s={:.1}",
+            "EMBGEMMA_BENCH parallel={parallel} embeds={iters} elapsed_s={elapsed:.3} ms_per_embed={:.3} embeds_per_s={:.1} tokens_per_s={:.1}",
             elapsed / iters as f64 * 1000.0,
             iters as f64 / elapsed,
             total_tokens as f64 / elapsed,

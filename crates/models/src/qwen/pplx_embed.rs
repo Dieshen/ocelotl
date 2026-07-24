@@ -26,17 +26,20 @@
 //! (which honors `causal = false`), cosine/ranking rather than bit-exact.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ocelotl_core::{OcelotlError, Result, RuntimeError, TokenId};
+use ocelotl_kernels::KernelBackend;
 use ocelotl_kernels::attention::scaled_dot_product_attention_bidirectional_with_scale;
-use ocelotl_kernels::matmul;
-use ocelotl_kernels::mlp::mlp_gated_silu;
+use ocelotl_kernels::mlp::silu_inplace;
 use ocelotl_kernels::pooling::{l2_normalize, mean_pool};
 use ocelotl_kernels::rmsnorm::rmsnorm;
 use ocelotl_kernels::rope::rope_apply_inplace;
 use ocelotl_loader::{
     GgufManifest, GgufMetadataValue, LoadedTensor, inspect_gguf, load_gguf_tensors_f32,
 };
+
+use crate::cpu_embedding_backend;
 
 fn rt<S: Into<String>>(message: S) -> OcelotlError {
     OcelotlError::Runtime(RuntimeError {
@@ -110,6 +113,7 @@ pub struct PplxEmbedModel {
     token_embd: Vec<f32>,
     output_norm: Vec<f32>,
     layers: Vec<Layer>,
+    kernels: Arc<dyn KernelBackend>,
 }
 
 fn take(map: &mut BTreeMap<String, LoadedTensor>, name: &str) -> Result<Vec<f32>> {
@@ -118,23 +122,9 @@ fn take(map: &mut BTreeMap<String, LoadedTensor>, name: &str) -> Result<Vec<f32>
         .ok_or_else(|| rt(format!("pplx-embed GGUF missing tensor `{name}`")))
 }
 
-/// Transpose a row-major `[rows][cols]` matrix to `[cols][rows]`.
-///
-/// GGUF stores a linear weight as `[out_features][in_features]`; ocelotl's
-/// `matmul`/`mlp_gated_silu` expect `[in][out]` (`out[o] = Σ_i x[i]·W[i,o]`).
-/// `rows`/`cols` are the GGUF dims (`out`, `in`).
-fn transpose(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    debug_assert_eq!(src.len(), rows * cols);
-    let mut dst = vec![0.0_f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            dst[c * rows + r] = src[r * cols + c];
-        }
-    }
-    dst
-}
-
-/// Take a 2D linear weight and transpose GGUF `[out][in]` → `[in][out]`.
+/// Take a 2D linear weight in the raw GGUF `[out_features][in_features]` layout,
+/// validating its length. `linear_out_by_in` (and its AVX2 microkernel) consume
+/// this layout directly — `out[o] = Σ_i x[i]·W[o,i]` — so no transpose is needed.
 fn take_linear(
     map: &mut BTreeMap<String, LoadedTensor>,
     name: &str,
@@ -148,7 +138,7 @@ fn take_linear(
             raw.len()
         )));
     }
-    Ok(transpose(&raw, out_dim, in_dim))
+    Ok(raw)
 }
 
 impl PplxEmbedModel {
@@ -209,6 +199,7 @@ impl PplxEmbedModel {
             token_embd,
             output_norm,
             layers,
+            kernels: cpu_embedding_backend(),
         })
     }
 
@@ -262,10 +253,13 @@ impl PplxEmbedModel {
 
         for layer in &self.layers {
             // --- attention sublayer (pre-norm, no post-norm) ---
+            // Projections use `linear_out_by_in` on the raw GGUF [out][in]
+            // weights so the AVX2 microkernel applies.
             rmsnorm(&hidden, seq, h, &layer.attn_norm, eps, &mut norm)?;
-            matmul(&norm, (seq, h), &layer.attn_q, (h, q_dim), &mut q)?;
-            matmul(&norm, (seq, h), &layer.attn_k, (h, kv_dim), &mut k)?;
-            matmul(&norm, (seq, h), &layer.attn_v, (h, kv_dim), &mut v)?;
+            let kern = self.kernels.as_ref();
+            kern.linear_out_by_in(&norm, seq, h, &layer.attn_q, q_dim, None, &mut q)?;
+            kern.linear_out_by_in(&norm, seq, h, &layer.attn_k, kv_dim, None, &mut k)?;
+            kern.linear_out_by_in(&norm, seq, h, &layer.attn_v, kv_dim, None, &mut v)?;
             // QK-norm: per-head RMSNorm over head_dim, weight shared across heads.
             rmsnorm(&q, seq * nq, hd, &layer.attn_q_norm, eps, &mut qn)?;
             rmsnorm(&k, seq * nkv, hd, &layer.attn_k_norm, eps, &mut kn)?;
@@ -283,25 +277,20 @@ impl PplxEmbedModel {
             scaled_dot_product_attention_bidirectional_with_scale(
                 &qn, &kn, &v, seq, nq, nkv, hd, attn_scale, &mut attn,
             )?;
-            matmul(&attn, (seq, q_dim), &layer.attn_output, (q_dim, h), &mut o)?;
+            kern.linear_out_by_in(&attn, seq, q_dim, &layer.attn_output, h, None, &mut o)?;
             for i in 0..seq * h {
                 hidden[i] += o[i];
             }
 
-            // --- FFN sublayer (SwiGLU, pre-norm, no post-norm) ---
+            // --- FFN sublayer (SwiGLU, pre-norm, no post-norm, [out][in]) ---
             rmsnorm(&hidden, seq, h, &layer.ffn_norm, eps, &mut ffn_in)?;
-            mlp_gated_silu(
-                &ffn_in,
-                seq,
-                h,
-                f,
-                &layer.ffn_gate,
-                &layer.ffn_up,
-                &layer.ffn_down,
-                &mut gate_buf,
-                &mut up_buf,
-                &mut mlp_out,
-            )?;
+            kern.linear_out_by_in(&ffn_in, seq, h, &layer.ffn_gate, f, None, &mut gate_buf)?;
+            kern.linear_out_by_in(&ffn_in, seq, h, &layer.ffn_up, f, None, &mut up_buf)?;
+            silu_inplace(&mut gate_buf);
+            for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()) {
+                *g *= *u;
+            }
+            kern.linear_out_by_in(&gate_buf, seq, f, &layer.ffn_down, h, None, &mut mlp_out)?;
             for i in 0..seq * h {
                 hidden[i] += mlp_out[i];
             }
@@ -366,19 +355,25 @@ mod tests {
                     .collect()
             })
             .collect();
+        let parallel = std::env::var("OCELOTL_BENCH_PARALLEL").is_ok();
         let model =
             PplxEmbedModel::load_from_gguf(std::path::Path::new(&gguf)).expect("model must load");
         let _ = model.embed(&prompts[0]).unwrap();
-        let mut total_tokens = 0usize;
+        let total_tokens: usize = (0..iters).map(|i| prompts[i % prompts.len()].len()).sum();
         let start = std::time::Instant::now();
-        for i in 0..iters {
-            let p = &prompts[i % prompts.len()];
-            total_tokens += p.len();
-            let _ = model.embed(p).expect("embed");
+        if parallel {
+            use rayon::prelude::*;
+            (0..iters).into_par_iter().for_each(|i| {
+                let _ = model.embed(&prompts[i % prompts.len()]).expect("embed");
+            });
+        } else {
+            for i in 0..iters {
+                let _ = model.embed(&prompts[i % prompts.len()]).expect("embed");
+            }
         }
         let elapsed = start.elapsed().as_secs_f64();
         eprintln!(
-            "PPLX_BENCH embeds={iters} elapsed_s={elapsed:.3} ms_per_embed={:.3} embeds_per_s={:.1} tokens_per_s={:.1}",
+            "PPLX_BENCH parallel={parallel} embeds={iters} elapsed_s={elapsed:.3} ms_per_embed={:.3} embeds_per_s={:.1} tokens_per_s={:.1}",
             elapsed / iters as f64 * 1000.0,
             iters as f64 / elapsed,
             total_tokens as f64 / elapsed,
