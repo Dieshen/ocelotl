@@ -203,8 +203,9 @@ mod tests {
         // sin(pos) for pos = +1 and -1 must be equal and opposite.
         let t = sinusoidal_rel_pos_table(2, 4, 10_000.0).expect("table");
         let dim = 4;
-        // rows = 3: offsets +1, 0, -1.
-        let sin_first = t[dim * 0];
+        // rows = 3: offsets +1, 0, -1. Row r starts at `r * dim`, so row 0 is
+        // index 0 and row 2 is `2 * dim`.
+        let sin_first = t[0];
         let sin_last = t[dim * 2];
         assert!(
             (sin_first - 1.0_f32.sin()).abs() < 1e-6,

@@ -45,6 +45,18 @@ const MAX_REL_DIFF: f32 = 1e-5;
 /// used in the units it was actually calibrated in.
 const MAX_ABS_ENCODER: f32 = 1e-3;
 
+/// Prefer the AVX2 microkernel, fall back to the portable path.
+///
+/// `CpuKernelMode::Optimized` is *safe-Rust scalar with a cache-friendlier
+/// accumulation order*, not the AVX2 microkernel — that is the separate `Avx2`
+/// variant. The distinction is worth a measured **105x** on the 24-block
+/// forward (5.2 s vs 552 s), so it is not a micro-optimization.
+fn backend() -> CpuKernelBackend {
+    CpuKernelBackend::with_mode(CpuKernelMode::Avx2)
+        .or_else(|_| CpuKernelBackend::with_mode(CpuKernelMode::Optimized))
+        .expect("cpu backend")
+}
+
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key).ok().map(PathBuf::from)
 }
@@ -113,7 +125,7 @@ fn parakeet_subsampler_matches_reference_pre_encode_output() {
     };
 
     let weights = load_subsample_weights(&weights_path);
-    let backend = CpuKernelBackend::with_mode(CpuKernelMode::Optimized).expect("cpu backend");
+    let backend = backend();
     let got = subsample(&features, &weights, D_MODEL, &backend).expect("subsample");
 
     let reference = read_f32(&ref_dir.join("enc").join("pre_encode_out_Add_output_0.f32"));
@@ -159,6 +171,71 @@ fn parakeet_subsampler_matches_reference_pre_encode_output() {
          (max abs {worst:.3e} against scale {scale:.1}) at frame {} dim {}",
         worst_at.0,
         worst_at.1
+    );
+}
+
+/// The relative-position table must match the reference exactly, on its own.
+///
+/// Worth its own test because it is the cheapest check in the suite and the
+/// highest-leverage: the table is a pure function of the frame count, it is
+/// shared by all 24 blocks, and an error in it is an error *everywhere at once*
+/// — which reads like a systemic attention bug rather than a table bug.
+///
+/// Two conventions are load-bearing and neither is guessable. Rows run
+/// **descending** from `+(T-1)` to `-(T-1)`, and sin/cos are **interleaved**
+/// within a row rather than concatenated as halves. Getting the split-half
+/// convention instead puts the worst error at 2.0 — the full range of a
+/// sinusoid, not a rounding difference.
+///
+/// Until now the encoder test loaded this table from the reference dump, so it
+/// was never actually checked. `encode()` generates it, so it is now live code.
+#[test]
+#[ignore = "requires OCELOTL_PARAKEET_REF_DIR"]
+fn parakeet_relative_position_table_matches_reference() {
+    use ocelotl_models::parakeet::encoder::{EncoderShape, rel_pos_table};
+    let Some(ref_dir) = env_path("OCELOTL_PARAKEET_REF_DIR") else {
+        eprintln!("skipping: set OCELOTL_PARAKEET_REF_DIR");
+        return;
+    };
+    let reference = read_f32(&ref_dir.join("enc").join("pos_enc_Slice_output_0.f32"));
+    let shape = EncoderShape::default();
+    let rows = 138;
+    assert_eq!(
+        reference.len(),
+        (2 * rows - 1) * shape.d_model,
+        "reference table is not [2T-1, d_model]"
+    );
+
+    let got = rel_pos_table(rows, shape).expect("build table");
+    assert_eq!(got.len(), reference.len());
+    let worst = got
+        .iter()
+        .zip(reference.iter())
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    eprintln!(
+        "PARAKEET_POS_TABLE rows={} max_abs={worst:.3e}",
+        2 * rows - 1
+    );
+    // Absolute, because sin/cos are bounded by 1 — already the right unit, with
+    // no mid-stack scale to normalize against.
+    //
+    // The gate is 1e-4 against a MEASURED floor of 9.5e-6, and that floor is the
+    // REFERENCE's error, not ours. Checked rather than assumed: rebuilding the
+    // table in pure f32 the way torch does lands 1.5e-5 from the reference,
+    // while our f64-angle build lands 9.5e-6 from it, so the reference sits
+    // between the two and ours is the more accurate. The mechanism is the same
+    // one that cost 200x in the mel frontend — trig on a large argument loses
+    // mantissa to f32 range reduction — just far milder here, because the angle
+    // only reaches ~130 rad (f32 eps there is 7.6e-6) instead of ~116_000.
+    //
+    // Discriminating power is intact: the failure modes this test exists for are
+    // structural, not numeric. An ascending row order or a split-half rather
+    // than interleaved sin/cos layout both produce errors near 2.0 — the full
+    // range of a sinusoid, four orders above this line.
+    assert!(
+        worst <= 1e-4,
+        "relative-position table differs by {worst:.3e}; a wrong ordering or a \
+         split-half sin/cos layout would show ~2.0 here"
     );
 }
 
@@ -256,7 +333,7 @@ fn parakeet_encoder_blocks_match_reference_stage_by_stage() {
     assert_eq!(pos.len(), (2 * rows - 1) * D_MODEL);
 
     let shape = EncoderShape::default();
-    let backend = CpuKernelBackend::with_mode(CpuKernelMode::Optimized).expect("backend");
+    let backend = backend();
     let mut worst_overall = 0.0_f32;
     for i in 0..24 {
         let w = load_block_weights(&wp, i);

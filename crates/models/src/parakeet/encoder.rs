@@ -245,6 +245,43 @@ fn conv_module(
     Ok(out)
 }
 
+/// Base for the sinusoidal relative-position table (NeMo `RelPositionalEncoding`).
+pub const POS_BASE: f32 = 10_000.0;
+
+/// Build the `[2*rows-1][d_model]` relative-position table this encoder expects.
+///
+/// Split out so the table can be diffed against the reference on its own. It is
+/// a pure function of `rows`, which makes it the cheapest possible check and the
+/// one most worth having: the table is shared by all 24 blocks, so an error in
+/// it is an error everywhere at once and looks like a systemic attention bug.
+pub fn rel_pos_table(rows: usize, shape: EncoderShape) -> Result<Vec<f32>> {
+    ocelotl_kernels::relpos::sinusoidal_rel_pos_table(rows, shape.d_model, POS_BASE)
+}
+
+/// Run the full Conformer stack over a subsampler output of `[rows][d_model]`.
+///
+/// Consumes `x` in place and returns it, so a caller streaming several
+/// utterances reuses one buffer. `blocks` must be ordered `0..n`.
+pub fn encode(
+    x: &mut [f32],
+    rows: usize,
+    shape: EncoderShape,
+    blocks: &[BlockWeights],
+    kernels: &dyn KernelBackend,
+) -> Result<()> {
+    if blocks.is_empty() {
+        return Err(rt("encoder has no Conformer blocks"));
+    }
+    if rows == 0 {
+        return Err(rt("encoder needs at least one frame"));
+    }
+    let pos = rel_pos_table(rows, shape)?;
+    for w in blocks {
+        block_forward(x, rows, &pos, shape, w, kernels)?;
+    }
+    Ok(())
+}
+
 /// Run one Conformer block in place on `x` (`[rows][d_model]`).
 pub fn block_forward(
     x: &mut [f32],
