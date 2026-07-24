@@ -132,6 +132,75 @@ pub fn scaled_dot_product_attention(
     Ok(())
 }
 
+/// **Bidirectional** (non-causal) scaled-dot-product attention: every query
+/// position attends to *all* key positions `0..seq_len`, not just the causal
+/// prefix `0..=i`. This is the encoder / embedding-model counterpart to
+/// [`scaled_dot_product_attention`] (EmbeddingGemma, pplx-embed) — there is no
+/// autoregressive causality, so the softmax runs over the full sequence.
+/// GQA is supported (`num_q_heads` a positive multiple of `num_kv_heads`).
+/// `scale` is explicit (Gemma-family uses a model-specific attention scalar,
+/// not `1/sqrt(head_dim)`).
+#[allow(clippy::too_many_arguments)]
+pub fn scaled_dot_product_attention_bidirectional_with_scale(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    let group_size = validate_scaled_dot_product_attention(
+        q, k, v, seq_len, num_q_heads, num_kv_heads, head_dim, out,
+    )?;
+    let mut scores = vec![0.0_f32; seq_len];
+    for i in 0..seq_len {
+        for h in 0..num_q_heads {
+            let kh = h / group_size;
+            let q_base = (i * num_q_heads + h) * head_dim;
+            // Score against EVERY key position (bidirectional) — the only
+            // difference from the causal compute, which stops at `i`.
+            for (j, score) in scores.iter_mut().enumerate() {
+                let k_base = (j * num_kv_heads + kh) * head_dim;
+                let mut acc = 0.0_f32;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            softmax(&mut scores);
+            let out_base = (i * num_q_heads + h) * head_dim;
+            out[out_base..out_base + head_dim].fill(0.0);
+            for (j, &p) in scores.iter().enumerate() {
+                let v_base = (j * num_kv_heads + kh) * head_dim;
+                for d in 0..head_dim {
+                    out[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bidirectional SDPA with the default `1/sqrt(head_dim)` scale.
+pub fn scaled_dot_product_attention_bidirectional(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    scaled_dot_product_attention_bidirectional_with_scale(
+        q, k, v, seq_len, num_q_heads, num_kv_heads, head_dim, scale, out,
+    )
+}
+
 /// Compute causal attention for a single query row over an existing K/V
 /// prefix. This is the decode-time counterpart to
 /// [`scaled_dot_product_attention`]: `q` and `out` contain one row while
@@ -1017,6 +1086,38 @@ mod tests {
                 "attention mismatch at flat index {idx}: got {got}, want {want}"
             );
         }
+    }
+
+    #[test]
+    fn bidirectional_attention_attends_both_directions() {
+        // Same tiny setup as the causal test. Under CAUSAL attention query 0
+        // sees only position 0 (out = V[0] = [1,2]); under BIDIRECTIONAL it
+        // also sees position 1, so its output blends toward V[1]. Query 1 is
+        // identical in both paths (it already attends to 0 and 1). This
+        // discriminates the two: a causal impl mislabelled bidirectional would
+        // leave query 0 at [1,2] and fail here.
+        let q = [1.0_f32, 0.0, 0.0, 1.0];
+        let k = [1.0_f32, 0.0, 0.0, 1.0];
+        let v = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut out = [0.0_f32; 4];
+
+        scaled_dot_product_attention_bidirectional(&q, &k, &v, 2, 1, 1, 2, &mut out)
+            .expect("well-formed bidirectional attention call must succeed");
+
+        // query 0 blends V[0]+V[1]; query 1 matches the causal result.
+        let expected = [1.660_478_f32, 2.660_478, 2.339_521, 3.339_521];
+        let tol = 5.0e-6_f32;
+        for (idx, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < tol,
+                "bidirectional attention mismatch at flat index {idx}: got {got}, want {want}"
+            );
+        }
+        // Tripwire: query 0 must NOT equal the causal V[0]=1.0.
+        assert!(
+            (out[0] - 1.0).abs() > 0.5,
+            "bidirectional query 0 should differ from the causal V[0]"
+        );
     }
 
     #[test]
