@@ -6,16 +6,25 @@
 //! avoiding a premature GEMM or attention-library decision.
 
 use std::mem::size_of_val;
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 use std::sync::Mutex;
 
 use cubecl::prelude::*;
 use ocelotl_core::{DType, Device, KernelError, OcelotlError, Result};
 
 use crate::rope::{rope_trig_tables, validate_rope_shape};
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 use crate::tensor::{DeviceBuffer, DeviceTensor};
 use crate::{KernelBackend, KernelContext};
+
+// The GPU runtime is selected at compile time. All device launchers and the
+// device buffer are written against `GpuRuntime`/`GpuDevice`, so the exact same
+// code runs on WGPU (→ Vulkan on AMD) or HIP (→ ROCm). Pick exactly one backend
+// feature; HIP wins if both are (accidentally) enabled.
+#[cfg(feature = "cubecl-hip")]
+use cubecl::hip::{AmdDevice as GpuDevice, HipRuntime as GpuRuntime};
+#[cfg(all(feature = "cubecl-wgpu", not(feature = "cubecl-hip")))]
+use cubecl::wgpu::{WgpuDevice as GpuDevice, WgpuRuntime as GpuRuntime};
 
 const CUBECL_BACKEND: &str = "cubecl";
 
@@ -56,7 +65,140 @@ impl CubeClKernelBackend {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    /// Device-resident batched NEOX RoPE over `x = [seq * n_heads, head_dim]`.
+    /// `cos`/`sin` are per-position tables `[n_positions * (head_dim/2)]`
+    /// (position `p`, pair `i` at index `p*(head_dim/2)+i`). Rotates in place
+    /// (swap-on-write). Off the WGPU runtime it falls back to host tables.
+    pub fn rope_tables_d(
+        &self,
+        x: &DeviceTensor,
+        cos: &DeviceTensor,
+        sin: &DeviceTensor,
+        head_dim: usize,
+        n_heads: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "_gpu")]
+        {
+            if let (Some(x_buf), Some(c_buf), Some(s_buf)) = (
+                extract_wgpu_buf(x),
+                extract_wgpu_buf(cos),
+                extract_wgpu_buf(sin),
+            ) {
+                return run_rope_tables_d_wgpu(x_buf, c_buf, s_buf, head_dim, n_heads);
+            }
+        }
+        // Host fallback: apply the same table rotation on readback.
+        let mut xs = x.to_host_owned()?;
+        let cos_h = cos.to_host_owned()?;
+        let sin_h = sin.to_host_owned()?;
+        let half = head_dim / 2;
+        let rows = xs.len() / head_dim;
+        for row in 0..rows {
+            let position = row / n_heads;
+            let base = row * head_dim;
+            for i in 0..half {
+                let c = cos_h[position * half + i];
+                let s = sin_h[position * half + i];
+                let lo = base + i;
+                let hi = lo + half;
+                let x_lo = xs[lo];
+                let x_hi = xs[hi];
+                xs[lo] = x_lo * c - x_hi * s;
+                xs[hi] = x_lo * s + x_hi * c;
+            }
+        }
+        x.write_from_host_slice(&xs)
+    }
+
+    /// Device-resident GQA key/value head expansion: `src = [seq, nkv,
+    /// head_dim]` → `dst = [seq, nq, head_dim]`, replicating each KV head
+    /// `nq/nkv` times so the MHA `attention_encoder_d` kernel applies.
+    pub fn expand_kv_heads_d(
+        &self,
+        src: &DeviceTensor,
+        dst: &DeviceTensor,
+        head_dim: usize,
+        nq: usize,
+        nkv: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "_gpu")]
+        {
+            if let (Some(src_buf), Some(dst_buf)) = (extract_wgpu_buf(src), extract_wgpu_buf(dst)) {
+                return run_expand_kv_heads_d_wgpu(src_buf, dst_buf, head_dim, nq, nkv);
+            }
+        }
+        let src_h = src.to_host_owned()?;
+        let seq = src_h.len() / (nkv * head_dim);
+        let group = nq / nkv;
+        let mut dst_h = vec![0.0_f32; seq * nq * head_dim];
+        for token in 0..seq {
+            for out_head in 0..nq {
+                let src_head = out_head / group;
+                let src_base = (token * nkv + src_head) * head_dim;
+                let dst_base = (token * nq + out_head) * head_dim;
+                dst_h[dst_base..dst_base + head_dim]
+                    .copy_from_slice(&src_h[src_base..src_base + head_dim]);
+            }
+        }
+        dst.write_from_host_slice(&dst_h)
+    }
+
+    /// Device-resident **block-diagonal** encoder attention over a batch of
+    /// `batch` equal-length (`seq_len`) sequences stacked in `q`/`k`/`v` as
+    /// `[batch*seq_len, n_head*head_dim]`. Each sequence attends only within
+    /// itself. One launch covers the whole batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_encoder_batched_d(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        batch: usize,
+        seq_len: usize,
+        n_head: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        #[cfg(feature = "_gpu")]
+        {
+            if let (Some(qb), Some(kb), Some(vb), Some(ob)) = (
+                extract_wgpu_buf(q),
+                extract_wgpu_buf(k),
+                extract_wgpu_buf(v),
+                extract_wgpu_buf(out),
+            ) {
+                return run_attention_encoder_batched_d_wgpu(
+                    qb, kb, vb, batch, seq_len, n_head, head_dim, scale, ob,
+                );
+            }
+        }
+        // Host fallback: run the scalar encoder attention per sequence block.
+        let q_host = q.to_host_owned()?;
+        let k_host = k.to_host_owned()?;
+        let v_host = v.to_host_owned()?;
+        let state = n_head * head_dim;
+        let block = seq_len * state;
+        let mut out_host = vec![0.0_f32; batch * block];
+        for b in 0..batch {
+            let s = b * block;
+            let mut block_out = vec![0.0_f32; block];
+            crate::attention_encoder_scalar(
+                &q_host[s..s + block],
+                &k_host[s..s + block],
+                &v_host[s..s + block],
+                seq_len,
+                n_head,
+                head_dim,
+                scale,
+                &mut block_out,
+            );
+            out_host[s..s + block].copy_from_slice(&block_out);
+        }
+        out.write_from_host_slice(&out_host)
+    }
+
+    #[cfg(feature = "_gpu")]
     pub fn rope_apply_inplace(
         &self,
         x: &mut [f32],
@@ -99,7 +241,7 @@ impl KernelBackend for CubeClKernelBackend {
         bias: Option<&[f32]>,
         out: &mut [f32],
     ) -> Result<()> {
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             linear_out_by_in_wgpu(
                 x,
@@ -112,7 +254,7 @@ impl KernelBackend for CubeClKernelBackend {
             )
         }
 
-        #[cfg(not(feature = "cubecl-wgpu"))]
+        #[cfg(not(feature = "_gpu"))]
         {
             crate::linear_out_by_in(
                 x,
@@ -157,12 +299,12 @@ impl KernelBackend for CubeClKernelBackend {
         position: usize,
         theta: f32,
     ) -> Result<()> {
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             rope_apply_inplace_wgpu(x, head_dim, position, theta)
         }
 
-        #[cfg(not(feature = "cubecl-wgpu"))]
+        #[cfg(not(feature = "_gpu"))]
         {
             crate::rope_apply_inplace(x, head_dim, position, theta)
         }
@@ -213,22 +355,22 @@ impl KernelBackend for CubeClKernelBackend {
     }
 
     fn upload(&self, host: &[f32]) -> Result<DeviceTensor> {
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             self.upload_wgpu(host)
         }
-        #[cfg(not(feature = "cubecl-wgpu"))]
+        #[cfg(not(feature = "_gpu"))]
         {
             Ok(DeviceTensor::from_host(host.to_vec()))
         }
     }
 
     fn alloc(&self, len: usize) -> Result<DeviceTensor> {
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             self.alloc_wgpu(len)
         }
-        #[cfg(not(feature = "cubecl-wgpu"))]
+        #[cfg(not(feature = "_gpu"))]
         {
             Ok(DeviceTensor::host_zeros(len))
         }
@@ -240,7 +382,7 @@ impl KernelBackend for CubeClKernelBackend {
     /// K/V rows without reading the cache back to host.
     fn copy_into_d(&self, src: &DeviceTensor, dst: &DeviceTensor, dst_offset: usize) -> Result<()> {
         crate::validate_copy_into_shapes(src, dst, dst_offset)?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(src_buf), Some(dst_buf)) = (extract_wgpu_buf(src), extract_wgpu_buf(dst)) {
                 return run_copy_into_d_wgpu(src_buf, dst_buf, dst_offset);
@@ -276,7 +418,7 @@ impl KernelBackend for CubeClKernelBackend {
         bias: Option<&DeviceTensor>,
         out: &DeviceTensor,
     ) -> Result<()> {
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let Some((x_buf, w_buf, bias_buf, out_buf)) =
                 Self::try_extract_wgpu_operands(x, weight, bias, out)
@@ -317,7 +459,7 @@ impl KernelBackend for CubeClKernelBackend {
     /// handles. Otherwise fall back to the trait default, which forces
     /// host readback.
     fn add_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(lhs_buf), Some(rhs_buf)) = (extract_wgpu_buf(lhs), extract_wgpu_buf(rhs)) {
                 return run_add_inplace_d_wgpu(lhs_buf, rhs_buf);
@@ -345,7 +487,7 @@ impl KernelBackend for CubeClKernelBackend {
     /// bit-identical to the CPU `erf_approx` Whisper uses; the 1e-4
     /// tolerance gate accepts this drift.
     fn gelu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let Some(buf) = extract_wgpu_buf(x) {
                 return run_gelu_inplace_d_wgpu(buf);
@@ -356,6 +498,33 @@ impl KernelBackend for CubeClKernelBackend {
             *v = crate::gelu_whisper_scalar(*v);
         }
         x.write_from_host_slice(&host)
+    }
+
+    fn silu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
+        #[cfg(feature = "_gpu")]
+        {
+            if let Some(buf) = extract_wgpu_buf(x) {
+                return run_silu_inplace_d_wgpu(buf);
+            }
+        }
+        let mut host = x.to_host_owned()?;
+        crate::mlp::silu_inplace(&mut host);
+        x.write_from_host_slice(&host)
+    }
+
+    fn mul_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
+        #[cfg(feature = "_gpu")]
+        {
+            if let (Some(lhs_buf), Some(rhs_buf)) = (extract_wgpu_buf(lhs), extract_wgpu_buf(rhs)) {
+                return run_mul_inplace_d_wgpu(lhs_buf, rhs_buf);
+            }
+        }
+        let mut lhs_host = lhs.to_host_owned()?;
+        let rhs_host = rhs.to_host_owned()?;
+        for (l, r) in lhs_host.iter_mut().zip(rhs_host.iter()) {
+            *l *= *r;
+        }
+        lhs.write_from_host_slice(&lhs_host)
     }
 
     /// Device-resident LayerNorm. When every operand is a
@@ -373,7 +542,7 @@ impl KernelBackend for CubeClKernelBackend {
         out: &DeviceTensor,
     ) -> Result<()> {
         crate::validate_layer_norm_shapes(x, rows, hidden, weight, bias, out)?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(x_buf), Some(w_buf), Some(b_buf), Some(out_buf)) = (
                 extract_wgpu_buf(x),
@@ -401,6 +570,44 @@ impl KernelBackend for CubeClKernelBackend {
         out.write_from_host_slice(&out_buf)
     }
 
+    /// Device-resident **RMSNorm** (Gemma/Qwen normalization — no mean, no
+    /// bias). Launches the cube kernel when every operand is on the WGPU
+    /// runtime; otherwise reads back and runs the host scalar `rmsnorm`.
+    fn rmsnorm_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        hidden: usize,
+        weight: &DeviceTensor,
+        eps: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        if weight.len() != hidden || x.len() != rows * hidden || out.len() != rows * hidden {
+            return Err(cubecl_err(format!(
+                "rmsnorm_d shape mismatch: x={} weight={} out={} expected rows*hidden={}",
+                x.len(),
+                weight.len(),
+                out.len(),
+                rows * hidden
+            )));
+        }
+        #[cfg(feature = "_gpu")]
+        {
+            if let (Some(x_buf), Some(w_buf), Some(out_buf)) = (
+                extract_wgpu_buf(x),
+                extract_wgpu_buf(weight),
+                extract_wgpu_buf(out),
+            ) {
+                return run_rmsnorm_d_wgpu(x_buf, rows, hidden, w_buf, eps, out_buf);
+            }
+        }
+        let x_host = x.to_host_owned()?;
+        let w_host = weight.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; rows * hidden];
+        crate::rmsnorm::rmsnorm(&x_host, rows, hidden, &w_host, eps, &mut out_buf)?;
+        out.write_from_host_slice(&out_buf)
+    }
+
     /// Device-resident encoder self-attention. When every operand is a
     /// `WgpuDeviceBuffer`, launch the fused cube kernel against the
     /// existing handles — no host bounce, no scalar fallback. When the
@@ -424,7 +631,7 @@ impl KernelBackend for CubeClKernelBackend {
         output: &DeviceTensor,
     ) -> Result<()> {
         crate::validate_attention_encoder_shapes(q, k, v, seq, n_head, head_dim, output)?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
                 extract_wgpu_buf(q),
@@ -469,7 +676,7 @@ impl KernelBackend for CubeClKernelBackend {
         start_pos: usize,
     ) -> Result<()> {
         crate::validate_add_positional_embedding_shapes(x, rows, cols, pe, pe_rows, start_pos)?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(x_buf), Some(pe_buf)) = (extract_wgpu_buf(x), extract_wgpu_buf(pe)) {
                 return run_add_positional_embedding_d_wgpu(x_buf, rows, cols, pe_buf, start_pos);
@@ -508,7 +715,7 @@ impl KernelBackend for CubeClKernelBackend {
         output: &DeviceTensor,
     ) -> Result<()> {
         crate::validate_attention_decoder_causal_shapes(q, k, v, seq, n_head, head_dim, output)?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
                 extract_wgpu_buf(q),
@@ -563,7 +770,7 @@ impl KernelBackend for CubeClKernelBackend {
         crate::validate_attention_decoder_incremental_shapes(
             q, past_k, past_v, new_k, new_v, past_seq, n_head, head_dim, output,
         )?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (
                 Some(q_buf),
@@ -635,7 +842,7 @@ impl KernelBackend for CubeClKernelBackend {
             head_dim,
             output,
         )?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
                 extract_wgpu_buf(q),
@@ -702,7 +909,7 @@ impl KernelBackend for CubeClKernelBackend {
             head_dim,
             output,
         )?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (
                 Some(q_buf),
@@ -783,7 +990,7 @@ impl KernelBackend for CubeClKernelBackend {
         crate::validate_attention_decoder_cross_shapes(
             q, k, v, q_seq, kv_seq, n_head, head_dim, output,
         )?;
-        #[cfg(feature = "cubecl-wgpu")]
+        #[cfg(feature = "_gpu")]
         {
             if let (Some(q_buf), Some(k_buf), Some(v_buf), Some(out_buf)) = (
                 extract_wgpu_buf(q),
@@ -824,7 +1031,7 @@ impl KernelBackend for CubeClKernelBackend {
 /// slice-based path). The kernel's output handle is then swapped into
 /// `out_buf`, so subsequent device-resident reads pick up the result
 /// without a host bounce.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_linear_d_wgpu(
     x_buf: &WgpuDeviceBuffer,
@@ -897,7 +1104,7 @@ fn run_linear_d_wgpu(
     // and "the buffer we just wrote into".
     let output_handle = client.empty(out_buf.len_f32() * std::mem::size_of::<f32>());
 
-    launch_linear_out_by_in_kernel::<cubecl::wgpu::WgpuRuntime>(
+    launch_linear_out_by_in_kernel::<GpuRuntime>(
         client,
         x_buf.clone_handle(),
         x_buf.len_f32(),
@@ -980,12 +1187,44 @@ fn layer_norm_naive_f32(
     }
 }
 
+/// Device-resident **RMSNorm** (no mean subtraction, no bias): one thread per
+/// row computes `out[c] = x[c] / sqrt(mean(x²) + eps) * weight[c]`. This is the
+/// normalization Gemma/Qwen use (the `layer_norm` kernel above is standard
+/// LayerNorm and is *not* interchangeable). Same naive one-pass-per-row shape as
+/// `layer_norm_naive_f32`; encoder rows are small so a fused reduction is not
+/// worth it yet.
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+fn rmsnorm_naive_f32(
+    x: &Array<f32>,
+    weight: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] hidden: usize,
+    eps: f32,
+) {
+    let row = ABSOLUTE_POS;
+    let row_start = row * hidden;
+    if row_start + hidden > output.len() {
+        terminate!();
+    }
+    let mut sq_sum = f32::new(0.0);
+    for c in 0..hidden {
+        let v = x[row_start + c];
+        sq_sum += v * v;
+    }
+    let mean_sq = sq_sum / f32::cast_from(hidden as u32);
+    let inv_rms = f32::new(1.0) / f32::sqrt(mean_sq + eps);
+    for c in 0..hidden {
+        output[row_start + c] = x[row_start + c] * inv_rms * weight[c];
+    }
+}
+
 /// Compute `(workgroup_count, workgroup_size)` for a 1-D elementwise
 /// launch sized `total` (in cells), rounded up to whole workgroups. Same
 /// pattern as `prepare_linear_launch`: WGPU caps workgroup size at 256 on
 /// most adapters, so we fan out across workgroups with a fixed 1-D
 /// `CubeDim::new_1d(256)` and the kernel does a tail bounds check.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 fn prepare_elementwise_launch(total: usize) -> Result<(u32, u32)> {
     const WORKGROUP_SIZE: u32 = 256;
     let total = u32::try_from(total).map_err(|_| {
@@ -1001,7 +1240,7 @@ fn prepare_elementwise_launch(total: usize) -> Result<(u32, u32)> {
 /// launch. We use a 1-D launch (`CubeDim::new_1d(WORKGROUP_SIZE)`) and
 /// round up the row count to whole workgroups; the kernel itself bounds-
 /// checks against `output.len()`.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 fn prepare_per_row_launch(rows: usize) -> Result<(u32, u32)> {
     const WORKGROUP_SIZE: u32 = 64; // rows per layer are typically << #cells;
     // a smaller workgroup avoids wasting threads
@@ -1015,7 +1254,7 @@ fn prepare_per_row_launch(rows: usize) -> Result<(u32, u32)> {
     Ok((workgroup_count, WORKGROUP_SIZE))
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 fn run_add_inplace_d_wgpu(lhs: &WgpuDeviceBuffer, rhs: &WgpuDeviceBuffer) -> Result<()> {
     if lhs.len_f32() != rhs.len_f32() {
         return Err(cubecl_wgpu_err(format!(
@@ -1036,7 +1275,7 @@ fn run_add_inplace_d_wgpu(lhs: &WgpuDeviceBuffer, rhs: &WgpuDeviceBuffer) -> Res
     let out_handle = client.empty(len * std::mem::size_of::<f32>());
 
     unsafe {
-        add_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        add_out_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(workgroup_size),
@@ -1065,7 +1304,35 @@ fn add_out_f32(lhs: &Array<f32>, rhs: &Array<f32>, output: &mut Array<f32>) {
     output[i] = lhs[i] + rhs[i];
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+/// Out-of-place elementwise product `output = lhs * rhs` (the gated-MLP
+/// `silu(gate) * up` / `gelu(gate) * up` step). Same kernel-vs-caller "in
+/// place" naming as `add_out_f32`.
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+fn mul_out_f32(lhs: &Array<f32>, rhs: &Array<f32>, output: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    if i >= output.len() {
+        terminate!();
+    }
+    output[i] = lhs[i] * rhs[i];
+}
+
+/// Out-of-place SiLU `output = x * sigmoid(x) = x / (1 + exp(-x))` (Qwen/pplx
+/// SwiGLU activation). `exp` is the same frontend intrinsic the attention
+/// softmax uses.
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+fn silu_out_f32(input: &Array<f32>, output: &mut Array<f32>) {
+    let i = ABSOLUTE_POS;
+    if i >= output.len() {
+        terminate!();
+    }
+    let v = input[i];
+    let sig = f32::new(1.0) / (f32::new(1.0) + f32::exp(-v));
+    output[i] = v * sig;
+}
+
+#[cfg(feature = "_gpu")]
 fn run_copy_into_d_wgpu(
     src: &WgpuDeviceBuffer,
     dst: &WgpuDeviceBuffer,
@@ -1090,7 +1357,7 @@ fn run_copy_into_d_wgpu(
     let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
 
     unsafe {
-        copy_into_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        copy_into_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(workgroup_size),
@@ -1113,7 +1380,7 @@ fn copy_into_f32(src: &Array<f32>, dst: &mut Array<f32>, dst_offset: u32) {
     dst[dst_start + i] = src[i];
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 fn run_gelu_inplace_d_wgpu(x: &WgpuDeviceBuffer) -> Result<()> {
     let len = x.len_f32();
     let client = x.client();
@@ -1122,7 +1389,64 @@ fn run_gelu_inplace_d_wgpu(x: &WgpuDeviceBuffer) -> Result<()> {
     let out_handle = client.empty(len * std::mem::size_of::<f32>());
 
     unsafe {
-        gelu_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        gelu_out_f32::launch_unchecked::<GpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(in_handle, len),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+        );
+    }
+
+    *x.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "_gpu")]
+fn run_mul_inplace_d_wgpu(lhs: &WgpuDeviceBuffer, rhs: &WgpuDeviceBuffer) -> Result<()> {
+    if lhs.len_f32() != rhs.len_f32() {
+        return Err(cubecl_wgpu_err(format!(
+            "mul_inplace_d length mismatch: lhs={} rhs={}",
+            lhs.len_f32(),
+            rhs.len_f32()
+        )));
+    }
+    let len = lhs.len_f32();
+    let client = lhs.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let lhs_handle = lhs.clone_handle();
+    let rhs_handle = rhs.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        mul_out_f32::launch_unchecked::<GpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(lhs_handle, len),
+            ArrayArg::from_raw_parts(rhs_handle, len),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+        );
+    }
+
+    *lhs.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "_gpu")]
+fn run_silu_inplace_d_wgpu(x: &WgpuDeviceBuffer) -> Result<()> {
+    let len = x.len_f32();
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let in_handle = x.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        silu_out_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(workgroup_size),
@@ -1151,7 +1475,7 @@ fn gelu_out_f32(input: &Array<f32>, output: &mut Array<f32>) {
     output[i] = f32::new(0.5) * v * (f32::new(1.0) + erf_val);
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 fn run_layer_norm_d_wgpu(
     x: &WgpuDeviceBuffer,
     rows: usize,
@@ -1166,7 +1490,7 @@ fn run_layer_norm_d_wgpu(
     let out_handle = client.empty(out.len_f32() * std::mem::size_of::<f32>());
 
     unsafe {
-        layer_norm_naive_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        layer_norm_naive_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(workgroup_size),
@@ -1185,7 +1509,107 @@ fn run_layer_norm_d_wgpu(
     Ok(())
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
+fn run_rmsnorm_d_wgpu(
+    x: &WgpuDeviceBuffer,
+    rows: usize,
+    hidden: usize,
+    weight: &WgpuDeviceBuffer,
+    eps: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_per_row_launch(rows)?;
+    let out_handle = client.empty(out.len_f32() * std::mem::size_of::<f32>());
+
+    unsafe {
+        rmsnorm_naive_f32::launch_unchecked::<GpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(x.clone_handle(), x.len_f32()),
+            ArrayArg::from_raw_parts(weight.clone_handle(), weight.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), out.len_f32()),
+            hidden,
+            eps,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "_gpu")]
+fn run_rope_tables_d_wgpu(
+    x: &WgpuDeviceBuffer,
+    cos: &WgpuDeviceBuffer,
+    sin: &WgpuDeviceBuffer,
+    head_dim: usize,
+    n_heads: usize,
+) -> Result<()> {
+    let len = x.len_f32();
+    let total_rows = len / head_dim;
+    let total_pairs = total_rows * (head_dim / 2);
+    let client = x.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(total_pairs)?;
+    let in_handle = x.clone_handle();
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        rope_tables_rows_f32::launch_unchecked::<GpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(in_handle, len),
+            ArrayArg::from_raw_parts(cos.clone_handle(), cos.len_f32()),
+            ArrayArg::from_raw_parts(sin.clone_handle(), sin.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+            head_dim,
+            n_heads,
+        );
+    }
+
+    *x.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "_gpu")]
+fn run_expand_kv_heads_d_wgpu(
+    src: &WgpuDeviceBuffer,
+    dst: &WgpuDeviceBuffer,
+    head_dim: usize,
+    nq: usize,
+    nkv: usize,
+) -> Result<()> {
+    let len = dst.len_f32();
+    let client = src.client();
+    let (workgroup_count, workgroup_size) = prepare_elementwise_launch(len)?;
+    let out_handle = client.empty(len * std::mem::size_of::<f32>());
+
+    unsafe {
+        expand_kv_heads_f32::launch_unchecked::<GpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(workgroup_size),
+            ArrayArg::from_raw_parts(src.clone_handle(), src.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), len),
+            head_dim,
+            nq,
+            nkv,
+        );
+    }
+
+    *dst.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "_gpu")]
 fn run_add_positional_embedding_d_wgpu(
     x: &WgpuDeviceBuffer,
     rows: usize,
@@ -1219,7 +1643,7 @@ fn run_add_positional_embedding_d_wgpu(
     let out_handle = client.empty(len * std::mem::size_of::<f32>());
 
     unsafe {
-        add_positional_embedding_out_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        add_positional_embedding_out_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(workgroup_size),
@@ -1406,11 +1830,87 @@ fn attention_encoder_f32(
     }
 }
 
+/// Block-diagonal encoder attention for a batch of equal-length sequences.
+/// Layout is `[batch * seq_len, n_head * head_dim]` with sequences stacked
+/// contiguously; query row `r`'s block is `r / seq_len`, and it attends only
+/// keys in `[block*seq_len, block*seq_len + seq_len)` — no cross-sequence
+/// leakage. Same online-softmax body as `attention_encoder_f32`, just with the
+/// key range offset by the block, so one launch covers the whole batch (the
+/// point of batching: amortize dispatch overhead over many sequences).
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+fn attention_encoder_batched_f32(
+    q: &Array<f32>,
+    k: &Array<f32>,
+    v: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] seq_len: usize,
+    #[comptime] n_head: usize,
+    #[comptime] head_dim: usize,
+    scale: f32,
+) {
+    #[allow(clippy::unnecessary_cast)]
+    let pos = ABSOLUTE_POS as usize;
+    let state = n_head * head_dim;
+    let total_rows = output.len() / state;
+    let total = total_rows * n_head;
+    if pos >= total {
+        terminate!();
+    }
+
+    let query_row = pos / n_head;
+    let head = pos - query_row * n_head;
+    let block = query_row / seq_len;
+    let key_start = block * seq_len;
+    let q_base = query_row * state + head * head_dim;
+
+    // Seed with the block's first key.
+    let k_base_0 = key_start * state + head * head_dim;
+    let mut m = f32::new(0.0);
+    for d in 0..head_dim {
+        m += q[q_base + d] * k[k_base_0 + d];
+    }
+    m *= scale;
+
+    let p0 = f32::new(1.0);
+    let mut l = p0;
+    #[allow(clippy::unnecessary_cast)]
+    let lane = UNIT_POS as usize;
+    let mut acc = SharedMemory::<f32>::new(ENC_ATTN_WG as usize * head_dim);
+    let acc_base = lane * head_dim;
+    for d in 0..head_dim {
+        acc[acc_base + d] = p0 * v[k_base_0 + d];
+    }
+
+    for jj in 1..seq_len {
+        let j = key_start + jj;
+        let k_base = j * state + head * head_dim;
+        let mut s = f32::new(0.0);
+        for d in 0..head_dim {
+            s += q[q_base + d] * k[k_base + d];
+        }
+        s *= scale;
+        let m_new = f32::max(m, s);
+        let alpha = f32::exp(m - m_new);
+        let p = f32::exp(s - m_new);
+        l = l * alpha + p;
+        let v_base = j * state + head * head_dim;
+        for d in 0..head_dim {
+            acc[acc_base + d] = acc[acc_base + d] * alpha + p * v[v_base + d];
+        }
+        m = m_new;
+    }
+
+    for d in 0..head_dim {
+        output[q_base + d] = acc[acc_base + d] / l;
+    }
+}
+
 /// Launch helper for the fused encoder-attention kernel. Validates buffer
 /// lengths (the kernel can't), allocates a fresh output handle, runs the
 /// kernel, and swaps the handle into `out_buf` so subsequent device reads
 /// pick up the result without a host bounce.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_attention_encoder_d_wgpu(
     q: &WgpuDeviceBuffer,
@@ -1453,7 +1953,7 @@ fn run_attention_encoder_d_wgpu(
     let out_handle = client.empty(expected * std::mem::size_of::<f32>());
 
     unsafe {
-        attention_encoder_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        attention_encoder_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(ENC_ATTN_WG),
@@ -1462,6 +1962,73 @@ fn run_attention_encoder_d_wgpu(
             ArrayArg::from_raw_parts(v.clone_handle(), v.len_f32()),
             ArrayArg::from_raw_parts(out_handle.clone(), expected),
             seq,
+            n_head,
+            head_dim,
+            scale,
+        );
+    }
+
+    *out.handle
+        .lock()
+        .expect("WgpuDeviceBuffer handle mutex poisoned") = out_handle;
+    Ok(())
+}
+
+#[cfg(feature = "_gpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_attention_encoder_batched_d_wgpu(
+    q: &WgpuDeviceBuffer,
+    k: &WgpuDeviceBuffer,
+    v: &WgpuDeviceBuffer,
+    batch: usize,
+    seq_len: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &WgpuDeviceBuffer,
+) -> Result<()> {
+    let state = n_head.checked_mul(head_dim).ok_or_else(|| {
+        cubecl_wgpu_err("attention_encoder_batched_d n_head*head_dim overflowed usize")
+    })?;
+    let rows = batch.checked_mul(seq_len).ok_or_else(|| {
+        cubecl_wgpu_err("attention_encoder_batched_d batch*seq_len overflowed usize")
+    })?;
+    let expected = rows.checked_mul(state).ok_or_else(|| {
+        cubecl_wgpu_err("attention_encoder_batched_d rows*state overflowed usize")
+    })?;
+    for (label, len) in [
+        ("q", q.len_f32()),
+        ("k", k.len_f32()),
+        ("v", v.len_f32()),
+        ("out", out.len_f32()),
+    ] {
+        if len != expected {
+            return Err(cubecl_wgpu_err(format!(
+                "attention_encoder_batched_d {label} len {len} != batch*seq_len*state {expected}"
+            )));
+        }
+    }
+
+    let total = u32::try_from(rows * n_head).map_err(|_| {
+        cubecl_wgpu_err(format!(
+            "attention_encoder_batched_d thread count {} exceeds u32 launch limit",
+            rows * n_head
+        ))
+    })?;
+    let workgroup_count = total.div_ceil(ENC_ATTN_WG).max(1);
+    let client = q.client();
+    let out_handle = client.empty(expected * std::mem::size_of::<f32>());
+
+    unsafe {
+        attention_encoder_batched_f32::launch_unchecked::<GpuRuntime>(
+            client,
+            CubeCount::Static(workgroup_count, 1, 1),
+            CubeDim::new_1d(ENC_ATTN_WG),
+            ArrayArg::from_raw_parts(q.clone_handle(), q.len_f32()),
+            ArrayArg::from_raw_parts(k.clone_handle(), k.len_f32()),
+            ArrayArg::from_raw_parts(v.clone_handle(), v.len_f32()),
+            ArrayArg::from_raw_parts(out_handle.clone(), expected),
+            seq_len,
             n_head,
             head_dim,
             scale,
@@ -1579,7 +2146,7 @@ fn attention_decoder_causal_f32(
 }
 
 /// Launch helper for the fused decoder causal self-attention kernel.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_attention_decoder_causal_d_wgpu(
     q: &WgpuDeviceBuffer,
@@ -1623,7 +2190,7 @@ fn run_attention_decoder_causal_d_wgpu(
     let out_handle = client.empty(expected * std::mem::size_of::<f32>());
 
     unsafe {
-        attention_decoder_causal_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        attention_decoder_causal_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(ENC_ATTN_WG),
@@ -1731,7 +2298,7 @@ fn attention_decoder_incremental_f32(
 }
 
 /// Launch helper for the fused incremental decoder self-attention kernel.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_attention_decoder_incremental_d_wgpu(
     q: &WgpuDeviceBuffer,
@@ -1784,7 +2351,7 @@ fn run_attention_decoder_incremental_d_wgpu(
     let out_handle = client.empty(state * std::mem::size_of::<f32>());
 
     unsafe {
-        attention_decoder_incremental_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        attention_decoder_incremental_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(n_head_u32, 1, 1),
             CubeDim::new_1d(1),
@@ -1882,7 +2449,7 @@ fn attention_decoder_incremental_cache_f32(
     }
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_attention_decoder_incremental_cache_d_wgpu(
     q: &WgpuDeviceBuffer,
@@ -1935,7 +2502,7 @@ fn run_attention_decoder_incremental_cache_d_wgpu(
     let out_handle = client.empty(state * std::mem::size_of::<f32>());
 
     unsafe {
-        attention_decoder_incremental_cache_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        attention_decoder_incremental_cache_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(ENC_ATTN_WG),
@@ -2033,7 +2600,7 @@ fn attention_decoder_incremental_cache_append_f32(
     }
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_attention_decoder_incremental_cache_append_d_wgpu(
     q: &WgpuDeviceBuffer,
@@ -2100,7 +2667,7 @@ fn run_attention_decoder_incremental_cache_append_d_wgpu(
     let out_handle = client.empty(state * std::mem::size_of::<f32>());
 
     unsafe {
-        attention_decoder_incremental_cache_append_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        attention_decoder_incremental_cache_append_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(ENC_ATTN_WG),
@@ -2226,7 +2793,7 @@ fn attention_decoder_cross_f32(
 }
 
 /// Launch helper for the fused decoder cross-attention kernel.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 fn run_attention_decoder_cross_d_wgpu(
     q: &WgpuDeviceBuffer,
@@ -2279,7 +2846,7 @@ fn run_attention_decoder_cross_d_wgpu(
     let out_handle = client.empty(q_expected * std::mem::size_of::<f32>());
 
     unsafe {
-        attention_decoder_cross_f32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+        attention_decoder_cross_f32::launch_unchecked::<GpuRuntime>(
             client,
             CubeCount::Static(workgroup_count, 1, 1),
             CubeDim::new_1d(ENC_ATTN_WG),
@@ -2398,20 +2965,14 @@ pub fn rope_apply_inplace_cubecl_with_layout<R: Runtime>(
     Ok(())
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 pub fn rope_apply_inplace_wgpu(
     x: &mut [f32],
     head_dim: usize,
     position: usize,
     theta: f32,
 ) -> Result<()> {
-    rope_apply_inplace_cubecl::<cubecl::wgpu::WgpuRuntime>(
-        &Default::default(),
-        x,
-        head_dim,
-        position,
-        theta,
-    )
+    rope_apply_inplace_cubecl::<GpuRuntime>(&Default::default(), x, head_dim, position, theta)
 }
 
 #[cube(launch_unchecked)]
@@ -2437,6 +2998,71 @@ fn rope_apply_f32(
 
     output[lo] = x_lo * c - x_hi * s;
     output[hi] = x_lo * s + x_hi * c;
+}
+
+/// Batched NEOX RoPE over a whole `[seq * n_heads, head_dim]` activation using
+/// per-position trig tables (`cos`/`sin` are `[n_positions * half]`, row-major
+/// by position). One thread per `(row, pair)`: `row = pos*n_heads + head`, so
+/// `position = row / n_heads`. Applying the whole tensor in one launch (instead
+/// of the per-(pos,head) host-slice `rope_apply_f32`) is what keeps RoPE
+/// device-resident inside the encoder forward.
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+fn rope_tables_rows_f32(
+    input: &Array<f32>,
+    cos: &Array<f32>,
+    sin: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] head_dim: usize,
+    #[comptime] n_heads: usize,
+) {
+    let half = head_dim / 2;
+    let pair = ABSOLUTE_POS;
+    let total_pairs = (output.len() / head_dim) * half;
+    if pair >= total_pairs {
+        terminate!();
+    }
+    let row = pair / half;
+    let i = pair - row * half;
+    let position = row / n_heads;
+    let base = row * head_dim;
+    let lo = base + i;
+    let hi = lo + half;
+    let c = cos[position * half + i];
+    let s = sin[position * half + i];
+    let x_lo = input[lo];
+    let x_hi = input[hi];
+    // Every cell is written: pair i writes lo (in [0,half)) and hi (in
+    // [half,head_dim)), so the two halves together cover the whole head.
+    output[lo] = x_lo * c - x_hi * s;
+    output[hi] = x_lo * s + x_hi * c;
+}
+
+/// Expand GQA key/value heads to match the query head count so the MHA-only
+/// `attention_encoder` kernel applies. `src` is `[seq * nkv * head_dim]`, `dst`
+/// is `[seq * nq * head_dim]`; each destination head `h` reads source head
+/// `h / (nq / nkv)`. One thread per destination cell.
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+fn expand_kv_heads_f32(
+    src: &Array<f32>,
+    dst: &mut Array<f32>,
+    #[comptime] head_dim: usize,
+    #[comptime] nq: usize,
+    #[comptime] nkv: usize,
+) {
+    let cell = ABSOLUTE_POS;
+    if cell >= dst.len() {
+        terminate!();
+    }
+    let group = nq / nkv;
+    let d = cell % head_dim;
+    let rem = cell / head_dim;
+    let out_head = rem % nq;
+    let token = rem / nq;
+    let src_head = out_head / group;
+    let src_idx = (token * nkv + src_head) * head_dim + d;
+    dst[cell] = src[src_idx];
 }
 
 /// Compute a single `[row, out_dim]` cell of `output = x * weight^T + bias`.
@@ -2494,6 +3120,10 @@ fn linear_out_by_in_f32(
 /// 24 chunks with no tail.
 const LINEAR_TILE_M: usize = 16;
 const LINEAR_TILE_N: usize = 16;
+// `linear_out_by_in_tiled_f32` (1-output-per-thread) is retained as a parity
+// reference; the live path is `linear_out_by_in_regtiled_f32`. TILE_K is only
+// read by the reference kernel's launch, which no longer runs.
+#[allow(dead_code)]
 const LINEAR_TILE_K: usize = 16;
 
 /// Workgroup-tiled `output = x * weight^T + bias`.
@@ -2595,6 +3225,145 @@ fn linear_out_by_in_tiled_f32(
     }
 }
 
+/// Register-blocked `output = x · weightᵀ + bias`.
+///
+/// Each workgroup computes a `RT_BM × RT_BN` output block; each of its
+/// `(RT_BN/RT_TN) × (RT_BM/RT_TM)` threads computes an `RT_TM × RT_TN`
+/// micro-tile held in registers. The K axis is walked in `RT_BK` chunks
+/// staged through shared memory. The point of the micro-tile: every value
+/// loaded from shared memory feeds `RT_TN` (for x) or `RT_TM` (for w) FMAs
+/// instead of one, so arithmetic intensity rises ~`RT_TM·RT_TN`× over the
+/// one-output-per-thread `linear_out_by_in_tiled_f32`. This is the standard
+/// step toward rocBLAS-class throughput. Weight is `[out, in]` row-major
+/// (the CPU `linear_out_by_in` contract); `bias` is `[out]` or a dummy.
+#[cfg(feature = "_gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn linear_out_by_in_regtiled_f32(
+    x: &Array<f32>,
+    weight: &Array<f32>,
+    bias: &Array<f32>,
+    output: &mut Array<f32>,
+    #[comptime] rows: usize,
+    #[comptime] in_features: usize,
+    #[comptime] out_features: usize,
+    #[comptime] bm: usize,
+    #[comptime] bn: usize,
+    #[comptime] bk: usize,
+    #[comptime] tm: usize,
+    #[comptime] tn: usize,
+    #[comptime] has_bias: bool,
+) {
+    let tile_row = CUBE_POS_Y as usize;
+    let tile_col = CUBE_POS_X as usize;
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let threads = (bn / tn) * (bm / tm);
+    let tid = ty * (bn / tn) + tx;
+
+    let row_block = tile_row * bm;
+    let col_block = tile_col * bn;
+
+    let mut x_tile = SharedMemory::<f32>::new(bm * bk); // [row_in_block][k]
+    let mut w_tile = SharedMemory::<f32>::new(bn * bk); // [col_in_block][k]
+
+    // Register accumulators for this thread's TM×TN micro-tile.
+    let mut acc = Array::<f32>::new(tm * tn);
+    #[unroll]
+    for i in 0..tm {
+        #[unroll]
+        for j in 0..tn {
+            let col = col_block + tx * tn + j;
+            let mut b = f32::new(0.0);
+            if has_bias && col < out_features {
+                b = bias[col];
+            }
+            acc[i * tn + j] = b;
+        }
+    }
+
+    let chunks = in_features.div_ceil(bk);
+    let x_loads = (bm * bk) / threads;
+    let w_loads = (bn * bk) / threads;
+    for chunk in 0..chunks {
+        let k_base = chunk * bk;
+        // Cooperative staged load of x_tile ([row_in_block][k]).
+        #[unroll]
+        for l in 0..x_loads {
+            let e = tid + l * threads;
+            let r = e / bk;
+            let k = e % bk;
+            let gr = row_block + r;
+            let gk = k_base + k;
+            let mut xv = f32::new(0.0);
+            if gr < rows && gk < in_features {
+                xv = x[gr * in_features + gk];
+            }
+            x_tile[e] = xv;
+        }
+        // Cooperative staged load of w_tile ([col_in_block][k]).
+        #[unroll]
+        for l in 0..w_loads {
+            let e = tid + l * threads;
+            let c = e / bk;
+            let k = e % bk;
+            let gc = col_block + c;
+            let gk = k_base + k;
+            let mut wv = f32::new(0.0);
+            if gc < out_features && gk < in_features {
+                wv = weight[gc * in_features + gk];
+            }
+            w_tile[e] = wv;
+        }
+        sync_cube();
+
+        // Micro-kernel: each shared load feeds tm (or tn) FMAs.
+        #[unroll]
+        for k in 0..bk {
+            let mut xr = Array::<f32>::new(tm);
+            #[unroll]
+            for i in 0..tm {
+                xr[i] = x_tile[(ty * tm + i) * bk + k];
+            }
+            let mut wr = Array::<f32>::new(tn);
+            #[unroll]
+            for j in 0..tn {
+                wr[j] = w_tile[(tx * tn + j) * bk + k];
+            }
+            #[unroll]
+            for i in 0..tm {
+                #[unroll]
+                for j in 0..tn {
+                    acc[i * tn + j] += xr[i] * wr[j];
+                }
+            }
+        }
+        sync_cube();
+    }
+
+    #[unroll]
+    for i in 0..tm {
+        #[unroll]
+        for j in 0..tn {
+            let gr = row_block + ty * tm + i;
+            let gc = col_block + tx * tn + j;
+            if gr < rows && gc < out_features {
+                output[gr * out_features + gc] = acc[i * tn + j];
+            }
+        }
+    }
+}
+
+/// Register-tile config for `linear_out_by_in_regtiled_f32`. Constraints:
+/// `bm*bk == bn*bk == threads * N` (whole cooperative loads) with
+/// `threads = (bn/tn)*(bm/tm)`. 64/64/8 with 4×4 micro-tiles → 256 threads,
+/// 4KB shared, each staged load feeding 4 FMAs.
+const RT_BM: usize = 64;
+const RT_BN: usize = 64;
+const RT_BK: usize = 8;
+const RT_TM: usize = 4;
+const RT_TN: usize = 4;
+
 /// Derive the 2-D workgroup grid for a tiled `linear_out_by_in` launch
 /// and validate shape invariants that the kernel itself relies on (u32
 /// indexing, non-zero cell count). Caller is expected to have already
@@ -2660,15 +3429,19 @@ fn launch_linear_out_by_in_kernel<R: Runtime>(
     in_features: usize,
     out_features: usize,
 ) -> Result<()> {
-    let (cube_count_x, cube_count_y) = prepare_linear_launch(rows, in_features, out_features)?;
+    // Validate shape fits the u32 launch limits (reuses the tiled checks).
+    prepare_linear_launch(rows, in_features, out_features)?;
+    // Register-blocked grid: one workgroup per RT_BM×RT_BN output block.
+    let cube_count_x = (out_features as u32).div_ceil(RT_BN as u32).max(1);
+    let cube_count_y = (rows as u32).div_ceil(RT_BM as u32).max(1);
 
     unsafe {
-        linear_out_by_in_tiled_f32::launch_unchecked::<R>(
+        linear_out_by_in_regtiled_f32::launch_unchecked::<R>(
             client,
             CubeCount::Static(cube_count_x, cube_count_y, 1),
-            // CubeDim x = out_in_tile axis (matches UNIT_POS_X / tx),
-            // CubeDim y = row_in_tile axis (matches UNIT_POS_Y / ty).
-            CubeDim::new_2d(LINEAR_TILE_N as u32, LINEAR_TILE_M as u32),
+            // CubeDim x = out-tile axis (tx, RT_BN/RT_TN), y = row-tile axis
+            // (ty, RT_BM/RT_TM).
+            CubeDim::new_2d((RT_BN / RT_TN) as u32, (RT_BM / RT_TM) as u32),
             ArrayArg::from_raw_parts(x_handle, x_len),
             ArrayArg::from_raw_parts(weight_handle, weight_len),
             ArrayArg::from_raw_parts(bias_handle, bias_len),
@@ -2676,9 +3449,11 @@ fn launch_linear_out_by_in_kernel<R: Runtime>(
             rows,
             in_features,
             out_features,
-            LINEAR_TILE_M,
-            LINEAR_TILE_N,
-            LINEAR_TILE_K,
+            RT_BM,
+            RT_BN,
+            RT_BK,
+            RT_TM,
+            RT_TN,
             has_bias,
         );
     }
@@ -2762,7 +3537,7 @@ pub fn linear_out_by_in_cubecl<R: Runtime>(
     Ok(())
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn linear_out_by_in_wgpu(
     x: &[f32],
@@ -2773,7 +3548,7 @@ pub fn linear_out_by_in_wgpu(
     bias: Option<&[f32]>,
     out: &mut [f32],
 ) -> Result<()> {
-    linear_out_by_in_cubecl::<cubecl::wgpu::WgpuRuntime>(
+    linear_out_by_in_cubecl::<GpuRuntime>(
         &Default::default(),
         x,
         rows,
@@ -2792,7 +3567,7 @@ fn cubecl_err(message: impl Into<String>) -> OcelotlError {
     })
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 fn cubecl_wgpu_err(message: impl Into<String>) -> OcelotlError {
     OcelotlError::Kernel(KernelError {
         backend: CUBECL_WGPU_BACKEND.to_string(),
@@ -2803,7 +3578,7 @@ fn cubecl_wgpu_err(message: impl Into<String>) -> OcelotlError {
 /// Stable backend id for `WgpuDeviceBuffer`. Distinct from the generic
 /// `"cubecl"` name so future CUDA/HIP buffers can share the trait without
 /// being mistaken for each other in `linear_d` downcasts.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 pub const CUBECL_WGPU_BACKEND: &str = "cubecl-wgpu";
 
 /// A f32 buffer that lives on a CubeCL WGPU runtime. The `client` is the
@@ -2812,9 +3587,9 @@ pub const CUBECL_WGPU_BACKEND: &str = "cubecl-wgpu";
 /// The handle sits behind a `Mutex` because `write_from_host` has to swap
 /// it (cubecl 0.10 exposes no public "write into existing handle" path on
 /// `ComputeClient`, so we recreate the handle via `create_from_slice`).
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 pub struct WgpuDeviceBuffer {
-    client: ComputeClient<cubecl::wgpu::WgpuRuntime>,
+    client: ComputeClient<GpuRuntime>,
     handle: Mutex<cubecl::server::Handle>,
     len_f32: usize,
 }
@@ -2822,7 +3597,7 @@ pub struct WgpuDeviceBuffer {
 // `ComputeClient` doesn't derive `Debug`. Hand-roll a Debug that just
 // shows the residency-relevant fields so `DeviceTensor`'s Debug still
 // compiles.
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 impl std::fmt::Debug for WgpuDeviceBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WgpuDeviceBuffer")
@@ -2832,12 +3607,12 @@ impl std::fmt::Debug for WgpuDeviceBuffer {
     }
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 impl WgpuDeviceBuffer {
     /// Build a new buffer by uploading `host` to the default WGPU device.
     pub fn upload_default(host: &[f32]) -> Self {
-        let device = cubecl::wgpu::WgpuDevice::default();
-        let client = cubecl::wgpu::WgpuRuntime::client(&device);
+        let device = GpuDevice::default();
+        let client = GpuRuntime::client(&device);
         let handle = client.create_from_slice(f32::as_bytes(host));
         Self {
             client,
@@ -2852,8 +3627,8 @@ impl WgpuDeviceBuffer {
     /// wgpu backend, but callers shouldn't rely on a specific bit pattern
     /// until the kernel writes into it).
     pub fn alloc_default(len: usize) -> Self {
-        let device = cubecl::wgpu::WgpuDevice::default();
-        let client = cubecl::wgpu::WgpuRuntime::client(&device);
+        let device = GpuDevice::default();
+        let client = GpuRuntime::client(&device);
         let handle = client.empty(len * std::mem::size_of::<f32>());
         Self {
             client,
@@ -2870,12 +3645,12 @@ impl WgpuDeviceBuffer {
             .clone()
     }
 
-    fn client(&self) -> &ComputeClient<cubecl::wgpu::WgpuRuntime> {
+    fn client(&self) -> &ComputeClient<GpuRuntime> {
         &self.client
     }
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 impl DeviceBuffer for WgpuDeviceBuffer {
     fn backend_id(&self) -> &'static str {
         CUBECL_WGPU_BACKEND
@@ -2925,7 +3700,7 @@ impl DeviceBuffer for WgpuDeviceBuffer {
     }
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 impl CubeClKernelBackend {
     fn upload_wgpu(&self, host: &[f32]) -> Result<DeviceTensor> {
         Ok(DeviceTensor::from_device(Box::new(
@@ -2967,7 +3742,7 @@ impl CubeClKernelBackend {
     }
 }
 
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 fn extract_wgpu_buf(t: &DeviceTensor) -> Option<&WgpuDeviceBuffer> {
     t.try_as_device_buffer()?.as_any().downcast_ref()
 }
@@ -2975,7 +3750,7 @@ fn extract_wgpu_buf(t: &DeviceTensor) -> Option<&WgpuDeviceBuffer> {
 #[cfg(test)]
 mod tests {
     use crate::require_gpu;
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     use crate::rope_apply_inplace;
 
     use super::*;
@@ -2989,7 +3764,7 @@ mod tests {
         require_gpu(&backend).unwrap();
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_rope_rejects_invalid_shape_before_launch() {
         let mut actual = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -3009,7 +3784,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_rope_rejects_non_f32_dtype_before_launch() {
         let mut actual = [1.0_f32, 2.0, 3.0, 4.0];
@@ -3019,7 +3794,7 @@ mod tests {
             row_stride: 4,
         };
 
-        let err = rope_apply_inplace_cubecl_with_layout::<cubecl::wgpu::WgpuRuntime>(
+        let err = rope_apply_inplace_cubecl_with_layout::<GpuRuntime>(
             &Default::default(),
             &mut actual,
             layout,
@@ -3037,7 +3812,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_rope_rejects_non_contiguous_stride_before_launch() {
         let mut actual = [1.0_f32, 2.0, 3.0, 4.0];
@@ -3047,7 +3822,7 @@ mod tests {
             row_stride: 8,
         };
 
-        let err = rope_apply_inplace_cubecl_with_layout::<cubecl::wgpu::WgpuRuntime>(
+        let err = rope_apply_inplace_cubecl_with_layout::<GpuRuntime>(
             &Default::default(),
             &mut actual,
             layout,
@@ -3068,7 +3843,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_linear_out_by_in_matches_scalar_within_tolerance() {
         use crate::CpuKernelBackend;
@@ -3128,7 +3903,7 @@ mod tests {
     /// the scalar CPU reference. The existing
     /// `wgpu_linear_out_by_in_matches_scalar_within_tolerance` test covers
     /// the unaligned-tail path with 17/23/13.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_linear_out_by_in_tiled_aligned_matches_scalar_within_tolerance() {
         use crate::CpuKernelBackend;
@@ -3177,7 +3952,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_linear_d_with_device_handles_matches_scalar_within_tolerance() {
         use crate::CpuKernelBackend;
@@ -3269,7 +4044,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_device_buffer_round_trips_through_to_host() {
         let host = vec![1.0_f32, 2.0, -3.0, 4.5];
@@ -3305,13 +4080,13 @@ mod tests {
     /// legacy slice path. If it errors (no adapter / no driver / etc.) we
     /// signal "skip" so each device-parity test gets the same skip
     /// semantics as the existing `wgpu_linear_out_by_in_matches_scalar_*`.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     fn wgpu_adapter_available() -> bool {
         let mut probe = vec![0.0_f32; 1];
         linear_out_by_in_wgpu(&[1.0_f32], 1, 1, &[1.0_f32], 1, None, &mut probe).is_ok()
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_add_inplace_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3353,7 +4128,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_gelu_inplace_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3384,7 +4159,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_layer_norm_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3425,7 +4200,231 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
+    #[test]
+    fn wgpu_rmsnorm_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_rmsnorm_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+
+        let rows = 19usize;
+        let hidden = 29usize;
+        let eps = 1e-6_f32;
+        let x_vec: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32) * 0.013).cos() * 3.0)
+            .collect();
+        // Gemma-like large-ish norm weights to exercise the affine scale.
+        let weight: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.4).collect();
+
+        let mut expected = vec![0.0_f32; rows * hidden];
+        crate::rmsnorm::rmsnorm(&x_vec, rows, hidden, &weight, eps, &mut expected)
+            .expect("scalar rmsnorm");
+
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x_vec).expect("upload x");
+        let w_d = backend.upload(&weight).expect("upload weight");
+        let out_d = backend.alloc(rows * hidden).expect("alloc output");
+        backend
+            .rmsnorm_d(&x_d, rows, hidden, &w_d, eps, &out_d)
+            .expect("device rmsnorm_d must succeed");
+        let got = out_d.to_host_owned().expect("readback");
+
+        assert_eq!(got.len(), expected.len());
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "GPU rmsnorm drifted at idx {idx}: scalar={s} gpu={g} abs={abs} rel={rel}"
+            );
+        }
+    }
+
+    #[cfg(feature = "_gpu")]
+    #[test]
+    fn wgpu_silu_inplace_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_silu_inplace_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+        let x: Vec<f32> = (0..97).map(|i| (i as f32 - 48.0) * 0.2).collect();
+        let mut expected = x.clone();
+        crate::mlp::silu_inplace(&mut expected);
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x).expect("upload");
+        backend.silu_inplace_d(&x_d).expect("silu_d");
+        let got = x_d.to_host_owned().expect("readback");
+        for (s, g) in expected.iter().zip(got.iter()) {
+            let abs = (s - g).abs();
+            assert!(abs <= 1e-4, "silu drift scalar={s} gpu={g}");
+        }
+    }
+
+    #[cfg(feature = "_gpu")]
+    #[test]
+    fn wgpu_mul_inplace_d_matches_scalar() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_mul_inplace_d_matches_scalar: no adapter");
+            return;
+        }
+        let a: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1).collect();
+        let b: Vec<f32> = (0..64).map(|i| (i as f32) * -0.03 + 1.0).collect();
+        let expected: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x * y).collect();
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let a_d = backend.upload(&a).expect("upload a");
+        let b_d = backend.upload(&b).expect("upload b");
+        backend.mul_inplace_d(&a_d, &b_d).expect("mul_d");
+        let got = a_d.to_host_owned().expect("readback");
+        for (s, g) in expected.iter().zip(got.iter()) {
+            assert!((s - g).abs() <= 1e-5, "mul drift scalar={s} gpu={g}");
+        }
+    }
+
+    #[cfg(feature = "_gpu")]
+    #[test]
+    fn wgpu_rope_tables_d_matches_scalar_within_tolerance() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_rope_tables_d_matches_scalar_within_tolerance: no adapter");
+            return;
+        }
+        let seq = 5usize;
+        let n_heads = 3usize;
+        let head_dim = 8usize;
+        let theta = 1_000_000.0_f32;
+        let half = head_dim / 2;
+        let rows = seq * n_heads;
+        let x: Vec<f32> = (0..rows * head_dim)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        // Reference: apply the CPU rope per row with position = row / n_heads.
+        let mut expected = x.clone();
+        for row in 0..rows {
+            let position = row / n_heads;
+            let base = row * head_dim;
+            crate::rope::rope_apply_inplace(
+                &mut expected[base..base + head_dim],
+                head_dim,
+                position,
+                theta,
+            )
+            .expect("cpu rope");
+        }
+        // Build per-position cos/sin tables [seq * half].
+        let mut cos = Vec::with_capacity(seq * half);
+        let mut sin = Vec::with_capacity(seq * half);
+        for p in 0..seq {
+            let (c, s) = crate::rope::rope_trig_tables(head_dim, p, theta);
+            cos.extend_from_slice(&c);
+            sin.extend_from_slice(&s);
+        }
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let x_d = backend.upload(&x).expect("upload x");
+        let cos_d = backend.upload(&cos).expect("upload cos");
+        let sin_d = backend.upload(&sin).expect("upload sin");
+        backend
+            .rope_tables_d(&x_d, &cos_d, &sin_d, head_dim, n_heads)
+            .expect("rope_tables_d");
+        let got = x_d.to_host_owned().expect("readback");
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            assert!(abs <= 1e-4, "rope drift at {idx}: scalar={s} gpu={g}");
+        }
+    }
+
+    #[cfg(feature = "_gpu")]
+    #[test]
+    fn wgpu_expand_kv_heads_d_matches_reference() {
+        if !wgpu_adapter_available() {
+            eprintln!("skipping wgpu_expand_kv_heads_d_matches_reference: no adapter");
+            return;
+        }
+        let seq = 4usize;
+        let nkv = 2usize;
+        let nq = 6usize;
+        let head_dim = 5usize;
+        let group = nq / nkv;
+        let src: Vec<f32> = (0..seq * nkv * head_dim).map(|i| i as f32).collect();
+        let mut expected = vec![0.0_f32; seq * nq * head_dim];
+        for token in 0..seq {
+            for out_head in 0..nq {
+                let src_head = out_head / group;
+                let sb = (token * nkv + src_head) * head_dim;
+                let db = (token * nq + out_head) * head_dim;
+                expected[db..db + head_dim].copy_from_slice(&src[sb..sb + head_dim]);
+            }
+        }
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let src_d = backend.upload(&src).expect("upload src");
+        let dst_d = backend.alloc(seq * nq * head_dim).expect("alloc dst");
+        backend
+            .expand_kv_heads_d(&src_d, &dst_d, head_dim, nq, nkv)
+            .expect("expand_kv_heads_d");
+        let got = dst_d.to_host_owned().expect("readback");
+        assert_eq!(got, expected);
+    }
+
+    #[cfg(feature = "_gpu")]
+    #[test]
+    fn wgpu_attention_encoder_batched_d_matches_per_block_scalar() {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "skipping wgpu_attention_encoder_batched_d_matches_per_block_scalar: no adapter"
+            );
+            return;
+        }
+        let batch = 3usize;
+        let seq_len = 5usize;
+        let n_head = 2usize;
+        let head_dim = 4usize;
+        let state = n_head * head_dim;
+        let block = seq_len * state;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let total = batch * block;
+        let q: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.021).sin()).collect();
+        let k: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.017).cos()).collect();
+        let v: Vec<f32> = (0..total)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+            .collect();
+        // Reference: independent per-block scalar encoder attention.
+        let mut expected = vec![0.0_f32; total];
+        for b in 0..batch {
+            let s = b * block;
+            let mut bo = vec![0.0_f32; block];
+            crate::attention_encoder_scalar(
+                &q[s..s + block],
+                &k[s..s + block],
+                &v[s..s + block],
+                seq_len,
+                n_head,
+                head_dim,
+                scale,
+                &mut bo,
+            );
+            expected[s..s + block].copy_from_slice(&bo);
+        }
+        let backend = CubeClKernelBackend::new_gpu(0);
+        let q_d = backend.upload(&q).expect("upload q");
+        let k_d = backend.upload(&k).expect("upload k");
+        let v_d = backend.upload(&v).expect("upload v");
+        let out_d = backend.alloc(total).expect("alloc out");
+        backend
+            .attention_encoder_batched_d(
+                &q_d, &k_d, &v_d, batch, seq_len, n_head, head_dim, scale, &out_d,
+            )
+            .expect("batched attention");
+        let got = out_d.to_host_owned().expect("readback");
+        for (idx, (s, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let abs = (s - g).abs();
+            let rel = if s.abs() > 1e-6 { abs / s.abs() } else { abs };
+            assert!(
+                abs <= 1e-4 || rel <= 1e-4,
+                "batched attention drift at {idx}: scalar={s} gpu={g}"
+            );
+        }
+    }
+
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_add_positional_embedding_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3469,7 +4468,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     #[ignore = "requires a CubeCL WGPU-capable local runtime"]
     fn wgpu_rope_matches_cpu_reference_for_position_one() {
@@ -3611,7 +4610,7 @@ mod tests {
     /// kernel must match `attention_decoder_causal_scalar` within `1e-4`
     /// rel/abs. Shape (seq=6, n_head=2, head_dim=4) exercises the causal
     /// mask across multiple heads and the softmax stability path.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_attention_decoder_causal_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3665,7 +4664,7 @@ mod tests {
     /// attention kernel must match `attention_decoder_incremental_scalar` within
     /// `1e-4` rel/abs. Exercises past_seq=4 so the concat(past, new) boundary
     /// is not at position 0.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_attention_decoder_incremental_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3736,7 +4735,7 @@ mod tests {
     /// Shape: q_seq=3 decoder rows, kv_seq=7 encoder frames, n_head=2, head_dim=4.
     /// The asymmetric q_seq vs kv_seq exercises the cross-attention-specific
     /// path where Q and K/V have different sequence lengths.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_attention_decoder_cross_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3817,7 +4816,7 @@ mod tests {
     /// but the test documents the intent; at seq=1500 the old design exceeds
     /// the 16 KiB WebGPU floor. Use seq=512 as the highest value that still
     /// exercises the overflow regime without making the test slow.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_attention_encoder_d_large_seq_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3872,7 +4871,7 @@ mod tests {
 
     /// GW.4-shmem large-seq causal decoder regression guard.
     /// seq=512 exercises the causal mask path across many rows.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_attention_decoder_causal_d_large_seq_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -3928,7 +4927,7 @@ mod tests {
     /// GW.4-shmem large-kv_seq cross-attention regression guard.
     /// kv_seq=512 encoder frames exercises the O(kv_seq) path that existed
     /// before the flash rewrite.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_attention_decoder_cross_d_large_kv_seq_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {
@@ -4002,7 +5001,7 @@ mod tests {
     /// softmax stability path, and the P·V accumulation. The shape
     /// (seq=8, n_head=2, head_dim=4) keeps the flash-attention slab O(1)
     /// and is viable on all adapters.
-    #[cfg(feature = "cubecl-wgpu")]
+    #[cfg(feature = "_gpu")]
     #[test]
     fn wgpu_attention_encoder_d_matches_scalar_within_tolerance() {
         if !wgpu_adapter_available() {

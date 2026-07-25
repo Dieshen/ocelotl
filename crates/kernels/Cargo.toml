@@ -11,7 +11,13 @@ readme = "../../README.md"
 [features]
 default = []
 cubecl = ["dep:cubecl"]
-cubecl-wgpu = ["cubecl", "cubecl/wgpu"]
+# `_gpu` is the internal umbrella both GPU runtimes enable; the device code is
+# gated on it so a single cfg covers WGPU and HIP. Pick exactly one runtime.
+_gpu = []
+cubecl-wgpu = ["cubecl", "cubecl/wgpu", "_gpu"]
+# cubecl/std turns on cubecl-runtime's `multi_threading` cfg, which the hip
+# backend's stream imports require (the wgpu path pulls std transitively).
+cubecl-hip = ["cubecl", "cubecl/hip", "cubecl/std", "_gpu"]
 
 [dependencies]
 cubecl = { version = "0.10.0", default-features = false, optional = true }

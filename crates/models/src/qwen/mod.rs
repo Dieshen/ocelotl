@@ -5,9 +5,11 @@
 //! `ocelotl_models::qwen::Qwen2_5Model` rather than exposing the internal
 //! per-family file layout (`qwen2_5/config.rs`, `qwen2_5/model.rs`, etc.).
 
+pub mod pplx_embed;
 pub mod qwen2_5;
 pub mod qwen3_5;
 
+pub use pplx_embed::{PplxEmbedConfig, PplxEmbedModel};
 pub use qwen2_5::{
     Qwen2_5Config, Qwen2_5LayerWeights, Qwen2_5Model, Qwen2_5Weights, required_tensor_names,
     transpose_2d, validate_qwen2_5_tensors,

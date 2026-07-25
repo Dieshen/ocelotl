@@ -10,7 +10,9 @@ readme = "../../README.md"
 
 [features]
 default = []
-cubecl-wgpu = ["ocelotl-kernels/cubecl-wgpu"]
+_gpu = []
+cubecl-wgpu = ["ocelotl-kernels/cubecl-wgpu", "_gpu"]
+cubecl-hip = ["ocelotl-kernels/cubecl-hip", "_gpu"]
 
 [dependencies]
 ocelotl-core.workspace = true

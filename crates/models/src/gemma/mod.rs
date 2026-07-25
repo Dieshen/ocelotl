@@ -11,3 +11,4 @@ pub use gemma4::{
     validate_gemma4_dense_tensors, validate_gemma4_dequantized_tensors,
     validate_gemma4_tensor_inventory, validate_gemma4_tensors,
 };
+pub mod embedding;

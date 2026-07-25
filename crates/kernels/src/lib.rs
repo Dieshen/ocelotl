@@ -37,10 +37,11 @@ pub mod attention;
 #[cfg(target_arch = "x86_64")]
 mod cpu_avx2;
 mod cpu_backend;
+pub mod pooling;
 pub use cpu_backend::CpuKernelBackend;
 #[cfg(feature = "cubecl")]
 pub mod cubecl_backend;
-#[cfg(feature = "cubecl-wgpu")]
+#[cfg(feature = "_gpu")]
 pub use cubecl_backend::{
     CUBECL_WGPU_BACKEND, WgpuDeviceBuffer, linear_out_by_in_wgpu, rope_apply_inplace_wgpu,
 };
@@ -424,6 +425,32 @@ pub trait KernelBackend: Debug + Send + Sync {
         x.write_from_host_slice(&host)
     }
 
+    /// Elementwise SiLU `x = x * sigmoid(x)` (SwiGLU activation). Default
+    /// reads back and runs the host scalar; GPU backends override on device.
+    fn silu_inplace_d(&self, x: &DeviceTensor) -> Result<()> {
+        let mut host = x.to_host_owned()?;
+        mlp::silu_inplace(&mut host);
+        x.write_from_host_slice(&host)
+    }
+
+    /// Elementwise in-place product `lhs *= rhs` (the gated-MLP combine).
+    /// Default reads back and multiplies on host; GPU backends override.
+    fn mul_inplace_d(&self, lhs: &DeviceTensor, rhs: &DeviceTensor) -> Result<()> {
+        let mut lhs_host = lhs.to_host_owned()?;
+        let rhs_host = rhs.to_host_owned()?;
+        if lhs_host.len() != rhs_host.len() {
+            return Err(kernel_err(format!(
+                "mul_inplace_d length mismatch: lhs={} rhs={}",
+                lhs_host.len(),
+                rhs_host.len()
+            )));
+        }
+        for (l, r) in lhs_host.iter_mut().zip(rhs_host.iter()) {
+            *l *= *r;
+        }
+        lhs.write_from_host_slice(&lhs_host)
+    }
+
     /// Per-row LayerNorm with affine. `weight` and `bias` are length
     /// `hidden`; `x` and `out` are length `rows * hidden`. Variance uses
     /// the biased estimator (divide by `hidden`, not `hidden - 1`) so this
@@ -454,6 +481,27 @@ pub trait KernelBackend: Debug + Send + Sync {
             eps,
             &mut out_buf,
         );
+        out.write_from_host_slice(&out_buf)
+    }
+
+    /// Device-resident **RMSNorm** (`out = x / sqrt(mean(x²) + eps) * weight`;
+    /// no mean subtraction, no bias) — the normalization Gemma/Qwen use. The
+    /// default reads back and runs the host scalar `rmsnorm`; GPU backends
+    /// override it to stay on device. Distinct from [`Self::layer_norm_d`],
+    /// which is standard LayerNorm and not interchangeable here.
+    fn rmsnorm_d(
+        &self,
+        x: &DeviceTensor,
+        rows: usize,
+        hidden: usize,
+        weight: &DeviceTensor,
+        eps: f32,
+        out: &DeviceTensor,
+    ) -> Result<()> {
+        let x_host = x.to_host_owned()?;
+        let weight_host = weight.to_host_owned()?;
+        let mut out_buf = vec![0.0_f32; rows * hidden];
+        rmsnorm::rmsnorm(&x_host, rows, hidden, &weight_host, eps, &mut out_buf)?;
         out.write_from_host_slice(&out_buf)
     }
 
