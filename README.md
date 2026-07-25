@@ -3,9 +3,22 @@
 Rust-first local LLM and speech inference runtime.
 
 Ocelotl is a correctness-first runtime with explicit model, loader, tokenizer,
-kernel, runtime, and serving boundaries. The active target is an honest local
-alpha with Whisper batch transcription and Gemma4 text inference as the minimum
-model-family scope. It is not yet an internet-facing production server.
+kernel, runtime, and serving boundaries — with **no FFI**: every kernel, loader,
+and tokenizer path is Rust.
+
+**0.1.0 supports two surfaces**, chosen because they have independent-reference
+parity evidence at the release commit:
+
+- **Text embeddings** (EmbeddingGemma, pplx-embed) — cosine ≥ 0.9999997 vs
+  `llama-embedding`; 2.4× faster than llama.cpp on bulk CPU.
+- **Parakeet TDT 0.6B ASR** — token-exact against *two* independent
+  implementations; RTF 0.095 on 12 threads.
+
+Whisper ASR and Gemma4 text generation are present in-tree but **deferred to
+0.2.0** — they execute, but neither meets its numeric parity contract at this
+commit. See [CHANGELOG.md](CHANGELOG.md) for the full support boundary.
+
+It is not an internet-facing server: M8 server work has not started.
 
 ## Start Here
 

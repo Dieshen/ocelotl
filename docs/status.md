@@ -1,6 +1,6 @@
 # Project Status
 
-Last reconciled: 2026-07-10.
+Last reconciled: 2026-07-25.
 
 This is the canonical status page for Ocelotl. Milestone task checkboxes record
 historical execution; this page states the current release posture. Acceptance
@@ -9,17 +9,41 @@ if any prose has drifted.
 
 ## Release Posture
 
-Ocelotl is in **alpha-production hardening**. It is not alpha-ready yet.
+Ocelotl is preparing **0.1.0**, a local, single-process Rust library that loads
+trusted local artifacts. It is not an internet-facing service: M8 server work has
+not started, so Ocelotl must not be presented as a hardened remote or
+multi-tenant service.
 
-The first alpha target is a local, single-process Rust library and CLI that
-loads trusted local artifacts. The minimum model-family scope is:
+### 0.1.0 scope — what is claimed
 
-- Whisper for offline 16 kHz mono batch transcription.
-- Gemma4 for text-only inference from the selected Q4_K_M GGUF family.
+The scope is set by **which surfaces have current, independently verified parity
+evidence at the release commit**, not by which were planned first:
 
-This target does not include an internet-facing service. M8 server work has not
-started, so Ocelotl must not be presented as a hardened remote or multi-tenant
-service.
+- **Text embeddings** (`gemma::embedding::EmbeddingGemmaModel`,
+  `qwen::pplx_embed::PplxEmbedModel`) — cosine >= 0.9999997 vs `llama-embedding`
+  with full retrieval-ranking agreement; CPU faster than llama.cpp on bulk, GPU
+  at parity.
+- **Parakeet TDT 0.6B ASR** — token-exact and frame-exact against **two**
+  independent implementations (the ONNX export and `parakeet.cpp`), RTF 0.095 on
+  12 threads.
+
+### Deferred to 0.2.0 — present in-tree, not claimed
+
+Both execute and are useful; neither satisfies its numeric gate at this commit,
+so neither is part of the 0.1.0 support claim.
+
+- **Gemma4 text.** Full-logit parity is red and is a **contract decision, not a
+  bug**: every specific suspect was ruled out and the residual is the
+  independent-f32 reproducibility floor. argmax matches llama.cpp exactly and
+  top-20 overlap is 18-19/20. 0.2.0 must first settle whether raw-logit
+  0.05-absolute is the right *shape* of contract versus top-k agreement or KL
+  divergence, both of which already pass.
+- **Whisper ASR.** Previously the lead alpha candidate on 2026-07-10 evidence.
+  That evidence cannot be reproduced at this commit: the artifact bundle was not
+  rebuildable from the repository (now fixed — see below), and a freshly built
+  bundle shows a **one-token divergence** from a pure-greedy whisper.cpp
+  reference (26 of 27 tokens match; ocelotl omits a comma). Cause unresolved.
+  Deferring is the honest call until it is.
 
 ## Milestone State
 
@@ -31,8 +55,8 @@ service.
 | M6 | closed for CPU/reference | Paged allocation, multi-page behavior, cleanup, and contiguous/paged parity are covered. GPU paged-attention kernels remain deferred. |
 | M7 | closed as correctness plumbing | Bounded admission, state transitions, cancellation, fairness, and deterministic batch parity are covered. The scheduler is not yet a throughput-optimized production scheduler. |
 | M8 | not started | There is no supported network server endpoint, streaming transport, authentication, or external error contract. |
-| Whisper ASR | alpha candidate; opt-in evidence green | Real tiny.en exact-token parity and a repeated equal-resource whisper.cpp comparison passed locally. The proof remains opt-in because weights and reference binaries are not committed. |
-| Gemma4 text | executes; real final-logit parity blocked | The selected Q4_K_M text path loads and executes all 42 layers with native Q4_K/Q5_K/Q6_K projections. Layer 0 is green, but the final real-artifact logit distribution is still outside tolerance. |
+| Whisper ASR | **deferred to 0.2.0**; parity red at this commit | Real tiny.en exact-token parity and a repeated equal-resource whisper.cpp comparison passed locally. The proof remains opt-in because weights and reference binaries are not committed. |
+| Gemma4 text | **deferred to 0.2.0**; executes, final-logit contract unsettled | The selected Q4_K_M text path loads and executes all 42 layers with native Q4_K/Q5_K/Q6_K projections. Layer 0 is green, but the final real-artifact logit distribution is still outside tolerance. |
 | Text embeddings | parity-clean; CPU at/above llama.cpp on bulk; GPU resident | Two bidirectional encoders (`gemma::embedding::EmbeddingGemmaModel`, `qwen::pplx_embed::PplxEmbedModel`) produce mean-pooled, L2-normalized embeddings. Cosine ≥ 0.9999997 vs `llama-embedding` with full retrieval-ranking agreement. **CPU** AVX2 `linear_out_by_in`: single-seq 78/196 ms (EmbeddingGemma/pplx); bulk (rayon over sentences) 13.1 ms/embed (2.4× *faster* than llama.cpp) / 98.8 ms (parity). **GPU** (`EmbeddingGemmaGpu`, `cubecl-wgpu`): fully device-resident forward (new rmsnorm_d/rope_tables_d/expand_kv_heads_d/silu_d/attention_encoder_batched_d kernels), cosine 0.9999999. `embed_batch` (block-diagonal batched attention) hits **10.2 ms/embed at batch 256 — 1.3× faster than CPU-bulk (13.1 ms) and 3× the CPU-only llama.cpp (30.9 ms)**; batch parity exact (cosine 1.000000). **HIP/ROCm runtime** wired (compile-time `cubecl-wgpu`|`cubecl-hip` switch; same kernels): 24 device tests + cosine 0.9999999 on ROCm. Fair GPU-vs-GPU (RX 6600): register-blocked GEMM → ocelotl-WGPU **5.9** / ocelotl-ROCm 7.4 / llama-ROCm 6.0 ms/embed (batch 256). **ocelotl-WGPU now matches llama.cpp.** The lever was kernel quality (register-blocked micro-tile GEMM), not the backend API. Remaining: 8×8 tiles/vectorized loads, variable-length batches, pplx GPU. Parity proofs are opt-in (need the GGUFs + a GPU). |
 
 ## Whisper
@@ -61,13 +85,30 @@ service.
   versus whisper.cpp `428 ms` (`425 ms` median, `497 ms` p95), or `1.449x`
   whisper.cpp full-process wall time on that machine.
 
-### Alpha Blockers And Limits
+### 0.2.0 Blockers And Limits
 
-- Local artifact parity is opt-in because weights and reference binaries are
-  not committed. Release evidence must still be refreshed at the candidate
-  commit and name the exact model, reference revision, commands, and hardware.
+- **One-token divergence, cause unresolved (2026-07-25).** A bundle rebuilt from
+  `openai/whisper-tiny.en` via `tools/convert_whisper_hf_to_openai.py`, with the
+  reference captured from whisper.cpp `080bbbe` in **pure greedy** mode
+  (`-bo 1 -bs 1 -nf`), matches on **26 of 27 tokens**. ocelotl omits a comma
+  (token 11) after " you"; every other token, including all of those after the
+  divergence, is identical. Re-convergence after a skipped token suggests a
+  near-tie rather than a structural fault, but that is a hypothesis, not a
+  finding.
+- Confounds not yet eliminated, in the order worth checking: ocelotl loads HF
+  safetensors while the reference runs `ggml-tiny.en.bin`, so the two may not be
+  bit-identical weights; the sample audio is a substitution (`jfk.wav`) because
+  the original bundle's audio was never committed; and token-suppression policy
+  may differ between the two decoders.
+- **The bundle was previously not rebuildable from the repository.**
+  `docs/artifact-preparation.md` described the bundle's shape but never the
+  HF-to-OpenAI tensor conversion it requires, so gate evidence could only be
+  refreshed by whoever still had the original files. That is fixed:
+  `tools/convert_whisper_hf_to_openai.py` is committed and maps all 167 tensors
+  with zero drops. The parity result above is the first reproducible one.
+- The equal-resource benchmark record has not been re-run at this commit.
 - Timestamped segments, streaming/chunk stitching, multilingual quality claims,
-  and an approved WER threshold are outside the first alpha support claim.
+  and an approved WER threshold remain out of scope.
 
 ## Gemma4
 
@@ -115,24 +156,46 @@ service.
   peak memory and load-time cost must be removed or bounded before the selected
   Gemma artifact is production-alpha ready.
 
-## Alpha Release Gates
+## 0.1.0 Release Gates
 
-An alpha tag requires all of the following at the same commit:
+All of the following must hold at the same commit. Status as of 2026-07-25:
 
-1. `tools/verify.ps1 -Mode Full` passes with the committed lockfile on the
-   pinned development toolchain.
-2. The Rust 1.85 MSRV job and the RustSec dependency audit pass, or an advisory
-   has an explicit, time-bounded policy exception.
-3. Public request/artifact limits and target-feature dispatch cannot be bypassed
-   through safe APIs.
-4. Whisper exact-token local parity and its repeatable equal-resource benchmark
-   record pass against pinned artifacts.
-5. Gemma4 text-only real-artifact tokenizer, layer, full-logit, and generated
-   token parity pass through the public runtime against a pinned reference.
-6. Default tests remain offline; local weights, network access, real GPU launch,
-   and external reference binaries remain opt-in and documented.
-7. Release notes state that M8 server, Gemma4 multimodal input, Whisper
-   streaming/timestamps, and unproved hardware backends are unsupported.
+| # | Gate | State |
+|---|---|---|
+| 1 | `tools/verify.ps1 -Mode Full` passes with the committed lockfile on the pinned toolchain | **PASS** — green on `main` |
+| 2 | Rust 1.85 MSRV job and the RustSec dependency audit pass, or an advisory has a time-bounded exception | **PASS** — both green |
+| 3 | Public request/artifact limits and target-feature dispatch cannot be bypassed through safe APIs | **PASS** — see below |
+| 4 | Every **claimed** surface has independent-reference parity evidence captured at the release commit | **PASS** — embeddings and Parakeet |
+| 5 | Default tests remain offline; local weights, network access, real GPU launch, and external reference binaries stay opt-in and documented | **PASS** — 589 offline, 43 opt-in |
+| 6 | Release notes name every unsupported surface explicitly | **PASS** — `CHANGELOG.md` |
+
+Gate 3 evidence: `CpuKernelBackend`'s `mode` field is private and the only
+constructors are `scalar()`/`optimized()` (feature-free modes) and the fallible
+`with_mode`/`with_mode_and_threads`, which route `Avx2` through
+`validate_mode_supported` — a runtime `is_x86_feature_detected!("avx2") && ("fma")`
+check that errors on unsupported hosts and on non-x86_64 targets. So no safe
+caller can construct a backend that later executes unsupported
+`#[target_feature]` code. `ArtifactLimits`/`RequestLimits` bound generation,
+audio, context, file bytes and GGUF tensor counts, with default-on tests in
+`ocelotl-core`.
+
+**Gate 4 changed shape deliberately.** It used to name Whisper and Gemma4
+specifically, which conflated *what the project set out to build* with *what it
+can currently prove*. Tying the gate to the claimed surface set instead means the
+release claim and the evidence cannot drift apart, and a surface can be deferred
+without rewriting the gate. The two deferred families keep their own gates in the
+0.2.0 section below.
+
+## 0.2.0 Gates (deferred surfaces)
+
+1. **Gemma4**: a project-owner decision on the shape of the logit contract,
+   then text-only real-artifact tokenizer, layer, logit, and generated-token
+   parity against a pinned reference under whichever contract is chosen.
+2. **Whisper**: resolve the one-token divergence against a pure-greedy
+   whisper.cpp reference, then exact-token local parity plus the repeatable
+   equal-resource benchmark record, both captured at the candidate commit.
+3. Both must be reproducible from the repository alone — no bundle that only
+   exists on one machine.
 
 ## Evidence Index
 

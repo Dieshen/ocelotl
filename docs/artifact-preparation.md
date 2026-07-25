@@ -82,7 +82,43 @@ without a suffix always means "the pinned revision from
 ## 4. Whisper tiny.en Artifact
 
 The first post-M3 Whisper ASR local-artifact contract is a converted tiny.en
-bundle under the repository root:
+bundle under the repository root.
+
+> **Building the bundle.** "Converted" is load-bearing: Ocelotl uses OpenAI's
+> tensor naming (`encoder.positional_embedding`, `encoder.ln_post.*`,
+> `attn.query`), while Hugging Face ships a structurally different scheme
+> (`model.encoder.embed_positions`, `layer_norm`, `self_attn.q_proj`). Until
+> 2026-07-25 that conversion was not documented or scripted anywhere, so the
+> bundle could not be rebuilt from this repository and the Whisper release gate
+> was unsatisfiable for anyone without the original files.
+>
+> ```sh
+> mkdir -p local-artifacts/whisper_tiny_en/reference
+> cd local-artifacts/whisper_tiny_en
+> for f in config.json tokenizer.json model.safetensors; do
+>   curl -sL -o $f "https://huggingface.co/openai/whisper-tiny.en/resolve/main/$f"
+> done
+> mv model.safetensors model.hf.safetensors
+> python3 ../../tools/convert_whisper_hf_to_openai.py \
+>   model.hf.safetensors model.safetensors      # 167 tensors, 0 dropped
+> ```
+>
+> Capture `reference/expected_tokens.json` from an **independent** reference in
+> the same decode mode Ocelotl implements — masked greedy. whisper.cpp defaults
+> to `best_of 5` / `beam_size 5`, i.e. beam search, so it must be forced to
+> greedy or the comparison is between two different algorithms:
+>
+> ```sh
+> whisper-cli -m models/ggml-tiny.en.bin -f reference/sample_16khz_mono.wav \
+>   -nt -ojf -ps -bo 1 -bs 1 -nf
+> ```
+>
+> Prepend the english-only startup prompt `[50257, 50362]`; whisper.cpp's
+> segment tokens already end with `50256`. Never generate this file from
+> Ocelotl's own output — a fixture derived from the implementation it gates
+> cannot fail.
+
+The bundle layout:
 
 ```text
 local-artifacts/
