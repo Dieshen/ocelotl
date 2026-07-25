@@ -9,6 +9,7 @@
 //! - `ocelotl_models::whisper::WhisperModel`
 
 pub mod gemma;
+pub mod parakeet;
 pub mod qwen;
 pub mod whisper;
 

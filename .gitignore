@@ -4,3 +4,4 @@
 # Large weights and license-bearing files belong outside the repo (see
 # docs/validation/fixtures.md § Storage Policy).
 /local-artifacts/
+fixtures/asr/*.wav

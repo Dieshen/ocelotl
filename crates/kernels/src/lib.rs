@@ -28,12 +28,16 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+pub mod recurrent;
+pub mod relpos;
 pub mod rope;
 pub use rope::{rope_apply_inplace, rope_apply_inplace_with_factors};
 
 use ocelotl_core::{Device, KernelError, OcelotlError, Result, UnsupportedError};
 
+pub mod activation;
 pub mod attention;
+pub mod conv;
 #[cfg(target_arch = "x86_64")]
 mod cpu_avx2;
 mod cpu_backend;
@@ -49,9 +53,11 @@ pub use cubecl_backend::{
 pub use cubecl_backend::{CubeClKernelBackend, linear_out_by_in_cubecl, rope_apply_inplace_cubecl};
 pub mod k_quant;
 pub use k_quant::{GgmlKQuantKind, GgmlKQuantMatrixRef, linear_q8_k_k_quant};
+pub mod layout;
 pub mod mlp;
 pub mod rmsnorm;
 pub mod tensor;
+pub use layout::transpose_2d;
 pub use tensor::{DeviceBuffer, DeviceTensor, HostBorrow, HostBorrowMut, Residency};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -846,7 +852,10 @@ pub(crate) fn erf_whisper_scalar(x: f32) -> f32 {
 /// Scalar LayerNorm matching `whisper::primitives::layer_norm` op-for-op
 /// (biased variance, `1.0 / sqrt(var + eps)`, then `(x - mean) * inv_std
 /// * weight + bias`).
-pub(crate) fn layer_norm_whisper_scalar(
+///
+/// Public because the Parakeet Conformer block needs it five times per layer;
+/// exposing the single existing implementation rather than adding a second.
+pub fn layer_norm_whisper_scalar(
     x: &[f32],
     rows: usize,
     hidden: usize,
