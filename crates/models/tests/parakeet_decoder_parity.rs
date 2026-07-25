@@ -462,7 +462,7 @@ fn parakeet_transcribes_audio_token_exactly_end_to_end() {
     }
 }
 
-/// Chunked transcription must reproduce the unchunked decode exactly.
+/// Chunked transcription must stay close to the unchunked decode.
 ///
 /// The chunk size is deliberately **absurd**: 48 frames of body with 25 frames
 /// of context, i.e. ~3.8 s chunks over an 11 s clip, forcing three windows and
@@ -474,7 +474,7 @@ fn parakeet_transcribes_audio_token_exactly_end_to_end() {
 /// cannot fail, so this one manufactures the boundaries.
 #[test]
 #[ignore = "requires OCELOTL_PARAKEET_WEIGHTS + OCELOTL_PARAKEET_REF_DIR"]
-fn parakeet_chunked_transcription_matches_the_unchunked_decode() {
+fn parakeet_chunked_transcription_stays_close_to_the_unchunked_decode() {
     let Some((weights_path, ref_dir)) = fixtures() else {
         return;
     };
@@ -519,11 +519,29 @@ fn parakeet_chunked_transcription_matches_the_unchunked_decode() {
     let got = model
         .decode_audio_chunked(&audio, CHUNK, CONTEXT, &backend)
         .expect("chunked decode");
-    assert_eq!(
-        got.tokens,
-        want_tokens,
-        "chunked decode differs from the reference tokens (max encoder delta \
-         {worst:.3e} across {} seams)",
+
+    // Bounded degradation, NOT token equality.
+    //
+    // An earlier version of this test asserted equality and passed, which was
+    // luck rather than a property: chunking a full-attention encoder truncates
+    // every frame's receptive field, so it is lossy by construction (see
+    // `parakeet::chunk`). Demanding exactness here contradicts the module's own
+    // measured finding, and it duly broke the moment attention's accumulation
+    // order changed — an f32-level shift, not a regression.
+    //
+    // 3.8 s chunks with 2 s of context is an abusive setting chosen to force
+    // three windows out of an 11 s clip; the production defaults put this whole
+    // fixture in one window. The gate is set well inside what a real stitching
+    // bug produces: a dropped or duplicated frame desynchronizes the transducer
+    // and drives TER toward 1.0, two orders above this line. The frame-count
+    // assertion above is the exact one.
+    let ter = token_error_rate(&want_tokens, &got.tokens);
+    eprintln!("PARAKEET_CHUNK token_error_rate={ter:.4}");
+    assert!(
+        ter <= 0.15,
+        "chunked decode has a {:.1}% token error rate against the reference \
+         (max encoder delta {worst:.3e} across {} seams)",
+        ter * 100.0,
         (single_frames.div_ceil(CHUNK)).saturating_sub(1)
     );
 
@@ -633,7 +651,14 @@ fn chunking_long_audio_at_default_settings() {
         return;
     };
     let audio = read_f32(&ref_dir.join("parity_long_quiet_audio.f32"));
-    let backend = backend();
+    // Threaded: the unchunked 1513-frame reference encode is the expensive half
+    // of this test, and there is no reason to measure it serially now that
+    // row-parallel dispatch exists and is bit-exact.
+    let backend = CpuKernelBackend::with_mode_and_threads(
+        CpuKernelMode::Avx2,
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+    )
+    .unwrap_or_else(|_| backend());
     let model = ParakeetModel::from_safetensors(&weights_path).expect("load model");
     eprintln!("PARAKEET_LONG audio={:.1}s", audio.len() as f32 / 16_000.0);
 
@@ -687,10 +712,24 @@ fn chunking_long_audio_at_default_settings() {
         "chunked decode has a {:.2}% token error rate against the unchunked one",
         ter * 100.0
     );
-    assert!(
-        chunked_secs < single_secs,
-        "chunking was not faster ({chunked_secs:.1}s vs {single_secs:.1}s) — \
-         the quadratic term it exists to remove must dominate at this length"
+    // NOT asserting that chunking is faster here — at 121 s it is not, and that
+    // is the correct outcome.
+    //
+    // Chunking was built when the encoder's quadratic term was 97% of runtime at
+    // this length. That term turned out to be 97% *unvectorized kernel*: once
+    // attention became a threaded GEMM the same encode went 493.7 s -> 11.7 s and
+    // the quadratic share fell to ~3%. Chunking's ~33% context re-encoding
+    // overhead now dominates whatever it saves, so it runs ~12% slower AND costs
+    // 4.2% token error. Refitting the threaded encoder puts break-even near
+    // 30 000 frames — about **40 minutes** of audio.
+    //
+    // The lesson this bakes in: chunking is a workaround, and a workaround
+    // benchmarked against a broken baseline looks like a win. Asserting a
+    // speedup here would lock that illusion into the test suite.
+    let ratio = single_secs / chunked_secs;
+    eprintln!(
+        "PARAKEET_LONG chunking is {ratio:.2}x the unchunked speed at this length \
+         (expected < 1.0 below ~40 min of audio)"
     );
 }
 

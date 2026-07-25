@@ -112,6 +112,33 @@ fn feed_forward(
 /// `relative_k_proj`. `bias_u`/`bias_v` are **per block** — a shared pair loads
 /// without complaint and silently changes every score, which is why they are
 /// stored per `BlockWeights` rather than once for the stack.
+///
+/// # All three products are GEMMs
+///
+/// `QKᵀ`, `QPᵀ` and `probs·V` were originally written as hand-rolled scalar
+/// loops, which cost far more than their share of the arithmetic suggests:
+/// attention is **2.3% of this encoder's multiply-accumulates but was 74.5% of
+/// its wall time**, because everything around it went through the AVX2
+/// microkernel and it did not. A MAC count ranks attention near the bottom of
+/// the optimization list and is simply the wrong instrument here.
+///
+/// Each product is a matrix multiply once the head's slice is made contiguous,
+/// and [`KernelBackend::linear_out_by_in`] computes exactly `X · Wᵀ` for a
+/// `[out][in]` weight — which is the shape all three already have:
+///
+/// | product | X | W (as `[out][in]`) |
+/// |---|---|---|
+/// | `AC = (q+bias_u)·kᵀ` | `[rows][hd]` | `k_h` as `[rows][hd]` |
+/// | `BD = (q+bias_v)·pᵀ` | `[rows][hd]` | `p_h` as `[pos_rows][hd]` |
+/// | `ctx = probs·V` | `[rows][rows]` | `v_hᵀ` as `[hd][rows]` |
+///
+/// The per-head gather that makes them contiguous is `O(rows·hd)` against an
+/// `O(rows²·hd)` GEMM, so it disappears into the win. The softmax stays scalar:
+/// it is `O(rows²)` with no reuse, so there is no matrix multiply to hand off.
+///
+/// Accumulation order changes relative to the naive loops (4x4 register tiling
+/// instead of a straight sum), so the block outputs shift slightly at the f32
+/// floor. The stage-by-stage parity gates cover that.
 fn self_attention(
     x: &[f32],
     rows: usize,
@@ -137,36 +164,52 @@ fn self_attention(
     let mut bd_wide = vec![0.0_f32; rows * pos_rows];
     let mut bd = vec![0.0_f32; rows * rows];
 
+    // Per-head contiguous scratch, allocated once for the whole stack of heads.
+    let mut qu = vec![0.0_f32; rows * hd]; // q_h + bias_u
+    let mut qv = vec![0.0_f32; rows * hd]; // q_h + bias_v
+    let mut kh = vec![0.0_f32; rows * hd];
+    let mut ph = vec![0.0_f32; pos_rows * hd];
+    let mut vt = vec![0.0_f32; hd * rows]; // v_h TRANSPOSED, [hd][rows]
+    let mut ctx_h = vec![0.0_f32; rows * hd];
+
     for head in 0..h {
         let off = head * hd;
-        // AC: (q + bias_u) . k^T ; BD: (q + bias_v) . p^T
+
+        // Gather this head's slice out of the [rows][d_model] projections into
+        // contiguous [rows][head_dim] buffers, folding the two biases in as we
+        // go. Both bias variants are materialized because AC and BD need
+        // different ones and each is consumed by a separate GEMM.
         for i in 0..rows {
             let qi = &q[i * d + off..i * d + off + hd];
-            for j in 0..rows {
-                let kj = &k[j * d + off..j * d + off + hd];
-                let mut acc = 0.0_f32;
-                for t in 0..hd {
-                    acc += (qi[t] + w.bias_u[off + t]) * kj[t];
-                }
-                ac[i * rows + j] = acc;
-            }
-            for j in 0..pos_rows {
-                let pj = &p[j * d + off..j * d + off + hd];
-                let mut acc = 0.0_f32;
-                for t in 0..hd {
-                    acc += (qi[t] + w.bias_v[off + t]) * pj[t];
-                }
-                bd_wide[i * pos_rows + j] = acc;
+            let ki = &k[i * d + off..i * d + off + hd];
+            let vi = &v[i * d + off..i * d + off + hd];
+            for t in 0..hd {
+                qu[i * hd + t] = qi[t] + w.bias_u[off + t];
+                qv[i * hd + t] = qi[t] + w.bias_v[off + t];
+                kh[i * hd + t] = ki[t];
+                // Transposed on the way in: the context GEMM needs V as an
+                // [out][in] = [head_dim][rows] weight.
+                vt[t * rows + i] = vi[t];
             }
         }
+        for j in 0..pos_rows {
+            let pj = &p[j * d + off..j * d + off + hd];
+            ph[j * hd..(j + 1) * hd].copy_from_slice(pj);
+        }
+
+        // AC[i][j] = sum_t qu[i][t] * kh[j][t]
+        kernels.linear_out_by_in(&qu, rows, hd, &kh, rows, None, &mut ac)?;
+        // BD_wide[i][j] = sum_t qv[i][t] * ph[j][t]
+        kernels.linear_out_by_in(&qv, rows, hd, &ph, pos_rows, None, &mut bd_wide)?;
         rel_shift(&bd_wide, rows, &mut bd)?;
 
+        // Softmax stays scalar: O(rows^2) with no reuse, nothing to hand to a
+        // matrix kernel.
         for i in 0..rows {
             let row = &mut ac[i * rows..(i + 1) * rows];
             for (j, s) in row.iter_mut().enumerate() {
                 *s = (*s + bd[i * rows + j]) * scale;
             }
-            // Softmax, max-subtracted.
             let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0_f32;
             for s in row.iter_mut() {
@@ -177,13 +220,12 @@ fn self_attention(
             for s in row.iter_mut() {
                 *s *= inv;
             }
-            for t in 0..hd {
-                let mut acc = 0.0_f32;
-                for (j, s) in row.iter().enumerate() {
-                    acc += *s * v[j * d + off + t];
-                }
-                context[i * d + off + t] = acc;
-            }
+        }
+
+        // ctx[i][t] = sum_j probs[i][j] * vt[t][j] = sum_j probs[i][j] * v_h[j][t]
+        kernels.linear_out_by_in(&ac, rows, rows, &vt, hd, None, &mut ctx_h)?;
+        for i in 0..rows {
+            context[i * d + off..i * d + off + hd].copy_from_slice(&ctx_h[i * hd..(i + 1) * hd]);
         }
     }
 

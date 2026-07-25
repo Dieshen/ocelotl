@@ -63,6 +63,18 @@ fn pick_backend() -> (CpuKernelBackend, &'static str) {
     }
 }
 
+/// Backend with a rayon pool of `threads` workers.
+///
+/// `linear_out_by_in` dispatches to the pool on its own once one exists (above
+/// 32 rows, which the encoder always clears at 138), so this is the whole of
+/// "turn on multi-threading" for the Parakeet path — the machinery was already
+/// in the kernels crate and simply was not being constructed.
+fn threaded_backend(threads: usize) -> CpuKernelBackend {
+    CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Avx2, threads)
+        .or_else(|_| CpuKernelBackend::with_mode_and_threads(CpuKernelMode::Optimized, threads))
+        .expect("threaded cpu backend")
+}
+
 /// Minimum of `repeats` timings of `f`, in seconds, after one warm-up call.
 fn best_of<T>(repeats: usize, mut f: impl FnMut() -> T) -> (f64, T) {
     let mut out = f(); // warm-up: page-faults the weights, primes caches
@@ -90,12 +102,22 @@ fn parakeet_cpu_benchmark_reports_per_stage_rtf() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
 
-    let (backend, backend_name) = pick_backend();
+    // Threads default to the host's parallelism; set to 1 to measure serial.
+    let threads: usize = std::env::var("OCELOTL_PARAKEET_BENCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let (probe, backend_name) = pick_backend();
+    drop(probe);
+    let backend = threaded_backend(threads);
     let load_start = Instant::now();
     let model = ParakeetModel::from_safetensors(&weights_path).expect("load model");
     let load_secs = load_start.elapsed().as_secs_f64();
 
-    eprintln!("PARAKEET_BENCH backend={backend_name} repeats={repeats} load_s={load_secs:.2}");
+    eprintln!(
+        "PARAKEET_BENCH backend={backend_name} threads={threads} repeats={repeats} \
+         load_s={load_secs:.2}"
+    );
     eprintln!(
         "{:<18} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}",
         "fixture", "audio_s", "mel_s", "sub_s", "enc_s", "dec_s", "total_s", "RTF"
@@ -167,6 +189,75 @@ fn parakeet_cpu_benchmark_reports_per_stage_rtf() {
         "PARAKEET_BENCH note: model load ({load_secs:.2}s) is excluded from RTF; \
          it is a one-time cost, not throughput."
     );
+}
+
+/// How the encoder scales across threads.
+///
+/// Reports speedup and parallel efficiency per thread count, and asserts the
+/// outputs still agree — a thread count that changed the answer would be a
+/// correctness bug wearing a performance result's clothing. Row-parallel
+/// dispatch keeps each output row on one worker with an unchanged accumulation
+/// order, so agreement here should be *exact*, not merely close; the assertion
+/// is written to catch it if that ever stops being true.
+#[test]
+#[ignore = "benchmark: run alone on an idle machine"]
+fn parakeet_encoder_thread_scaling() {
+    let (Some(weights_path), Some(ref_dir)) = (
+        env_path("OCELOTL_PARAKEET_WEIGHTS"),
+        env_path("OCELOTL_PARAKEET_REF_DIR"),
+    ) else {
+        eprintln!("skipping");
+        return;
+    };
+    let model = ParakeetModel::from_safetensors(&weights_path).expect("load model");
+    let audio = read_f32(&ref_dir.join("parity_jfk_audio.f32"));
+    let features = parakeet_log_mel(&audio).expect("mel");
+    let shape = EncoderShape::default();
+    let base = threaded_backend(1);
+    let subsampled =
+        subsample(&features, &model.weights().subsample, shape.d_model, &base).expect("subsample");
+    let frames = subsampled.frames;
+
+    let run = |kernels: &dyn KernelBackend| {
+        let mut best = f64::INFINITY;
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let start = Instant::now();
+            let mut h = subsampled.values.clone();
+            encode(&mut h, frames, shape, &model.weights().blocks, kernels).expect("encode");
+            best = best.min(start.elapsed().as_secs_f64());
+            out = h;
+        }
+        (best, out)
+    };
+
+    let (serial_s, serial_out) = run(&threaded_backend(1));
+    eprintln!(
+        "{:>8} {:>9} {:>9} {:>12}",
+        "threads", "encode_s", "speedup", "efficiency"
+    );
+    eprintln!("{:>8} {serial_s:>9.3} {:>9} {:>12}", 1, "1.00x", "100%");
+
+    for threads in [2usize, 4, 8, 12] {
+        let (secs, out) = run(&threaded_backend(threads));
+        let speedup = serial_s / secs;
+        eprintln!(
+            "{threads:>8} {secs:>9.3} {:>8.2}x {:>11.0}%",
+            speedup,
+            speedup / threads as f64 * 100.0
+        );
+        let worst = serial_out
+            .iter()
+            .zip(out.iter())
+            .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+        assert_eq!(
+            worst, 0.0,
+            "{threads} threads changed the encoder output by {worst:.3e}; \
+             row-parallel dispatch is supposed to preserve accumulation order \
+             exactly, so any drift means work is being split somewhere it should \
+             not be"
+        );
+    }
 }
 
 /// Compare the AVX2 microkernel against the portable path on one encoder pass.

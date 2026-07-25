@@ -1,48 +1,63 @@
 //! Chunk planning for long-form Parakeet transcription.
 //!
-//! # Why chunking is needed, and what it actually fixes
+//! # Read this before reaching for chunking
 //!
-//! The encoder runs full self-attention (`att_context_size = [-1, -1]`) with no
-//! KV cache, so its cost is quadratic in the subsampled frame count.
+//! > ⚠️ **Chunking is currently a pessimization below ~40 minutes of audio.** It
+//! > exists, it is correct, and at the lengths anyone actually uses it is both
+//! > **slower** and **less accurate** than just encoding the whole utterance.
+//! > Measured on the 121 s fixture: 13.1 s chunked against 11.5 s in one window,
+//! > for a 4.2% token error rate. Use [`super::model::ParakeetModel::encode_audio`]
+//! > unless you are past [`super::model::MAX_AUDIO_SECONDS`] and bounded by
+//! > memory.
 //!
-//! Fitting `cost = a*T + b*T^2` to two measured points (138 frames in 5.23 s,
-//! 1513 frames in 482.7 s) gives `a = 9.7e-3 s/frame`, `b = 2.0e-4 s/frame^2`:
+//! # How it ended up that way, because the mistake generalizes
 //!
-//! | audio | frames | linear | quadratic | quadratic share | RTF |
-//! |------:|-------:|-------:|----------:|----------------:|----:|
-//! |  11 s |    138 |  1.3 s |     3.9 s |           74.5% | 0.5 |
-//! |  60 s |    751 |  7.3 s |   115.3 s |           94.1% | 2.0 |
-//! | 121 s |  1 513 | 14.7 s |   468.1 s |           97.0% | 4.0 |
-//! | 600 s |  7 501 | 72.6 s | 11504.0 s |           99.4% |19.3 |
+//! Chunking was built to fix a real, measured problem: the encoder ran at
+//! **RTF 4.08** on 121 s of audio and the quadratic attention term was **97%** of
+//! that. Overlap-and-trim chunking cut it to RTF 1.58 — a genuine 2.58x, honestly
+//! measured.
 //!
-//! The binding constraint is **time, not memory**: the largest transient is the
-//! `[T, 2T-1]` score matrix, only ~450 MB even at ten minutes. RTF crosses 1.0
-//! between 11 s and 60 s of audio, far earlier than a naive reading suggests.
+//! Then the quadratic term turned out to be 97% *unvectorized kernel*.
+//! `encoder::self_attention` computed `QKᵀ`, `QPᵀ` and `probs·V` in scalar loops
+//! while everything around it used the AVX2 microkernel. Rewriting those three
+//! products as GEMMs and putting them on the thread pool took the same encode
+//! from **493.7 s to 11.5 s — 43x** — and dropped the quadratic share to ~3%.
 //!
-//! > ⚠️ **Most of that quadratic term is an unvectorized kernel, not intrinsic
-//! > cost.** Attention is only **2.3% of the encoder's multiply-accumulates** at
-//! > 138 frames but **74.5% of its time**, because `encoder::self_attention`
-//! > computes `QK^T`, `QP^T` and `score·V` in hand-written scalar loops while
-//! > every projection and FFN goes through the AVX2 microkernel — roughly a 32x
-//! > per-MAC penalty. Chunking bounds the quadratic term; **vectorizing
-//! > attention would shrink it**, and is the larger win of the two. Chunking is
-//! > still worth having (it makes cost linear in length regardless of kernel
-//! > quality) but it is not the fix for this.
+//! | 121 s fixture | before | after |
+//! |---|---:|---:|
+//! | one window | 493.7 s (RTF 4.08) | **11.5 s (RTF 0.09)** |
+//! | chunked (375 / 62) | 191.4 s (RTF 1.58) | 13.1 s (RTF 0.11) |
+//! | chunking verdict | **2.58x faster** | **0.88x — slower** |
 //!
-//! Chunking replaces the quadratic term with a constant one, so RTF stays at
-//! whatever the chunk size costs no matter how long the audio is. Measured on
-//! the 121 s fixture at the defaults below:
+//! **I optimized around a bottleneck instead of fixing it.** The 2.58x was real
+//! and reproducible; it was also measured against a baseline crippled by a
+//! kernel-selection bug, which made a lossy workaround look like a win. A
+//! workaround benchmarked against a broken baseline always will.
 //!
-//! | | wall clock | RTF | tokens |
-//! |---|---:|---:|---:|
-//! | one window | 493.7 s | 4.08 | 407 |
-//! | chunked (375 / 62) | 191.4 s | 1.58 | 413 |
+//! The tell was available before any of this was written: attention was 2.3% of
+//! the encoder's multiply-accumulates and 74.5% of its time. A 32x discrepancy
+//! between arithmetic and wall clock says "your kernel is wrong", not "this
+//! operation is expensive". See
+//! the "fast path nobody called" lesson in the knowledge base
+//! (`docs/lessons/fast-path-not-taken`), which this is the fourth instance of.
 //!
-//! **2.58x faster for a 4.2% token error rate** against the unchunked decode.
-//! That fixture is deliberately hostile — `parity_jfk` tiled eleven times at
-//! -30 dBFS, i.e. quiet and highly repetitive, which is the worst case for a
-//! transducer's alignment — so treat 4.2% as a pessimistic bound rather than a
-//! typical cost.
+//! # When chunking still earns its place
+//!
+//! Refitting the threaded encoder (`a = 5.1e-3 s/frame`, `b = 1.1e-7 s/frame²`):
+//!
+//! | audio | frames | quadratic share | score transient |
+//! |------:|-------:|----------------:|----------------:|
+//! |  11 s |    137 |            0.3% |         ~0.00 GB |
+//! | 121 s |  1 512 |            3.3% |         ~0.03 GB |
+//! | 600 s |  7 500 |           14.3% |         ~0.67 GB |
+//! |  20 min | 15 000 |          25.1% |         ~2.70 GB |
+//! |  40 min | 30 000 |          40.1% |        ~10.80 GB |
+//!
+//! Chunking's overhead is the ~33% of extra encoding spent on context frames it
+//! then discards, so it breaks even where the quadratic share it removes exceeds
+//! that — **about 30 000 frames, or 40 minutes**. Below that, single-window wins
+//! on both speed and accuracy. Above it, chunking is also the only thing keeping
+//! the score transient bounded, which is the more durable reason to have it.
 //!
 //! # Overlap-and-trim, then a single decode
 //!

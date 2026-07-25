@@ -11,18 +11,18 @@
 //! KV-cache shortcut, so its cost is quadratic in the subsampled frame count
 //! (~12.5 frames per second of audio).
 //!
-//! **The binding constraint is time, not memory.** The largest transient is the
-//! `[T, 2T-1]` score matrix, which is only ~450 MB even at ten minutes — well
-//! within reach. What degrades is throughput: attention is 2.3% of the encoder's
-//! multiply-accumulates at 11 s, 11% at 60 s, 20% at 121 s and 56% at 600 s, so
-//! real-time factor is flat at first and then climbs past 1.0 somewhere near ten
-//! minutes.
+//! **The binding constraint is memory, not time** — though it took fixing a
+//! kernel to make that true. With attention vectorized and running on the thread
+//! pool, the measured quadratic share is 0.3% at 11 s, 3% at 121 s and 14% at
+//! 600 s, so RTF stays roughly flat (0.095 at 11 s and 0.09 at 121 s on 12
+//! threads). What eventually bites is the `[T, 2T-1]` score transient: ~0.7 GB at
+//! 600 s and ~2.7 GB at 20 minutes.
 //!
-//! [`ParakeetModel::encode_audio`] keeps a [`MAX_AUDIO_SECONDS`] guard so the
-//! single-window path cannot quietly become the slow one, and
-//! [`ParakeetModel::encode_audio_chunked`] has no limit: overlap-and-trim
-//! chunking replaces the quadratic term with a constant one, holding RTF at
-//! whatever the chunk size costs regardless of length. See [`super::chunk`].
+//! [`ParakeetModel::encode_audio`] therefore guards on [`MAX_AUDIO_SECONDS`] for
+//! allocation size, and [`ParakeetModel::encode_audio_chunked`] has no limit.
+//! Note that chunking is **slower** than a single window below roughly 40
+//! minutes of audio — see [`super::chunk`] for why, and for what that says about
+//! benchmarking a workaround against a broken baseline.
 
 use std::path::Path;
 
@@ -44,12 +44,19 @@ pub const NUM_BLOCKS: usize = 24;
 
 /// Longest audio the **single-window** path will attempt, in seconds.
 ///
-/// Neither a model limit nor a memory one — a throughput guard. Past this point
-/// the quadratic attention term stops being negligible and the chunked path is
-/// simply the better choice, so refusing here routes callers to it instead of
-/// letting them silently take the slow road.
-/// [`ParakeetModel::encode_audio_chunked`] is not bounded by this.
-pub const MAX_AUDIO_SECONDS: usize = 60;
+/// A **memory** guard, and only that. Attention materializes a `[T, 2T-1]` score
+/// transient per block: ~0.7 GB at 600 s, ~2.7 GB at 20 minutes, quadratic
+/// thereafter.
+///
+/// This was 60 s, sized when the encoder's quadratic term was ~94% of runtime at
+/// that length. It is not any more: with attention vectorized and threaded the
+/// quadratic share at 600 s is 14%, and single-window beats chunking out to
+/// roughly 40 minutes of audio. A 60 s ceiling would now push callers onto the
+/// slower, lossier path for no reason.
+///
+/// [`ParakeetModel::encode_audio_chunked`] is not bounded by this and is the
+/// right choice past it — for memory, not for speed.
+pub const MAX_AUDIO_SECONDS: usize = 600;
 
 fn rt<S: Into<String>>(m: S) -> OcelotlError {
     OcelotlError::Runtime(RuntimeError { message: m.into() })
