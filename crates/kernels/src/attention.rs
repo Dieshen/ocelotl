@@ -192,6 +192,10 @@ pub fn scaled_dot_product_attention_bidirectional_with_scale(
 }
 
 /// Bidirectional SDPA with the default `1/sqrt(head_dim)` scale.
+// Eight arguments, like every other entry point in this file: the tensor trio
+// plus four shape parameters and an output buffer. Grouping them into a struct
+// would move the same values behind a constructor without removing any of them.
+#[allow(clippy::too_many_arguments)]
 pub fn scaled_dot_product_attention_bidirectional(
     q: &[f32],
     k: &[f32],
