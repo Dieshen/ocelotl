@@ -236,11 +236,6 @@ impl Qwen2_5Weights {
     }
 }
 
-/// Transpose a `[rows, cols]` row-major slice into a fresh `[cols, rows]`
-/// row-major slice. Used at weight-load time to flip HF's
-/// `[out_features, in_features]` storage into the `[in, out]` layout the
-/// matmul kernel consumes without re-walking memory in column order.
-
 fn take_tensor_values(
     by_name: &mut BTreeMap<String, LoadedTensor>,
     name: &str,

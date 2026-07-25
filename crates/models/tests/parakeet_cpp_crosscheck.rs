@@ -31,14 +31,14 @@
 //!   `OCELOTL_PARAKEET_CPP_GGUF`  path to `tdt-0.6b-v3-f16.gguf`
 //!   `OCELOTL_PARAKEET_REF_DIR`   dir holding `decode/` (ocelotl's golden decode)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key).ok().map(PathBuf::from)
 }
 
-fn read_i32(path: &PathBuf) -> Vec<i32> {
+fn read_i32(path: &Path) -> Vec<i32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     bytes
         .chunks_exact(4)

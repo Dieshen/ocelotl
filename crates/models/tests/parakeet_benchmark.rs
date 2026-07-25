@@ -31,7 +31,7 @@
 //!   `OCELOTL_PARAKEET_REF_DIR`   dir holding the `parity_*_audio.f32` fixtures
 //!   `OCELOTL_PARAKEET_BENCH_REPEATS`  iterations per fixture (default 3)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode, KernelBackend};
@@ -45,7 +45,7 @@ fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key).ok().map(PathBuf::from)
 }
 
-fn read_f32(path: &PathBuf) -> Vec<f32> {
+fn read_f32(path: &Path) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     bytes
         .chunks_exact(4)

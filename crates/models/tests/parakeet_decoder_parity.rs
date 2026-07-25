@@ -23,7 +23,7 @@
 //!   `OCELOTL_PARAKEET_TOKENIZER` path to `tokenizer.json` (optional; enables
 //!                                the detokenization check)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ocelotl_core::TokenId;
 use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode, transpose_2d};
@@ -68,7 +68,7 @@ fn backend() -> CpuKernelBackend {
         .expect("cpu backend")
 }
 
-fn read_f32(path: &PathBuf) -> Vec<f32> {
+fn read_f32(path: &Path) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     bytes
         .chunks_exact(4)
@@ -76,7 +76,7 @@ fn read_f32(path: &PathBuf) -> Vec<f32> {
         .collect()
 }
 
-fn read_i32(path: &PathBuf) -> Vec<i32> {
+fn read_i32(path: &Path) -> Vec<i32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     bytes
         .chunks_exact(4)
@@ -84,7 +84,7 @@ fn read_i32(path: &PathBuf) -> Vec<i32> {
         .collect()
 }
 
-fn load_prednet(path: &PathBuf) -> PredNetWeights {
+fn load_prednet(path: &Path) -> PredNetWeights {
     let mut names = vec!["decoder.embedding.weight".to_string()];
     for l in 0..PRED_LAYERS {
         for t in ["weight_ih", "weight_hh", "bias_ih", "bias_hh"] {
@@ -105,7 +105,7 @@ fn load_prednet(path: &PathBuf) -> PredNetWeights {
     PredNetWeights { embedding, layers }
 }
 
-fn load_joint(path: &PathBuf) -> JointWeights {
+fn load_joint(path: &Path) -> JointWeights {
     let names = [
         "encoder_projector.weight",
         "encoder_projector.bias",
@@ -129,7 +129,7 @@ fn load_joint(path: &PathBuf) -> JointWeights {
 
 /// The reference encoder dump is `[d_model][frames]` (channel-major, as the
 /// exported graph emits it); the decoder wants one contiguous frame at a time.
-fn reference_encoder_time_major(ref_dir: &PathBuf) -> Vec<f32> {
+fn reference_encoder_time_major(ref_dir: &Path) -> Vec<f32> {
     let channel_major = read_f32(&ref_dir.join("enc").join("outputs.f32"));
     assert_eq!(
         channel_major.len(),

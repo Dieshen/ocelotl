@@ -25,7 +25,7 @@
 //! time-axis off-by-one survives a passing value diff and only surfaces later as
 //! a desynchronized transducer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ocelotl_models::parakeet::audio::{frame_count, parakeet_log_mel};
 
@@ -66,7 +66,7 @@ fn ref_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn read_f32(path: &PathBuf) -> Vec<f32> {
+fn read_f32(path: &Path) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(bytes.len() % 4, 0, "{} is not f32-aligned", path.display());
     bytes
@@ -75,7 +75,7 @@ fn read_f32(path: &PathBuf) -> Vec<f32> {
         .collect()
 }
 
-fn load(dir: &PathBuf, name: &'static str) -> Fixture {
+fn load(dir: &Path, name: &'static str) -> Fixture {
     let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest.json");
     // Minimal extraction — avoids a serde_json dependency in this test.
     let entry = manifest
@@ -86,7 +86,7 @@ fn load(dir: &PathBuf, name: &'static str) -> Fixture {
         entry
             .split(&format!("\"{key}\""))
             .nth(1)
-            .and_then(|s| s.split(|c: char| c == ',' || c == '}').next())
+            .and_then(|s| s.split([',', '}']).next())
             .and_then(|s| s.trim().trim_start_matches(':').trim().parse().ok())
             .unwrap_or_else(|| panic!("manifest {name}.{key} unreadable"))
     };

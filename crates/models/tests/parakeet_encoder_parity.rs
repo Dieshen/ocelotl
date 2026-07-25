@@ -10,7 +10,7 @@
 //!   `OCELOTL_PARAKEET_WEIGHTS`  path to `model.safetensors` (nvidia v3)
 //!   `OCELOTL_PARAKEET_REF_DIR`  dir holding `parity_jfk_mel.f32` and `enc/`
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ocelotl_kernels::{CpuKernelBackend, CpuKernelMode};
 use ocelotl_loader::load_safetensors_tensors_f32;
@@ -61,7 +61,7 @@ fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key).ok().map(PathBuf::from)
 }
 
-fn read_f32(path: &PathBuf) -> Vec<f32> {
+fn read_f32(path: &Path) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     bytes
         .chunks_exact(4)
@@ -69,7 +69,7 @@ fn read_f32(path: &PathBuf) -> Vec<f32> {
         .collect()
 }
 
-fn load_subsample_weights(path: &PathBuf) -> SubsampleWeights {
+fn load_subsample_weights(path: &Path) -> SubsampleWeights {
     let names = [
         "encoder.subsampling.layers.0.weight",
         "encoder.subsampling.layers.0.bias",
@@ -239,7 +239,7 @@ fn parakeet_relative_position_table_matches_reference() {
     );
 }
 
-fn load_block_weights(path: &PathBuf, i: usize) -> ocelotl_models::parakeet::encoder::BlockWeights {
+fn load_block_weights(path: &Path, i: usize) -> ocelotl_models::parakeet::encoder::BlockWeights {
     use ocelotl_models::parakeet::encoder::BlockWeights;
     let p = format!("encoder.layers.{i}");
     let names: Vec<String> = [

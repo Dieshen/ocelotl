@@ -133,11 +133,17 @@ mod tests {
 
     #[test]
     fn tanh_matches_hand_computed_values() {
+        // tanh(0) = 0 exactly; tanh(1) = 0.7615941559557649, whose nearest f32
+        // is 0.7615942. The literal below is written to that f32 rather than to
+        // full precision because the extra digits are not representable — but
+        // the value they came from is recorded here, so the derivation stays
+        // auditable. (A wrong literal in a sibling LSTM test cost real time this
+        // port; the comment is what localized it.)
         let mut x = [0.0_f32, 1.0, -1.0];
         tanh_inplace(&mut x);
         assert_eq!(x[0], 0.0);
-        assert!((x[1] - 0.761_594_16).abs() < 1e-6);
-        assert!((x[2] + 0.761_594_16).abs() < 1e-6);
+        assert!((x[1] - 0.761_594_2).abs() < 1e-6);
+        assert!((x[2] + 0.761_594_2).abs() < 1e-6);
     }
 
     #[test]

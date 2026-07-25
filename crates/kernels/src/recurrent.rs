@@ -150,7 +150,7 @@ mod tests {
         // c' = 0*c0 + 1*0.76159416
         let (_, c) = step_with_bias([30.0, -30.0, 1.0, 0.0], 0.0, 99.0);
         assert!(
-            (c - 0.761_594_16).abs() < 1e-5,
+            (c - 0.761_594_2).abs() < 1e-5,
             "i/g gates wrong: c={c} (expected tanh(1))"
         );
     }
@@ -194,7 +194,7 @@ mod tests {
             &mut c_out,
         )
         .expect("lstm_step");
-        assert!((c_out[0] - 0.380_797_08).abs() < 1e-6, "c={}", c_out[0]);
+        assert!((c_out[0] - 0.380_797_1).abs() < 1e-6, "c={}", c_out[0]);
         assert!((h_out[0] - 0.181_699_74).abs() < 1e-6, "h={}", h_out[0]);
     }
 
@@ -217,7 +217,7 @@ mod tests {
             &mut c_out,
         )
         .expect("lstm_step");
-        assert!((c_out[0] - 0.380_797_08).abs() < 1e-6, "c={}", c_out[0]);
+        assert!((c_out[0] - 0.380_797_1).abs() < 1e-6, "c={}", c_out[0]);
     }
 
     #[test]
