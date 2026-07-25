@@ -7,15 +7,22 @@
 //!
 //! # Long-form audio
 //!
-//! The encoder uses full self-attention (`att_context_size = [-1, -1]`), so
-//! attention cost is quadratic in the *subsampled* frame count with no
-//! KV-cache shortcut available. Roughly 12.5 encoder frames per second of
-//! audio, and each block materializes a `[T, 2T-1]` score matrix — so ten
-//! minutes of audio is on the order of a gigabyte of transient scores per
-//! block. [`ParakeetModel::encode_audio`] therefore refuses inputs beyond
-//! [`MAX_AUDIO_SECONDS`] rather than attempting an allocation that will fail
-//! somewhere less legible. Chunking with overlap is the fix, and it is not
-//! implemented here.
+//! The encoder uses full self-attention (`att_context_size = [-1, -1]`) with no
+//! KV-cache shortcut, so its cost is quadratic in the subsampled frame count
+//! (~12.5 frames per second of audio).
+//!
+//! **The binding constraint is time, not memory.** The largest transient is the
+//! `[T, 2T-1]` score matrix, which is only ~450 MB even at ten minutes — well
+//! within reach. What degrades is throughput: attention is 2.3% of the encoder's
+//! multiply-accumulates at 11 s, 11% at 60 s, 20% at 121 s and 56% at 600 s, so
+//! real-time factor is flat at first and then climbs past 1.0 somewhere near ten
+//! minutes.
+//!
+//! [`ParakeetModel::encode_audio`] keeps a [`MAX_AUDIO_SECONDS`] guard so the
+//! single-window path cannot quietly become the slow one, and
+//! [`ParakeetModel::encode_audio_chunked`] has no limit: overlap-and-trim
+//! chunking replaces the quadratic term with a constant one, holding RTF at
+//! whatever the chunk size costs regardless of length. See [`super::chunk`].
 
 use std::path::Path;
 
@@ -23,22 +30,25 @@ use ocelotl_core::{OcelotlError, Result, RuntimeError};
 use ocelotl_kernels::KernelBackend;
 use ocelotl_loader::load_safetensors_tensors_f32;
 
-use super::audio::{PARAKEET_SAMPLE_RATE_HZ, parakeet_log_mel};
+use super::audio::{PARAKEET_SAMPLE_RATE_HZ, ParakeetFeatures, parakeet_log_mel};
+use super::chunk::plan_chunks;
 use super::decoder::{
     JointWeights, LstmLayerWeights, PRED_LAYERS, PredNetWeights, TdtConfig, TdtDecode,
     greedy_decode,
 };
 use super::encoder::{BlockWeights, EncoderShape, encode};
-use super::subsample::{SubsampleWeights, subsample};
+use super::subsample::{SubsampleWeights, subsample, subsampled_frames};
 
 /// Conformer blocks in `parakeet-tdt-0.6b-v3`.
 pub const NUM_BLOCKS: usize = 24;
 
-/// Longest audio [`ParakeetModel::encode_audio`] will attempt, in seconds.
+/// Longest audio the **single-window** path will attempt, in seconds.
 ///
-/// Not a model limit — a memory one. See the module docs: the encoder's
-/// quadratic attention makes the failure mode a doomed allocation deep inside
-/// block 0, which is far harder to read than an explicit refusal.
+/// Neither a model limit nor a memory one — a throughput guard. Past this point
+/// the quadratic attention term stops being negligible and the chunked path is
+/// simply the better choice, so refusing here routes callers to it instead of
+/// letting them silently take the slow road.
+/// [`ParakeetModel::encode_audio_chunked`] is not bounded by this.
 pub const MAX_AUDIO_SECONDS: usize = 60;
 
 fn rt<S: Into<String>>(m: S) -> OcelotlError {
@@ -242,6 +252,11 @@ impl ParakeetModel {
 
     /// Encoder hidden states for `audio` (16 kHz mono f32), `[frames][d_model]`.
     ///
+    /// **Single-window**: encodes the whole input under full attention. Cost is
+    /// quadratic in length, so prefer [`Self::encode_audio_chunked`] for
+    /// anything long. Kept public because parity tests need the unchunked path
+    /// as the thing chunking is checked against.
+    ///
     /// Exposed separately from [`Self::decode_audio`] so the encoder can be
     /// benchmarked and diffed without the decode, and so a caller doing its own
     /// decoding does not pay for the greedy loop.
@@ -253,15 +268,37 @@ impl ParakeetModel {
         let max_samples = MAX_AUDIO_SECONDS * PARAKEET_SAMPLE_RATE_HZ as usize;
         if audio.len() > max_samples {
             return Err(rt(format!(
-                "audio is {:.1}s; this encoder uses full self-attention with no \
-                 KV cache, so inputs over {MAX_AUDIO_SECONDS}s need chunking \
-                 (not implemented) rather than a larger allocation",
+                "audio is {:.1}s, over the {MAX_AUDIO_SECONDS}s single-window \
+                 limit. This encoder uses full self-attention with no KV cache, \
+                 so cost grows quadratically; use encode_audio_chunked or \
+                 decode_audio_chunked instead.",
                 audio.len() as f32 / PARAKEET_SAMPLE_RATE_HZ as f32
             )));
         }
+        self.encode_window(audio, kernels)
+    }
+
+    /// Encode one window with no length check. The chunked path drives this.
+    fn encode_window(
+        &self,
+        audio: &[f32],
+        kernels: &dyn KernelBackend,
+    ) -> Result<(Vec<f32>, usize)> {
         let features = parakeet_log_mel(audio)?;
+        self.encode_features(&features, kernels)
+    }
+
+    /// Subsample and encode already-computed mel features.
+    ///
+    /// Split out from [`Self::encode_window`] so the chunked path can normalize
+    /// once and slice, rather than re-running the frontend per window.
+    fn encode_features(
+        &self,
+        features: &ParakeetFeatures,
+        kernels: &dyn KernelBackend,
+    ) -> Result<(Vec<f32>, usize)> {
         let subsampled = subsample(
-            &features,
+            features,
             &self.weights.subsample,
             self.shape.d_model,
             kernels,
@@ -278,11 +315,100 @@ impl ParakeetModel {
         Ok((hidden, frames))
     }
 
+    /// Encoder hidden states via overlap-and-trim chunking, with **no length
+    /// limit**.
+    ///
+    /// The mel frontend runs **once** over the whole utterance and chunking
+    /// slices its normalized output — not the waveform. Per-feature
+    /// normalization reduces over every frame of its input, so waveform-level
+    /// chunking would give each window its own statistics and perturb every
+    /// frame inside it, which no amount of context trimming can undo. See
+    /// [`super::chunk`] for the measurement that established this.
+    ///
+    /// Each window is then encoded with `context_frames` of extra frames on both
+    /// sides, which are discarded; the surviving bodies tile the utterance
+    /// exactly.
+    ///
+    /// Returns the same `(hidden, frames)` shape as [`Self::encode_audio`], so
+    /// the two are directly diffable — which is exactly how the chunking gate is
+    /// written.
+    pub fn encode_audio_chunked(
+        &self,
+        audio: &[f32],
+        chunk_frames: usize,
+        context_frames: usize,
+        kernels: &dyn KernelBackend,
+    ) -> Result<(Vec<f32>, usize)> {
+        let features = parakeet_log_mel(audio)?;
+        let total = subsampled_frames(features.frames);
+        let plan = plan_chunks(total, chunk_frames, context_frames)?;
+        let d = self.shape.d_model;
+        let mut out: Vec<f32> = Vec::with_capacity(total * d);
+
+        for window in &plan {
+            let range = window.mel_range(features.frames);
+            let slice = features.slice_frames(range.clone());
+            let (hidden, produced) = self.encode_features(&slice, kernels)?;
+            let keep = window.keep_range();
+            // The closed-form frame count and what the encoder actually emits
+            // for a slice must agree. If they ever do not, stitching would
+            // silently shift the time axis from here on — so fail loudly.
+            if keep.end > produced {
+                return Err(rt(format!(
+                    "chunk [{}, {}) needed local frames {keep:?} but the encoder \
+                     produced only {produced} from {} mel frames — the frame \
+                     arithmetic and the encoder disagree",
+                    window.ctx_start,
+                    window.ctx_end,
+                    range.len()
+                )));
+            }
+            out.extend_from_slice(&hidden[keep.start * d..keep.end * d]);
+        }
+
+        let frames = out.len() / d;
+        if frames != total {
+            return Err(rt(format!("stitched {frames} frames but planned {total}")));
+        }
+        Ok((out, frames))
+    }
+
     /// Greedy TDT decode of `audio`, returning token ids and frame indices.
+    ///
+    /// Single-window; see [`Self::encode_audio`] for the length limit.
     pub fn decode_audio(&self, audio: &[f32], kernels: &dyn KernelBackend) -> Result<TdtDecode> {
         let (hidden, frames) = self.encode_audio(audio, kernels)?;
+        self.decode_hidden(&hidden, frames, kernels)
+    }
+
+    /// Chunked encode followed by **one** greedy decode over the stitched
+    /// output, with no length limit.
+    ///
+    /// The decode deliberately is not chunked. Running it per window would reset
+    /// the prediction network's recurrent state at every seam; a single pass
+    /// over the stitched encoder output keeps that state continuous, which is
+    /// why this can be token-identical to the unchunked path.
+    pub fn decode_audio_chunked(
+        &self,
+        audio: &[f32],
+        chunk_frames: usize,
+        context_frames: usize,
+        kernels: &dyn KernelBackend,
+    ) -> Result<TdtDecode> {
+        let (hidden, frames) =
+            self.encode_audio_chunked(audio, chunk_frames, context_frames, kernels)?;
+        self.decode_hidden(&hidden, frames, kernels)
+    }
+
+    /// Greedy decode over encoder hidden states the caller already has.
+    pub fn decode_hidden(
+        &self,
+        hidden: &[f32],
+        frames: usize,
+        kernels: &dyn KernelBackend,
+    ) -> Result<TdtDecode> {
         greedy_decode(
-            &hidden,
+            hidden,
             frames,
             &self.weights.prednet,
             &self.weights.joint,

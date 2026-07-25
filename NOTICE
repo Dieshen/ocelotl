@@ -1,0 +1,110 @@
+Ocelotl
+Copyright (c) 2026 Dieshen
+
+This product includes software developed as part of the Ocelotl project,
+licensed under MIT OR Apache-2.0 (see LICENSE-MIT and LICENSE-APACHE).
+
+================================================================================
+THIRD-PARTY MODEL WEIGHTS
+================================================================================
+
+Ocelotl's source code contains no model weights. It loads them at runtime from
+files the user supplies. The licences below therefore attach to the *weights*,
+not to this source tree — but they do attach to any distribution, container
+image, or release artifact that bundles them, and to the fixtures and reference
+tensors derived from them.
+
+The distinction that matters: several of these are NOT permissive in the way the
+code is. In particular the Parakeet weights are CC-BY-4.0, which requires
+attribution and a statement of changes wherever they travel. Shipping them with
+no NOTICE is a licence violation even though shipping the code is not.
+
+--------------------------------------------------------------------------------
+NVIDIA Parakeet TDT 0.6B (v3)
+--------------------------------------------------------------------------------
+Model:      nvidia/parakeet-tdt-0.6b-v3
+Source:     https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+Copyright:  Copyright (c) NVIDIA Corporation
+Licence:    Creative Commons Attribution 4.0 International (CC-BY-4.0)
+            https://creativecommons.org/licenses/by/4.0/
+
+Changes made: none to the weights themselves. Ocelotl reads the published
+`model.safetensors` unmodified and reimplements the inference graph in Rust.
+No re-parameterisation, quantisation, fine-tuning, or fusion is applied to the
+distributed tensors.
+
+Reference artifacts used for parity testing are derived from the ONNX export
+below and from these weights. Any redistribution of those artifacts carries the
+same CC-BY-4.0 obligation.
+
+--------------------------------------------------------------------------------
+Parakeet TDT 0.6B v3 — ONNX export (parity oracle)
+--------------------------------------------------------------------------------
+Model:      istupakov/parakeet-tdt-0.6b-v3-onnx
+Source:     https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx
+Licence:    CC-BY-4.0, inherited from the NVIDIA weights above.
+
+Used only as a numerical reference: the exported graphs are run to produce
+golden tensors that Ocelotl's implementation is diffed against. The exported
+graphs are not redistributed by Ocelotl and are not required at runtime.
+
+Changes made: the graphs are re-saved locally with additional intermediate
+tensors promoted to graph outputs, purely to localize parity failures. These
+instrumented copies stay on the developer's machine.
+
+TDT greedy decoding semantics follow onnx-asr (https://github.com/istupakov/onnx-asr),
+MIT licensed, which ships alongside these exports. No code was copied; the loop
+was reimplemented in Rust from the published algorithm.
+
+--------------------------------------------------------------------------------
+OpenAI Whisper
+--------------------------------------------------------------------------------
+Source:     https://github.com/openai/whisper
+Copyright:  Copyright (c) 2022 OpenAI
+Licence:    MIT
+
+--------------------------------------------------------------------------------
+Google Gemma / EmbeddingGemma
+--------------------------------------------------------------------------------
+Source:     https://huggingface.co/google
+Copyright:  Copyright (c) Google LLC
+Licence:    Gemma Terms of Use — https://ai.google.dev/gemma/terms
+            Note: this is NOT an OSI-approved open-source licence. It carries
+            use restrictions (see the Prohibited Use Policy) that survive
+            redistribution. Review it before bundling these weights.
+
+--------------------------------------------------------------------------------
+Qwen (Qwen2.5, Qwen3 / pplx-embed)
+--------------------------------------------------------------------------------
+Source:     https://huggingface.co/Qwen
+Copyright:  Copyright (c) Alibaba Cloud
+Licence:    Apache-2.0. Verified for the checkpoints this tree actually
+            references: Qwen/Qwen2.5-0.5B-Instruct and Qwen/Qwen3.5-35B-A3B.
+            Some other Qwen releases use the Tongyi Qianwen licence instead —
+            check the specific checkpoint before redistributing.
+
+Model:      perplexity-ai/pplx-embed-v1-0.6b
+Source:     https://huggingface.co/perplexity-ai/pplx-embed-v1-0.6b
+Licence:    MIT
+
+================================================================================
+AUDIO FIXTURES
+================================================================================
+
+No audio fixtures are committed to this repository; they are fetched and derived
+by the commands in `fixtures/asr/README.md`. This section documents their
+provenance for anyone who does redistribute them.
+
+`parity_jfk.wav` is fetched from whisper.cpp (`samples/jfk.wav`):
+    https://github.com/ggerganov/whisper.cpp
+    Copyright (c) 2023-2024 The ggml authors
+    Licence: MIT
+
+Its content is an excerpt of John F. Kennedy's 1961 inaugural address, a work of
+the United States federal government and therefore in the public domain
+(17 U.S.C. Sec. 105).
+
+`parity_short.wav` and `parity_long_quiet.wav` are **derived from that same
+recording** by `fixtures/asr/make_fixtures.py` — not synthetic. `parity_short`
+is its first 0.75 s; `parity_long_quiet` is the clip tiled to 130 s and
+normalised to about -30 dBFS. Both inherit the provenance above.

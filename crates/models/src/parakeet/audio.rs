@@ -82,6 +82,35 @@ impl ParakeetFeatures {
     pub fn band(&self, mel: usize) -> &[f32] {
         &self.values[mel * self.frames..(mel + 1) * self.frames]
     }
+
+    /// Copy out the frames in `range`, preserving the mel-major layout.
+    ///
+    /// This is how long-form chunking slices audio, and the level at which it
+    /// slices is load-bearing. [`normalize_per_feature`] reduces over **every**
+    /// frame of its input, so chunking the *waveform* would give each chunk its
+    /// own mean and standard deviation and shift every frame inside it — not
+    /// just the ones near a boundary. Slicing here, after normalization, leaves
+    /// all chunks on the statistics the unchunked path would have used, so the
+    /// only thing chunking perturbs is attention context.
+    ///
+    /// Measured on `parity_jfk`: waveform-level chunking left interior frames
+    /// almost as wrong as seam frames (7.6e-2 vs 8.1e-2), which is the signature
+    /// of a global coupling rather than a boundary effect.
+    pub fn slice_frames(&self, range: std::ops::Range<usize>) -> Self {
+        let start = range.start.min(self.frames);
+        let end = range.end.min(self.frames).max(start);
+        let frames = end - start;
+        let mut values = vec![0.0_f32; self.mel_bins * frames];
+        for mel in 0..self.mel_bins {
+            let src = &self.values[mel * self.frames + start..mel * self.frames + end];
+            values[mel * frames..(mel + 1) * frames].copy_from_slice(src);
+        }
+        Self {
+            frames,
+            mel_bins: self.mel_bins,
+            values,
+        }
+    }
 }
 
 fn invalid(field: impl Into<String>, message: impl Into<String>) -> OcelotlError {

@@ -7,6 +7,7 @@
 //! or mutates it.
 
 pub mod audio;
+pub mod chunk;
 pub mod decoder;
 pub mod encoder;
 pub mod model;
