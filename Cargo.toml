@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dieshen/ocelotl"
@@ -28,13 +28,13 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 
-ocelotl-core = { path = "crates/core", version = "0.0.1" }
-ocelotl-loader = { path = "crates/loader", version = "0.0.1" }
-ocelotl-tokenizer = { path = "crates/tokenizer", version = "0.0.1" }
-ocelotl-kernels = { path = "crates/kernels", version = "0.0.1" }
-ocelotl-models = { path = "crates/models", version = "0.0.1" }
-ocelotl-runtime = { path = "crates/runtime", version = "0.0.1" }
-ocelotl-server = { path = "crates/server", version = "0.0.1" }
+ocelotl-core = { path = "crates/core", version = "0.1.0" }
+ocelotl-loader = { path = "crates/loader", version = "0.1.0" }
+ocelotl-tokenizer = { path = "crates/tokenizer", version = "0.1.0" }
+ocelotl-kernels = { path = "crates/kernels", version = "0.1.0" }
+ocelotl-models = { path = "crates/models", version = "0.1.0" }
+ocelotl-runtime = { path = "crates/runtime", version = "0.1.0" }
+ocelotl-server = { path = "crates/server", version = "0.1.0" }
 
 [package]
 name = "ocelotl"
